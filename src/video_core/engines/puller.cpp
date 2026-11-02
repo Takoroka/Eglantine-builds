@@ -59,6 +59,12 @@ void DrainBack() {
     VideoCommon::GpuSplit::Get().Drain();
 }
 
+// Split GPU thread: GEQUAL acquires check guest memory first and park without draining while the
+// front has other command lists to parse (Puller::may_drain).
+bool LazyAcquires() {
+    return VideoCommon::GpuSplit::Get().Active();
+}
+
 } // Anonymous namespace
 
 bool Puller::PendingAcquire::Matches(u32 current) const {
@@ -77,6 +83,20 @@ bool Puller::PendingAcquire::Matches(u32 current) const {
 bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (!pending_acquire) {
         return true;
+    }
+    if (LazyAcquires() && pending_acquire->operation ==
+                              static_cast<u32>(GpuSemaphoreOperation::AcquireGequal)) {
+        // The values only grow: one already in guest memory is met without the back's caches.
+        if (Nx2SemaphoreWaiters::Get().Latched(this) ||
+            pending_acquire->Matches(dma_pusher.memory_manager.Read<u32>(pending_acquire->address))) {
+            return true;
+        }
+        // Wait for the back only with nothing else to parse, or after a while (a release that
+        // lands at a fence the back passes needs the drain's fence pass to show).
+        if (!may_drain &&
+            std::chrono::steady_clock::now() - pending_acquire->since < std::chrono::microseconds{200}) {
+            return false;
+        }
     }
     // The release may still be queued for the split GPU thread's back half (and the caches
     // ReadSemaphoreWord asks are its state).
@@ -245,6 +265,21 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+        if (LazyAcquires() && op == GpuSemaphoreOperation::AcquireGequal) {
+            if (acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))) {
+                return;
+            }
+            if (!may_drain) {
+                // Parked without waiting for the back: the GPU thread resumes the channel once
+                // the value shows (CanResumeAcquire), draining only when it has nothing to parse.
+                if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
+                    Nx2SemaphoreWaiters::Get().Add(this, *device, acquire.value, acquire.operation);
+                }
+                pending_acquire = acquire;
+                VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
+                return;
+            }
+        }
         DrainBack();
         if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
             return;
