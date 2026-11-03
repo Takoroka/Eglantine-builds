@@ -46,6 +46,7 @@
 #include "core/hle/kernel/k_memory_manager.h"
 #include "core/hle/kernel/k_page_group.h"
 #include "core/hle/kernel/k_resource_limit.h"
+#include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/k_server_session.h"
 #include "core/hle/kernel/k_event.h"
 #include "core/hle/kernel/k_hardware_timer.h"
@@ -116,6 +117,43 @@ inline void TipcHandshake(HLERequestContext& ctx, std::string_view session) {
     LOG_INFO(Service, "{} TIPC 0 handshake {:#x}", session, u64{w[2]} | (u64{w[3]} << 32));
     TipcReplyWords(ctx, {w[2], w[3]});
 }
+
+// EDEN_NX2_PRESENT_TRACE=<file>: one CSV line per present with what paced the frame (fence,
+// vblank pacing, the game's vsync event and GPU syncpoint waits), to find what a game's swap
+// interval follows. Counters are added up between presents and reset by each line.
+struct Nx2PresentTrace {
+    static Nx2PresentTrace& Get() {
+        static Nx2PresentTrace trace;
+        return trace;
+    }
+    static s64 NowNs() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    }
+
+    std::FILE* file{};
+    std::atomic<u64> sync_requests{};   // nx2:syncpt 201 requests
+    std::atomic<u64> sync_waits{};      // ... whose value wasn't reached yet
+    std::atomic<u64> sync_wait_us{};    // request to signal, summed over those
+    std::atomic<u64> sync_max_wait_us{};
+    std::atomic<u64> vsync_ticks{};
+    std::atomic<s64> vsync_tick_ns{};
+    std::atomic<u64> vsync_unconsumed{}; // ticks that found the event still signalled
+
+private:
+    Nx2PresentTrace() {
+        if (const char* path = std::getenv("EDEN_NX2_PRESENT_TRACE")) {
+            file = std::fopen(path, "w");
+            if (file != nullptr) {
+                std::fputs("n,t_us,w12,frame_us,fence_us,comp_us,pace_us,late_us,vs_ticks,"
+                           "vs_unconsumed,vs_clears,since_clear_us,since_tick_us,sync_req,"
+                           "sync_waits,sync_wait_us,sync_max_us,gpu_ticks,cntpct,catchup,debt_us\n",
+                           file);
+            }
+        }
+    }
+};
 
 // Replies with success and a copied handle to a new session served by `iface`.
 template <class T>
@@ -249,17 +287,34 @@ private:
         request.syncpoint = syncpoint;
         request.pending = true;
         auto& manager = system.Host1x().GetSyncpointManager();
+        auto& trace = Nx2PresentTrace::Get();
+        s64 requested_ns = 0;
+        if (trace.file != nullptr) {
+            trace.sync_requests.fetch_add(1, std::memory_order_relaxed);
+            if (!manager.IsReadyGuest(syncpoint, static_cast<u32>(value))) {
+                trace.sync_waits.fetch_add(1, std::memory_order_relaxed);
+                requested_ns = Nx2PresentTrace::NowNs();
+            }
+        }
         // The action runs on the GPU thread under the manager's lock, or inline if the value is
         // already reached.
         request.handle = manager.RegisterGuestAction(
             syncpoint, static_cast<u32>(value),
-            [shared = m_shared, &kernel = system.Kernel(), &request, event] {
+            [shared = m_shared, &kernel = system.Kernel(), &request, event, requested_ns] {
                 std::scoped_lock lk{shared->mutex};
                 if (!shared->alive) {
                     return;
                 }
                 request.pending = false;
                 event->Signal(kernel);
+                if (requested_ns != 0) {
+                    auto& trace = Nx2PresentTrace::Get();
+                    const u64 us = static_cast<u64>(Nx2PresentTrace::NowNs() - requested_ns) / 1000;
+                    trace.sync_wait_us.fetch_add(us, std::memory_order_relaxed);
+                    u64 max = trace.sync_max_wait_us.load(std::memory_order_relaxed);
+                    while (us > max && !trace.sync_max_wait_us.compare_exchange_weak(max, us)) {
+                    }
+                }
             });
         TipcReplyWords(ctx, {});
     }
@@ -1788,6 +1843,7 @@ private:
         const auto composited = std::chrono::steady_clock::now();
         PaceToVblank(w[12]);
         const auto paced = std::chrono::steady_clock::now();
+        TracePresent(w, entered, waited, composited, paced);
         // Where each frame's time goes on the present thread, averaged per 600 presents: the
         // game is blocked here while Eden's GPU thread catches up (fence) and composites.
         {
@@ -1840,6 +1896,67 @@ private:
     bool m_title_checked{};
     bool m_previous_frame_only{}; ///< Presents wait for the previous frame only (see there)
 
+    // EDEN_NX2_PRESENT_TRACE: one line per present (Nx2PresentTrace), and the present's words
+    // in the log for the first presents and the first swap interval changes.
+    s64 m_trace_late_us{};
+    bool m_trace_catching_up{};
+    std::chrono::steady_clock::time_point m_trace_previous{};
+    u32 m_trace_word12{};
+    u32 m_trace_dumps{};
+    void TracePresent(const u32* w, std::chrono::steady_clock::time_point entered,
+                      std::chrono::steady_clock::time_point waited,
+                      std::chrono::steady_clock::time_point composited,
+                      std::chrono::steady_clock::time_point paced) {
+        auto& trace = Nx2PresentTrace::Get();
+        if (trace.file == nullptr) {
+            return;
+        }
+        if (m_presents <= 8 || (w[12] != m_trace_word12 && m_trace_dumps < 64)) {
+            m_trace_dumps += m_presents > 8 ? 1 : 0;
+            std::string words;
+            for (u32 i = 0; i < 40; ++i) {
+                words += fmt::format(" {:08x}", w[i]);
+            }
+            LOG_INFO(Service, "nx2:vi2 trace present #{} words{}", m_presents, words);
+        }
+        m_trace_word12 = w[12];
+        const auto us = [](auto d) {
+            return static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(d).count());
+        };
+        const s64 entered_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   entered.time_since_epoch())
+                                   .count();
+        const s64 clear_ns = Kernel::KReadableEvent::traced_clear_ns.load(std::memory_order_relaxed);
+        const s64 tick_ns = trace.vsync_tick_ns.load(std::memory_order_relaxed);
+        static const auto start = entered;
+        std::fprintf(trace.file,
+                     "%llu,%lld,%x,%lld,%lld,%lld,%lld,%lld,%llu,%llu,%llu,%lld,%lld,%llu,%llu,%llu,"
+                     "%llu,%llu,%llu,%d,%lld\n",
+                     static_cast<unsigned long long>(m_presents), us(entered - start), w[12],
+                     m_trace_previous == std::chrono::steady_clock::time_point{}
+                         ? 0LL
+                         : us(entered - m_trace_previous),
+                     us(waited - entered), us(composited - waited), us(paced - composited),
+                     static_cast<long long>(m_trace_late_us),
+                     static_cast<unsigned long long>(trace.vsync_ticks.exchange(0)),
+                     static_cast<unsigned long long>(trace.vsync_unconsumed.exchange(0)),
+                     static_cast<unsigned long long>(Kernel::KReadableEvent::traced_clears.exchange(0)),
+                     clear_ns == 0 ? -1LL : static_cast<long long>((entered_ns - clear_ns) / 1000),
+                     tick_ns == 0 ? -1LL : static_cast<long long>((entered_ns - tick_ns) / 1000),
+                     static_cast<unsigned long long>(trace.sync_requests.exchange(0)),
+                     static_cast<unsigned long long>(trace.sync_waits.exchange(0)),
+                     static_cast<unsigned long long>(trace.sync_wait_us.exchange(0)),
+                     static_cast<unsigned long long>(trace.sync_max_wait_us.exchange(0)),
+                     static_cast<unsigned long long>(system.GPU().GetTicks()),
+                     static_cast<unsigned long long>(system.CoreTiming().GetClockTicks()),
+                     m_trace_catching_up ? 1 : 0,
+                     static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(m_frame_debt).count()));
+        if ((m_presents % 600) == 0) {
+            std::fflush(trace.file);
+        }
+        m_trace_previous = entered;
+    }
+
     // The console flips one frame per 60 Hz vblank and keeps the rest queued, so a game can't
     // present faster than that. Every slot is reported free here: hold each present until the
     // next vblank instead (title 4 ran at up to 160 fps, its timing and audio with it).
@@ -1879,6 +1996,7 @@ private:
         const auto interval = std::chrono::nanoseconds{
             100'000'000'000LL * swap_interval / refresh_rate / Settings::SpeedLimit()};
         const auto now = std::chrono::steady_clock::now();
+        m_trace_late_us = std::chrono::duration_cast<std::chrono::microseconds>(now - m_next_vblank).count();
         // An interval above one is a frame rate only while the game keeps up. Mario Kart World
         // picks its interval each frame from how far its frame times ran past the vblanks it asked
         // for (debt += last frame time - interval vblanks, at most 4 vblanks; interval = 1 + debt
@@ -1916,6 +2034,7 @@ private:
             m_previous_gap = std::chrono::duration_cast<std::chrono::nanoseconds>(released - m_previous_release);
         }
         m_previous_release = released;
+        m_trace_catching_up = catching_up;
     }
 
     /// Waits until the fence is reached. With `unless_gpu_waits`, gives up after a few ms once a
@@ -2284,6 +2403,9 @@ private:
         LOG_INFO(Service, "nx2:vi2 261 native event {} -> vsync", index);
         if (index < m_native_events.size() && m_native_events[index]) {
             SetVsyncSlot(index, true);
+            if (Nx2PresentTrace::Get().file != nullptr) {
+                Kernel::KReadableEvent::traced_event = &m_native_events[index]->GetReadableEvent();
+            }
         }
         TipcReplyWords(ctx, {});
     }
@@ -2345,6 +2467,21 @@ private:
                 [vsync_state = m_vsync, &kernel = system.Kernel()](
                     s64, std::chrono::nanoseconds) -> std::optional<std::chrono::nanoseconds> {
                     std::scoped_lock lk{vsync_state->mutex};
+                    auto& trace = Nx2PresentTrace::Get();
+                    if (trace.file != nullptr) {
+                        trace.vsync_ticks.fetch_add(1, std::memory_order_relaxed);
+                        trace.vsync_tick_ns.store(Nx2PresentTrace::NowNs(), std::memory_order_relaxed);
+                        const auto* traced =
+                            Kernel::KReadableEvent::traced_event.load(std::memory_order_relaxed);
+                        for (auto* vsync : vsync_state->events) {
+                            if (&vsync->GetReadableEvent() == traced) {
+                                Kernel::KScopedSchedulerLock sl{kernel};
+                                if (traced->IsSignaled(kernel)) {
+                                    trace.vsync_unconsumed.fetch_add(1, std::memory_order_relaxed);
+                                }
+                            }
+                        }
+                    }
                     for (auto* vsync : vsync_state->events) {
                         vsync->Signal(kernel);
                     }
