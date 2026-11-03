@@ -2133,7 +2133,9 @@ void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
 
 template <class P>
 void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
-    if (buffer_id != NULL_BUFFER_ID) {
+    // Draws bind the same buffers many times a frame: touch the LRU item (a lookup in its pool)
+    // only the first time in each frame.
+    if (buffer_id != NULL_BUFFER_ID && buffer.TakeLRUTouch(frame_tick)) {
         lru_cache.Touch(buffer.getLRUID(), frame_tick);
     }
 }

@@ -117,6 +117,15 @@ public:
         lru_id = lru_id_;
     }
 
+    /// Whether the buffer still needs its LRU touch for this frame (true once per frame tick).
+    bool TakeLRUTouch(u64 frame_tick) noexcept {
+        if (lru_touch_tick == frame_tick) {
+            return false;
+        }
+        lru_touch_tick = frame_tick;
+        return true;
+    }
+
     size_t SizeBytes() const {
         return size_bytes;
     }
@@ -136,6 +145,7 @@ private:
     size_t lru_id = SIZE_MAX;
     size_t size_bytes = 0;
     u64 write_tick = 0;
+    u64 lru_touch_tick = ~u64{0};
 };
 
 } // namespace VideoCommon
