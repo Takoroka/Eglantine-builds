@@ -292,6 +292,7 @@ void ShaderCache::InvalidatePagesInRegion(VAddr addr, size_t size) {
         if (it == invalidation_cache.end()) {
             continue;
         }
+        invalidated_pages.fetch_add(1, std::memory_order_relaxed);
         InvalidatePageEntries(it->second, addr, addr_end);
     }
 }

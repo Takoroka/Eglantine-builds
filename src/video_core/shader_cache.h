@@ -77,6 +77,11 @@ public:
     /// @brief Flushes delayed removal operations
     void SyncGuestHost();
 
+    /// Counts the cached shader pages written ranges reached (InvalidatePagesInRegion).
+    [[nodiscard]] u64 InvalidatedPages() const noexcept {
+        return invalidated_pages.load(std::memory_order_relaxed);
+    }
+
 protected:
     struct GraphicsEnvironments {
         std::array<GraphicsEnvironment, NUM_PROGRAMS> envs;
@@ -164,6 +169,7 @@ private:
 
     mutable std::mutex lookup_mutex;
     std::mutex invalidation_mutex;
+    std::atomic<u64> invalidated_pages{}; ///< InvalidatedPages
 
     ::Common::unordered_map<u64, std::unique_ptr<Entry>> lookup_cache;
     ::Common::unordered_map<u64, std::vector<Entry*>> invalidation_cache;

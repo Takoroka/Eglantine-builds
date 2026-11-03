@@ -327,6 +327,17 @@ public:
 
     [[nodiscard]] bool IsRescaling(const ImageViewBase& image_view) const noexcept;
 
+    /// Whether the last draw's CheckFeedbackLoop recorded a barrier (it does so on every draw
+    /// that samples one of its render targets).
+    [[nodiscard]] bool FeedbackLoopBarrier() const noexcept {
+        return last_feedback_loop_result;
+    }
+
+    /// Counts the images WriteMemory found in written ranges.
+    [[nodiscard]] u64 WrittenImages() const noexcept {
+        return written_images;
+    }
+
     /// Create channel state.
     void CreateChannel(Tegra::Control::ChannelState& channel) final override;
 
@@ -525,6 +536,7 @@ private:
     u64 last_feedback_loop_serial = 0;
     u64 last_feedback_texture_serial = 0;
     bool last_feedback_loop_result = false;
+    u64 written_images = 0; ///< WrittenImages
     FramebufferId last_framebuffer_id{};
     u64 last_framebuffer_serial = 0;
 

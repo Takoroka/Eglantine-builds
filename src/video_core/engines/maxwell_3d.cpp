@@ -48,6 +48,48 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
     execution_mask.reset();
     for (size_t i = 0; i < execution_mask.size(); i++)
         execution_mask[i] = IsMethodExecutable(u32(i));
+    // What each register is to a draw's setup (same_state_serials). Anything not listed below is
+    // "other": it may feed the pipeline, textures or any other part of the setup.
+    same_state_kinds.fill(SameStateOther);
+    const auto set_kind = [this](size_t first, size_t count, SameStateKind kind) {
+        std::fill_n(same_state_kinds.begin() + first, count, kind);
+    };
+    // Read by the draw itself only (the index range is checked against the bound index buffer),
+    // or by nothing but macros.
+    for (const size_t method : {MAXWELL3D_REG_INDEX(draw.begin), MAXWELL3D_REG_INDEX(draw.end),
+                                MAXWELL3D_REG_INDEX(vertex_buffer.first),
+                                MAXWELL3D_REG_INDEX(vertex_buffer.count),
+                                MAXWELL3D_REG_INDEX(index_buffer.first),
+                                MAXWELL3D_REG_INDEX(index_buffer.count),
+                                MAXWELL3D_REG_INDEX(global_base_vertex_index),
+                                MAXWELL3D_REG_INDEX(global_base_instance_index),
+                                MAXWELL3D_REG_INDEX(vertex_array_instance_first),
+                                MAXWELL3D_REG_INDEX(vertex_array_instance_subsequent),
+                                MAXWELL3D_REG_INDEX(vertex_id_base)}) {
+        same_state_kinds[method] = SameStateNone;
+    }
+    set_kind(MAXWELL3D_REG_INDEX(shadow_scratch), sizeof(regs.shadow_scratch) / sizeof(u32),
+             SameStateNone);
+    // Turing MME memory reads (addresses, data RAM address, DMA reads): macro plumbing.
+    set_kind(0x154, 5, SameStateNone);
+    // Constant buffer upload target, data and binds.
+    set_kind(MAXWELL3D_REG_INDEX(const_buffer), sizeof(regs.const_buffer) / sizeof(u32),
+             SameStateUniforms);
+    for (size_t stage = 0; stage < Regs::MaxShaderStage; ++stage) {
+        same_state_kinds[MAXWELL3D_REG_INDEX(bind_groups) + stage * sizeof(Regs::BindGroup) / sizeof(u32) +
+                         offsetof(Regs::BindGroup, raw_config) / sizeof(u32)] = SameStateUniforms;
+    }
+    // Vertex and index buffer addresses and sizes (not strides, enables, divisors or formats).
+    for (size_t index = 0; index < Regs::NumVertexArrays; ++index) {
+        set_kind(MAXWELL3D_REG_INDEX(vertex_streams) + index * sizeof(Regs::VertexStream) / sizeof(u32) +
+                     offsetof(Regs::VertexStream, address_high) / sizeof(u32),
+                 2, SameStateGeometry);
+        set_kind(MAXWELL3D_REG_INDEX(vertex_stream_limits) + index * sizeof(Regs::VertexStreamLimit) / sizeof(u32),
+                 sizeof(Regs::VertexStreamLimit) / sizeof(u32), SameStateGeometry);
+        // Switch 2 vertex stream sizes (Regs::NativeVertexStreamSize).
+        set_kind(0x600 / sizeof(u32) + index * 2, 2, SameStateGeometry);
+    }
+    set_kind(MAXWELL3D_REG_INDEX(index_buffer.start_addr_high), 4, SameStateGeometry);
 }
 
 Maxwell3D::~Maxwell3D() = default;
@@ -345,6 +387,7 @@ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
         draw_manager.DrawDeferred(*this, true);
     }
     regs.reg_array[method] = argument;
+    ++same_state_serials[same_state_kinds[method]];
     for (auto const& table : dirty.tables)
         dirty.flags[table[method]] = true;
 }
@@ -564,6 +607,7 @@ void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* bas
         break;
     case MAXWELL3D_REG_INDEX(inline_data): {
         ASSERT(methods_pending == amount);
+        ++same_state_serials[SameStateOther];
         upload_state.ProcessData(base_start, amount);
         return;
     }
@@ -739,9 +783,14 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
         return; // slot field is 5 bits; the state array holds 18
     }
     auto& buffer = state.shader_stages[stage_index].const_buffers[bind_data.shader_slot];
+    const ConstBufferInfo previous = buffer;
     buffer.enabled = bind_data.valid.Value() != 0;
     buffer.address = regs.const_buffer.Address();
     buffer.size = regs.const_buffer.size;
+    if (buffer.enabled != previous.enabled || buffer.address != previous.address ||
+        buffer.size != previous.size) {
+        cbuf_changes.bound_slots[stage_index] |= 1u << bind_data.shader_slot;
+    }
 
     const bool is_enabled = bind_data.valid.Value() != 0;
     if (!is_enabled) {
@@ -764,6 +813,23 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
     const GPUVAddr address{buffer_address + regs.const_buffer.offset};
     const size_t copy_size = amount * sizeof(u32);
     memory_manager.WriteBlockCached(address, start_base, copy_size);
+    ++same_state_serials[SameStateUniforms];
+    // Uploads usually continue where the last one ended: one range for a whole buffer. With the
+    // list full, the range that grows least takes the write (wider ranges only cost precision).
+    auto& changes = cbuf_changes;
+    const GPUVAddr end = address + copy_size;
+    if (changes.num_writes != 0 && changes.writes[changes.num_writes - 1].second == address) {
+        changes.writes[changes.num_writes - 1].second = end;
+    } else if (changes.num_writes < changes.writes.size()) {
+        changes.writes[changes.num_writes++] = {address, end};
+    } else {
+        const auto growth = [address, end](const std::pair<GPUVAddr, GPUVAddr>& range) {
+            return ((std::max)(range.second, end) - (std::min)(range.first, address)) -
+                   (range.second - range.first);
+        };
+        auto& range = *std::ranges::min_element(changes.writes, {}, growth);
+        range = {(std::min)(range.first, address), (std::max)(range.second, end)};
+    }
 
     // Increment the current buffer position.
     regs.const_buffer.offset += static_cast<u32>(copy_size);
@@ -1122,7 +1188,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     fs.parameters.clear();
     if (fs.draw_pending) {
         fs.draw_pending = false;
-        split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); });
+        split.DeferEngineWork([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); });
     }
     if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
         FrontVerify(split, fs);
