@@ -24,6 +24,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_sem_model.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/texture.h"
 #ifdef ARCHITECTURE_x86_64
@@ -1105,6 +1106,26 @@ void CheckReadAhead(VideoCommon::GpuSplit& split, GPUVAddr source, u32 method,
     }
 }
 
+// The semaphore write a report the front queues makes, for the front's model (as ProcessQueryGet:
+// release and report-only operations write the payload, or a counter for other report types).
+void FrontModelReport(const MemoryManager& memory, const std::array<u32, Maxwell3D::Regs::NUM_REGS>& regs,
+                      u32 query) {
+    namespace Model = VideoCommon::Nx2SemModel;
+    if (!Model::Active()) {
+        return;
+    }
+    constexpr u32 base = MAXWELL3D_REG_INDEX(report_semaphore);
+    const GPUVAddr address = (GPUVAddr{regs[base]} << 32) | regs[base + 1];
+    const u32 operation = query & 3;
+    if (operation != 0 && operation != 2) {
+        return;
+    }
+    const bool payload_report = ((query >> 23) & 0x1f) == 0;
+    const u32 bytes = ((query >> 28) & 1) != 0 ? 4 : 16;
+    Model::Apply(memory, address, payload_report ? Model::Op::Set : Model::Op::Unknown,
+                 regs[base + 2], bytes);
+}
+
 // EDEN_NX2_SPLIT_SKIP=0: send state writes that keep the register's value too.
 bool FrontSkipSame() {
     static const bool skip = [] {
@@ -1216,6 +1237,9 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         }
         case MAXWELL3D_REG_INDEX(falcon[4]):
             fs.regs[MAXWELL3D_REG_INDEX(shadow_scratch)] = 1;
+            break;
+        case MAXWELL3D_REG_INDEX(report_semaphore.query):
+            FrontModelReport(memory_manager, fs.regs, value);
             break;
         default:
             if (method >= cb_data && method < cb_data + 16) {
@@ -1350,6 +1374,9 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
             }
             case MAXWELL3D_REG_INDEX(falcon[4]):
                 fs.regs[MAXWELL3D_REG_INDEX(shadow_scratch)] = 1;
+                break;
+            case MAXWELL3D_REG_INDEX(report_semaphore.query):
+                FrontModelReport(memory_manager, fs.regs, value);
                 break;
             default:
                 if (!FrontHandledOutsideDrawManager(method)) {

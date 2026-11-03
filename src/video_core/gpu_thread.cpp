@@ -59,6 +59,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         auto last_progress = std::chrono::steady_clock::now();
         namespace Profile = VideoCommon::Nx2Profile;
         auto& split = VideoCommon::GpuSplit::Get();
+        Tegra::Engines::Puller::may_drain = false;
         while (!stop_token.stop_requested()) {
             Profile::Report();
             split.MaybeStart(system);
@@ -67,6 +68,14 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 {
                     Profile::Scope scope{Profile::Zone::ResumePending};
                     scheduler.ResumePending(system.GPU());
+                }
+                if (split.Active() && scheduler.HasPendingChannels() && state.queue.Empty()) {
+                    // Nothing else to parse: the parked channels may now wait for the back
+                    // (Puller::may_drain); while command lists arrive they only look at memory.
+                    Profile::Scope scope{Profile::Zone::ResumePending};
+                    Tegra::Engines::Puller::may_drain = true;
+                    scheduler.ResumePending(system.GPU());
+                    Tegra::Engines::Puller::may_drain = false;
                 }
                 if (!state.queue.TryPop(next)) {
                     // The CPU usually releases the semaphore soon after: poll for half a

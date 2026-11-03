@@ -18,6 +18,7 @@
 #include "common/logging.h"
 #include "shader_recompiler/exception.h"
 #include "core/core.h"
+#include "video_core/nx2_sem_model.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2.h"
@@ -924,6 +925,14 @@ void FrontNoteWrite(VideoCommon::GpuSplit& split, const MemoryManager& memory,
 // written to each, on the back too) and loads and binds the compute macro code itself.
 struct KeplerCompute::FrontState {
     std::array<u32, 0x1000> registers{};
+    /// Shadow of the back's QMD scheduler (Nx2SemModel): which launches run, with whose releases.
+    ShadowQmdScheduler shadow_qmd;
+    struct InlineQmd {
+        NativeQmdScheduler::Descriptor words;
+        u64 epoch; ///< Nx2SemModel::g_epoch when written (later, memory holds it)
+    };
+    /// Inline QMDs (method 0x107) the back writes to memory when it reaches them.
+    std::unordered_map<GPUVAddr, InlineQmd> inline_qmds;
     std::optional<u32> executing_macro;
     std::vector<u32> parameters;
     bool compute_uploaded{};
@@ -955,6 +964,9 @@ void KeplerCompute::FrontApply(FrontState& fs, u32 method, u32 argument) {
         fs.compute_uploaded = true;
     }
     fs.registers[method] = argument;
+    if (VideoCommon::Nx2SemModel::Active()) [[unlikely]] {
+        FrontModelReleases(fs, method, argument);
+    }
     switch (method) {
     case 0x45:
         FrontMacroEngine(fs).ClearCode(argument);
@@ -977,6 +989,87 @@ void KeplerCompute::FrontApply(FrontState& fs, u32 method, u32 argument) {
     default:
         break;
     }
+}
+
+void KeplerCompute::FrontModelReleases(FrontState& fs, u32 method, u32 argument) {
+    namespace Model = VideoCommon::Nx2SemModel;
+    const auto& r = fs.registers;
+    switch (method) {
+    case 0x6c3: { // As ProcessNativeReportSemaphore
+        const GPUVAddr address = (GPUVAddr{r[0x6c0] & 0x1ffffff} << 32) | r[0x6c1];
+        const u32 payload = r[0x6c2];
+        const u32 operation = argument & 3;
+        if (operation != 0 && operation != 2) {
+            return;
+        }
+        if ((argument >> 3) & 1) {
+            const u32 reduction = (argument >> 9) & 7;
+            Model::Apply(memory_manager, address,
+                         reduction == 0   ? Model::Op::Add
+                         : reduction == 2 ? Model::Op::Max
+                                          : Model::Op::Unknown,
+                         payload);
+        } else {
+            Model::Apply(memory_manager, address, Model::Op::Set, payload,
+                         ((argument >> 28) & 1) ? 4 : 16);
+        }
+        return;
+    }
+    case 0x107: { // Inline QMD: the back writes it to memory, then may schedule it
+        const GPUVAddr address = ((GPUVAddr{r[0xc6]} << 32) | r[0xc7]) << 8;
+        auto& qmd = fs.inline_qmds[address];
+        std::copy_n(r.begin() + 0xc8, qmd.words.size(), qmd.words.begin());
+        qmd.epoch = Model::g_epoch;
+        if ((r[0xa7] & (1U << 24)) || !(r[0xcc] & (1U << 12))) {
+            FrontShadowQmd(fs, address, 3);
+        }
+        return;
+    }
+    case 0xae:
+    case 0xaf:
+    case 0xb0: {
+        if (method == 0xae || (method == 0xaf && !(argument & 2)) ||
+            (method == 0xb0 && ((argument & 15) == 0 || (argument & 15) == 1))) {
+            return;
+        }
+        FrontShadowQmd(fs, GPUVAddr{r[0xad]} << 8, argument);
+        return;
+    }
+    default:
+        return;
+    }
+}
+
+void KeplerCompute::FrontShadowQmd(FrontState& fs, GPUVAddr qmd_address, u32 argument) {
+    namespace Model = VideoCommon::Nx2SemModel;
+    // As the back's native_qmd.Signal: the same actions in the same order, reading the QMDs
+    // the back will read (inline ones it hasn't written yet from the front's copy).
+    fs.shadow_qmd.Signal(
+        qmd_address, argument,
+        [&](u64 address, NativeQmdScheduler::Descriptor& descriptor) {
+            if (const auto it = fs.inline_qmds.find(address);
+                it != fs.inline_qmds.end() && it->second.epoch == Model::g_epoch) {
+                descriptor = it->second.words;
+                return true;
+            }
+            if (!memory_manager.IsFullyMappedRange(address, sizeof(descriptor))) {
+                return false;
+            }
+            memory_manager.ReadBlockUnsafe(address, descriptor.data(), sizeof(descriptor));
+            return true;
+        },
+        [&](u64 address, u32 payload, u32 flags) {
+            if (!memory_manager.IsFullyMappedRange(address, sizeof(payload))) {
+                return false;
+            }
+            Model::Apply(memory_manager, address,
+                         (flags & (1U << 26))   ? Model::Op::Add
+                         : (flags & (1U << 19)) ? Model::Op::Max
+                                                : Model::Op::Set,
+                         payload);
+            return true;
+        },
+        [](const auto&) { return true; });
 }
 
 MacroEngine& KeplerCompute::FrontMacroEngine(FrontState& fs) {

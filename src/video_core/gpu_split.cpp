@@ -26,6 +26,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_sem_model.h"
 
 namespace VideoCommon {
 
@@ -218,6 +219,7 @@ void GpuSplit::Drain() {
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache == write_position) {
         ClearPendingWrites();
+        Nx2SemModel::OnDrained();
         return;
     }
     Publish();
@@ -227,6 +229,7 @@ void GpuSplit::Drain() {
         if (consumed_cache == write_position) {
             publish_every = 8;
             ClearPendingWrites();
+            Nx2SemModel::OnDrained();
             return;
         }
         if (spins < 16384) {
