@@ -121,6 +121,10 @@ public:
     virtual void InvalidateRegion(DAddr addr, u64 size,
                                   VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;
 
+    /// The guest may have written memory the commands after this point read: a command list
+    /// starts, or a semaphore acquire is checked.
+    virtual void OnGuestSyncPoint() {}
+
     virtual void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
         if (!Settings::values.skip_cpu_inner_invalidation.GetValue()) {
             for (const auto& [cpu_addr, size] : sequences) {

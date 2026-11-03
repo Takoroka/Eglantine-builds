@@ -102,6 +102,7 @@ public:
     void OnCacheInvalidation(PAddr addr, u64 size) override;
     bool OnCPUWrite(PAddr addr, u64 size) override;
     void InvalidateGPUCache() override;
+    void OnGuestSyncPoint() override;
     void UnmapMemory(DAddr addr, u64 size) override;
     void ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) override;
     void SignalFence(std::function<void()>&& func) override;

@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
@@ -106,6 +107,13 @@ void BufferCache<P>::TickFrame() {
         return;
     }
     runtime.TickFrame(slot_buffers);
+    // Hot pages (MemoryTrackerBase::ReArmHotPages) for Switch 2 titles; EDEN_NX2_HOT_PAGES=0 turns
+    // them off (comparisons).
+    static const bool hot_pages_allowed = [] {
+        const char* value = std::getenv("EDEN_NX2_HOT_PAGES");
+        return value == nullptr || value[0] != '0';
+    }();
+    memory_tracker.TickFrame(hot_pages_allowed && Tegra::g_nx2_ampere.load(std::memory_order_relaxed));
     if (frame_tick % 600 == 0 && !uploaded_buffer_ranges.empty()) {
         for (const auto& [address, size] : uploaded_buffer_ranges) {
             device_memory.HintCold(address, size);
@@ -970,7 +978,15 @@ void BufferCache<P>::BindHostVertexBuffers() {
             const Binding& binding = VertexBufferSlot(index);
             Buffer& buffer = slot_buffers[binding.buffer_id];
             TouchBuffer(buffer, binding.buffer_id);
-            SynchronizeBuffer(buffer, binding.device_addr, binding.size);
+            if (!SynchronizeBuffer(buffer, binding.device_addr, binding.size)) {
+                // New data under a repacked binding (hot pages are uploaded again without the
+                // write trap that marks it stale): assemble the copy again.
+                if constexpr (requires { runtime.IsVertexRepacked(u32{}); }) {
+                    if (runtime.IsVertexRepacked(index)) {
+                        flags[Dirty::VertexBuffer0 + index] = true;
+                    }
+                }
+            }
             if (!flags[Dirty::VertexBuffer0 + index]) {
                 flush_bindings();
                 continue;

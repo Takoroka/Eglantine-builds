@@ -1121,6 +1121,11 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
     }
 }
 
+void RasterizerVulkan::OnGuestSyncPoint() {
+    std::scoped_lock lock{buffer_cache.mutex};
+    buffer_cache.OnGuestSyncPoint();
+}
+
 void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
     {
         std::scoped_lock lock{texture_cache.mutex};

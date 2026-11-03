@@ -13,6 +13,7 @@
 #include <type_traits>
 #include "common/container/unordered_set.h"
 #include <utility>
+#include <vector>
 
 #include "common/alignment.h"
 #include "common/common_types.h"
@@ -72,8 +73,10 @@ public:
 
     /// Mark region as CPU modified, notifying the device_tracker about this change
     void MarkRegionAsCpuModified(VAddr dirty_cpu_addr, u64 query_size) {
-        IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
+        IteratePages<true>(dirty_cpu_addr, query_size, [this](Manager* manager, u64 offset, size_t size) {
+            manager->hot_pages_enabled = hot_pages_enabled;
             manager->ChangeRegionState(Type::CPU, true, manager->cpu_addr + offset, size);
+            ListManager(manager);
         });
     }
 
@@ -139,9 +142,42 @@ public:
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
     template <typename Func>
     void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
-        IteratePages<true>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {
+        IteratePages<true>(query_cpu_range, query_size, [this, &func](Manager* manager, u64 offset, size_t size) {
             manager->ForEachModifiedRange(Type::CPU, true, manager->cpu_addr + offset, size, func);
+            ListManager(manager);
         });
+    }
+
+    /// The guest may have written memory the work that follows reads: hot pages (pages the guest
+    /// rewrites after every upload, left without write protection) must be uploaded again before
+    /// their next use.
+    void ReArmHotPages() noexcept {
+        std::erase_if(hot_managers, [](Manager* manager) {
+            manager->in_hot_list = manager->ReArmHotPages();
+            return !manager->in_hot_list;
+        });
+    }
+
+    /// Once a frame: ages the uploads that make pages hot. Every DEMOTE_FRAMES frames, and while
+    /// hot pages are off, hot pages are protected again at their next upload; the ones the guest
+    /// still rewrites soon after it become hot again.
+    void TickFrame(bool enable_hot_pages) noexcept {
+        std::erase_if(recent_managers, [](Manager* manager) {
+            manager->in_recent_list = manager->AgeRecentUploads();
+            return !manager->in_recent_list;
+        });
+        for (Manager* const manager : hot_managers) {
+            manager->ClearHotUploads();
+        }
+        hot_pages_enabled = enable_hot_pages;
+        if (++frames_since_demote >= DEMOTE_FRAMES || !hot_pages_enabled) {
+            frames_since_demote = 0;
+            for (Manager* const manager : hot_managers) {
+                manager->DemoteHotPages();
+                manager->in_hot_list = false;
+            }
+            hot_managers.clear();
+        }
     }
 
     /// Call 'func' for each GPU modified range and unmark those pages as GPU modified
@@ -160,6 +196,25 @@ public:
     }
 
 private:
+    static constexpr u32 DEMOTE_FRAMES = 300;
+
+    void ListManager(Manager* manager) {
+        if (manager->has_hot) {
+            manager->has_hot = false;
+            if (!manager->in_hot_list) {
+                manager->in_hot_list = true;
+                hot_managers.push_back(manager);
+            }
+        }
+        if (manager->has_recent) {
+            manager->has_recent = false;
+            if (!manager->in_recent_list) {
+                manager->in_recent_list = true;
+                recent_managers.push_back(manager);
+            }
+        }
+    }
+
     template <bool create_region_on_fail, typename Func>
     bool IteratePages(VAddr cpu_address, size_t size, Func&& func) {
         using FuncReturn = typename std::invoke_result<Func, Manager*, u64, size_t>::type;
@@ -258,6 +313,10 @@ private:
     std::deque<std::array<Manager, MANAGER_POOL_SIZE>> manager_pool;
     std::deque<Manager*> free_managers;
     ::Common::unordered_set<u32> cached_pages;
+    std::vector<Manager*> hot_managers;
+    std::vector<Manager*> recent_managers;
+    u32 frames_since_demote = 0;
+    bool hot_pages_enabled = false; ///< Until TickFrame turns them on
     DeviceTracker* device_tracker = nullptr;
 };
 

@@ -95,6 +95,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 auto* const rasterizer_ptr = renderer.ReadRasterizer();
                 if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
                     Profile::Scope scope{Profile::Zone::Push};
+                    // The guest wrote what the list reads before submitting it.
+                    split.Defer([rasterizer_ptr] { rasterizer_ptr->OnGuestSyncPoint(); });
                     scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
                 } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
                     split.Defer([gpu = &system.GPU()] { gpu->TickWork(); });
@@ -124,6 +126,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             }
             if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
                 Profile::Scope scope{Profile::Zone::Push};
+                // The guest wrote what the list reads before submitting it.
+                renderer.ReadRasterizer()->OnGuestSyncPoint();
                 scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
             } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
                 Profile::Scope scope{Profile::Zone::Tick};
