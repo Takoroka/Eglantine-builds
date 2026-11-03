@@ -113,7 +113,10 @@ public:
             func();
         }
         fences.push(std::move(new_fence));
-        if (should_flush) {
+        // Where queueing a fence submits (Vulkan), flushing again only sent an empty command
+        // buffer: a second submit for each of the ~4,700 fences a second that carry downloads in
+        // Mario Kart World.
+        if (should_flush && !Traits::QUEUE_SUBMITS) {
             rasterizer.FlushCommands();
         }
         if constexpr (can_async_check) {
