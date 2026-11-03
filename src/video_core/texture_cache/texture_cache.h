@@ -340,14 +340,16 @@ void TextureCache<P>::TickFrame() {
                     critical_memory =
                         budget - (std::min)(margin + pressure_margin + slack_margin, budget / 2);
                     expected_memory = critical_memory - (std::min)(margin, critical_memory / 2);
+                    ApplyThresholdOverrides(false);
                     // Log the first values and real changes (the budget moves by a few MiB all
-                    // the time).
+                    // the time). Compared once capped: a budget far over MaxCriticalMemory is
+                    // more than that over the capped value at every check, which logged both
+                    // lines every 30 frames.
                     const u64 change = critical_memory > old_critical
                                            ? critical_memory - old_critical
                                            : old_critical - critical_memory;
-                    const bool log = budget_check_frames == 1 || change >= 256_MiB;
-                    ApplyThresholdOverrides(log);
-                    if (log) {
+                    if (budget_check_frames == 1 || change >= 256_MiB) {
+                        ApplyThresholdOverrides(true);
                         LOG_INFO(HW_GPU,
                                  "Memory margins: base {} MiB, out of memory {} MiB, block slack {} MiB",
                                  margin >> 20, pressure_margin >> 20, slack_margin >> 20);
@@ -2458,9 +2460,22 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         if (IsPixelFormatASTC(new_info.format) && runtime.UseOpaqueAstcFormat()) {
             const size_t scan_bytes = CalculateGuestSizeInBytes(new_info);
             if (scan_bytes <= MaxScanBytes) {
-                astc_scan_buffer.resize(scan_bytes);
-                gpu_memory->ReadBlockUnsafe(gpu_addr, astc_scan_buffer.data(), scan_bytes);
-                new_info.astc_opaque = AstcDataLooksOpaque(astc_scan_buffer);
+                if (const u8* const data = gpu_memory->GetSpan(gpu_addr, scan_bytes)) {
+                    // Contiguous in host memory: scanned where it is, not copied first.
+                    new_info.astc_opaque = AstcDataLooksOpaque({data, scan_bytes});
+                } else {
+                    // In pieces, so a block with alpha early on ends the copying too.
+                    constexpr size_t ScanChunkBytes = 256_KiB;
+                    new_info.astc_opaque = true;
+                    for (size_t offset = 0; offset < scan_bytes && new_info.astc_opaque;
+                         offset += ScanChunkBytes) {
+                        const size_t chunk = (std::min)(ScanChunkBytes, scan_bytes - offset);
+                        astc_scan_buffer.resize(chunk);
+                        gpu_memory->ReadBlockUnsafe(gpu_addr + offset, astc_scan_buffer.data(),
+                                                    chunk);
+                        new_info.astc_opaque = AstcDataLooksOpaque(astc_scan_buffer);
+                    }
+                }
                 ++(new_info.astc_opaque ? astc_opaque_images : astc_alpha_images);
             }
         }
