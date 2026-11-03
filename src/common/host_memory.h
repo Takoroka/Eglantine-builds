@@ -39,10 +39,11 @@ public:
     HostMemory& operator=(const HostMemory& other) = delete;
 
     /**
-     * Move constructors. They will move the buffer and the mappings to the new object.
+     * Not movable: a moved-from object would keep the fallback buffer's pointer and free it a second
+     * time. Nothing moves one; it lives in its owner for the whole session.
      */
-    HostMemory(HostMemory&& other) noexcept;
-    HostMemory& operator=(HostMemory&& other) noexcept;
+    HostMemory(HostMemory&& other) = delete;
+    HostMemory& operator=(HostMemory&& other) = delete;
 
     void Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms,
              bool separate_heap);
