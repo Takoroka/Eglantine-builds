@@ -10,6 +10,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
@@ -118,6 +119,9 @@ inline void MemoryManager::SetBigPageContinuous(size_t big_page_index, bool valu
 
 GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr dev_addr, size_t size, PTEKind kind, MemoryManager::EntryType entry_type) {
     [[maybe_unused]] u64 remaining_size{size};
+    SCOPE_EXIT {
+        translation_generation.fetch_add(1, std::memory_order_release);
+    };
     if (entry_type == EntryType::Mapped) {
         page_table.ReserveRange(gpu_addr, size);
     }
@@ -127,6 +131,8 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
     u64 modified_size{};
     const auto flush_modified = [&] {
         if (modified_size != 0) {
+            // The caches may translate the changed pages: no cached translation from before.
+            translation_generation.fetch_add(1, std::memory_order_release);
             rasterizer->ModifyGPUMemory(unique_identifier, modified_start, modified_size);
             modified_size = 0;
         }
@@ -162,10 +168,15 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
 
 GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr dev_addr, size_t size, PTEKind kind, MemoryManager::EntryType entry_type) {
     [[maybe_unused]] u64 remaining_size{size};
+    SCOPE_EXIT {
+        translation_generation.fetch_add(1, std::memory_order_release);
+    };
     GPUVAddr modified_start{};
     u64 modified_size{};
     const auto flush_modified = [&] {
         if (modified_size != 0) {
+            // The caches may translate the changed pages: no cached translation from before.
+            translation_generation.fetch_add(1, std::memory_order_release);
             rasterizer->ModifyGPUMemory(unique_identifier, modified_start, modified_size);
             modified_size = 0;
         }
@@ -248,17 +259,45 @@ void MemoryManager::Unmap(GPUVAddr gpu_addr, std::size_t size) {
 }
 
 std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr gpu_addr) const {
+    // Draws translate the same few pages again and again (buffer bindings, semaphores): keep the
+    // last pages translated, per thread, while no page table entry changed.
+    struct CachedPage {
+        size_t owner;
+        u64 generation; // 0: empty
+        GPUVAddr begin;
+        u64 mask;
+        DAddr dev_addr_base;
+    };
+    thread_local std::array<CachedPage, 4> cached_pages{};
+    thread_local u32 next_cached_page = 0;
+    const u64 generation = translation_generation.load(std::memory_order_acquire);
+    for (const CachedPage& page : cached_pages) {
+        if (page.generation == generation && page.owner == unique_identifier &&
+            (gpu_addr & ~page.mask) == page.begin) {
+            return page.dev_addr_base + (gpu_addr & page.mask);
+        }
+    }
     if (!IsWithinGPUAddressRange(gpu_addr)) [[unlikely]] {
         return std::nullopt;
     }
+    u64 mask = big_page_mask;
+    DAddr dev_addr_base{};
     if (GetEntry(gpu_addr, true) != EntryType::Mapped) [[unlikely]] {
         if (GetEntry(gpu_addr, false) != EntryType::Mapped)
             return std::nullopt;
-        const DAddr dev_addr_base = DAddr(page_table[PageEntryIndex(gpu_addr, false)]) << cpu_page_bits;
-        return dev_addr_base + (gpu_addr & page_mask);
+        mask = page_mask;
+        dev_addr_base = DAddr(page_table[PageEntryIndex(gpu_addr, false)]) << cpu_page_bits;
+    } else {
+        dev_addr_base = DAddr(big_page_table_dev[PageEntryIndex(gpu_addr, true)]) << cpu_page_bits;
     }
-    const DAddr dev_addr_base = DAddr(big_page_table_dev[PageEntryIndex(gpu_addr, true)]) << cpu_page_bits;
-    return dev_addr_base + (gpu_addr & big_page_mask);
+    cached_pages[next_cached_page++ % cached_pages.size()] = {
+        .owner = unique_identifier,
+        .generation = generation,
+        .begin = gpu_addr & ~mask,
+        .mask = mask,
+        .dev_addr_base = dev_addr_base,
+    };
+    return dev_addr_base + (gpu_addr & mask);
 }
 
 std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr addr, std::size_t size) const {
