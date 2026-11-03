@@ -107,6 +107,20 @@ public:
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     void WaitForWriters();
 
+    /// On the back, while it runs an entry: whether more work was sent after it (false on any
+    /// other thread, or without the split).
+    bool BackHasMoreWork() const {
+        return t_back_read_position != nullptr &&
+               published.load(std::memory_order_relaxed) - *t_back_read_position > 64;
+    }
+
+    /// Runs on the back after it ran everything sent so far, before the front can see it done
+    /// (the back still owns the rasterizer then): work the back put off until it idles.
+    void SetBackIdleHook(void (*hook)(void*), void* context) {
+        back_idle_context = context;
+        back_idle_hook = hook;
+    }
+
 private:
     enum class Kind : u64 {
         Wrap,   ///< The rest of the ring is unused: continue at its start
@@ -172,6 +186,10 @@ private:
 
     // Back side.
     Tegra::Engines::EngineInterface* back_engine{};
+    void (*back_idle_hook)(void*){};
+    void* back_idle_context{};
+    /// The back thread's read position (BackHasMoreWork); null on other threads.
+    static inline thread_local const u64* t_back_read_position{};
 
     static GpuSplit instance;
 

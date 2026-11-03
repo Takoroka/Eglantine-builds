@@ -340,6 +340,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     g_back_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
 #endif
     u64 read_position = 0;
+    t_back_read_position = &read_position;
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread");
         u64 available = published.load(std::memory_order_acquire);
@@ -377,6 +378,10 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 consumed.store(read_position, std::memory_order_release);
                 last_store = read_position;
             }
+        }
+        if (back_idle_hook != nullptr &&
+            published.load(std::memory_order_acquire) == read_position) {
+            back_idle_hook(back_idle_context);
         }
         g_back_busy.store(false, std::memory_order_release);
         consumed.store(read_position, std::memory_order_release);

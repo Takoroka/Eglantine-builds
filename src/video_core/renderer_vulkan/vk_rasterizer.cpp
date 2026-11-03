@@ -234,9 +234,16 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
       wfi_event(device.GetLogical().CreateEvent()) {
     scheduler.SetQueryCache(query_cache);
+    // Buffer downloads fences put off go out before the split's back runs out of work.
+    VideoCommon::GpuSplit::Get().SetBackIdleHook(
+        [](void* self) {
+            static_cast<RasterizerVulkan*>(self)->fence_manager.FlushDeferredDownloads(true);
+        },
+        this);
 }
 
 RasterizerVulkan::~RasterizerVulkan() {
+    VideoCommon::GpuSplit::Get().SetBackIdleHook(nullptr, nullptr);
     scheduler.WaitWorker();
     scheduler.Finish();
 }
@@ -1270,6 +1277,7 @@ void RasterizerVulkan::FlushCommands() {
 }
 
 void RasterizerVulkan::TickFrame() {
+    fence_manager.FlushDeferredDownloads(true);
     draw_counter = 0;
     pipeline_cache.TickFrame();
     guest_descriptor_queue.TickFrame();
@@ -1411,6 +1419,8 @@ void RasterizerVulkan::LoadDiskResources(u64 title_id, std::stop_token stop_load
 }
 
 void RasterizerVulkan::FlushWork() {
+    // Before the draw or dispatch takes the cache locks: downloads put off past their window.
+    fence_manager.FlushDeferredDownloads(false);
 #ifdef __ANDROID__
     static constexpr u32 DRAWS_TO_DISPATCH = 512;
     static constexpr u32 CHECK_MASK = 3;
@@ -1446,7 +1456,10 @@ void RasterizerVulkan::FlushWork() {
         scheduler.DispatchWork();
         return;
     }
-    scheduler.Flush();
+    // Buffer downloads that fences left for later go with this submit.
+    if (!fence_manager.FlushDeferredDownloads(true)) {
+        scheduler.Flush();
+    }
     draw_counter = 0;
 }
 
