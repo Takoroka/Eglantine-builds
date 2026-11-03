@@ -27,22 +27,30 @@ public:
     std::string_view Signal(Address address, Word argument, Read read, Release release, Dispatch dispatch) {
         struct Pending { Address address; Word action; Word count; };
         std::string_view error;
-        std::array<Pending, 256> pending{};
+        // Only the first `count` entries are read: not zeroed (4 KiB for each of the thousands of
+        // calls a second).
+        std::array<Pending, 256> pending;
         std::size_t count = 1;
         pending[0] = {address, argument & 15, ((argument >> 14) & 0x3ff) + 1};
         for (std::size_t i = 0; i < count; ++i) {
             const auto request = pending[i];
-            if (states.size() >= 4096 && !states.contains(request.address)) {
-                // Finished QMDs with nothing deferred are only history, drop them instead of stalling.
-                std::erase_if(states, [](const auto& entry) {
-                    return entry.second.completed && entry.second.deferred == 0;
-                });
-                if (states.size() >= 4096) return "QMD cache limit";
+            auto found = states.find(request.address);
+            if (found == states.end()) {
+                if (states.size() >= 4096) {
+                    // Finished QMDs with nothing deferred are only history, drop them instead of stalling.
+                    std::erase_if(states, [](const auto& entry) {
+                        return entry.second.completed && entry.second.deferred == 0;
+                    });
+                    if (states.size() >= 4096) return "QMD cache limit";
+                }
+                found = states.try_emplace(request.address).first;
             }
-            auto& state = states[request.address];
+            auto& state = found->second;
+            bool just_read = false;
             if (request.action == 3 || request.action == 2) {
                 if (request.action == 3 || !state.loaded) {
                     if (!read(request.address, state.descriptor)) return "unmapped QMD";
+                    just_read = true;
                     const auto& qmd = state.descriptor;
                     if ((qmd[18] & 0xff) != 0x30 || (qmd[4] & 0x100)) return "unsupported QMD version or queue";
                     if constexpr (std::is_same_v<Dispatch, RejectShaderDispatch>) {
@@ -74,8 +82,9 @@ public:
             if (!state.loaded || !state.scheduled || state.completed || state.dependencies > 0) continue;
             if (state.dependencies < 0) return "QMD dependency underflow";
             // The SDK patches release payloads while a scheduled QMD is
-            // waiting for its remaining dependencies. Fetch them at execution.
-            if (!read(request.address, state.descriptor)) return "unmapped QMD";
+            // waiting for its remaining dependencies. Fetch them at execution, unless this very
+            // request just read the QMD (scheduled with nothing left to wait for).
+            if (!just_read && !read(request.address, state.descriptor)) return "unmapped QMD";
             const auto qmd = state.descriptor;
             if ((qmd[18] & 0xff) != 0x30 || (qmd[4] & 0x100)) return "unsupported QMD version or queue";
             // Validate the release slots before making any visible.
