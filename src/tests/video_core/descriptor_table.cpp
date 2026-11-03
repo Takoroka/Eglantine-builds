@@ -18,6 +18,12 @@ struct DescriptorMemory {
         const auto offset = (address - 0x1000) % 0x1000;
         std::memcpy(output, reinterpret_cast<const u8*>(banks[bank].data()) + offset, size);
     }
+
+    const u8* GetPointer(GPUVAddr address) const {
+        const auto bank = (address - 0x1000) / 0x1000;
+        const auto offset = (address - 0x1000) % 0x1000;
+        return reinterpret_cast<const u8*>(banks[bank].data()) + offset;
+    }
 };
 } // namespace
 
@@ -56,8 +62,8 @@ TEST_CASE("Descriptor invalidation matches eager refresh across mutations", "[de
             const u64 expected = memory.banks[bank][index];
             const bool changed = !seen[index] || previous[index] != expected;
             const auto actual = table.Read(memory, index);
-            REQUIRE(actual.first == expected);
-            REQUIRE(actual.second == changed);
+            REQUIRE(table.descriptors[index] == expected);
+            REQUIRE((actual != VideoCommon::DescriptorRead::Same) == changed);
             seen[index] = true;
             previous[index] = expected;
         }
@@ -71,7 +77,7 @@ TEST_CASE("Repeated image deletion cannot reuse stale descriptor view IDs", "[de
     std::array<std::array<unsigned, 128>, 5> view_ids{};
     unsigned live_generation = 1;
     const auto visit = [&](size_t channel, u32 index) {
-        if (channels[channel].Read(memory, index).second) {
+        if ((channels[channel].Read(memory, index) != VideoCommon::DescriptorRead::Same)) {
             view_ids[channel][index] = live_generation;
         }
         return view_ids[channel][index];
@@ -92,7 +98,7 @@ TEST_CASE("Repeated image deletion cannot reuse stale descriptor view IDs", "[de
         for (size_t channel = 0; channel < channels.size(); ++channel) {
             for (u32 index = 0; index < 128; ++index) {
                 REQUIRE(visit(channel, index) == live_generation);
-                REQUIRE_FALSE(channels[channel].Read(memory, index).second);
+                REQUIRE_FALSE((channels[channel].Read(memory, index) != VideoCommon::DescriptorRead::Same));
             }
         }
     }
@@ -108,28 +114,28 @@ TEST_CASE("Descriptor limits clear exposed slots after shrink and growth", "[des
     for (const u32 limit : limits) {
         VideoCommon::DescriptorTable<u64> table;
         REQUIRE(table.Synchronize(0x1000, limit));
-        CHECK(table.Read(memory, limit).second);
-        CHECK_FALSE(table.Read(memory, limit).second);
+        CHECK((table.Read(memory, limit) != VideoCommon::DescriptorRead::Same));
+        CHECK_FALSE((table.Read(memory, limit) != VideoCommon::DescriptorRead::Same));
         table.Refresh(0x1000, 0);
         table.Invalidate();
-        CHECK(table.Read(memory, 0).second);
-        CHECK_FALSE(table.Read(memory, 0).second);
+        CHECK((table.Read(memory, 0) != VideoCommon::DescriptorRead::Same));
+        CHECK_FALSE((table.Read(memory, 0) != VideoCommon::DescriptorRead::Same));
         table.Refresh(0x1000, limit);
-        CHECK(table.Read(memory, limit).second);
-        CHECK_FALSE(table.Read(memory, limit).second);
+        CHECK((table.Read(memory, limit) != VideoCommon::DescriptorRead::Same));
+        CHECK_FALSE((table.Read(memory, limit) != VideoCommon::DescriptorRead::Same));
         table.Invalidate();
         table.Invalidate();
-        CHECK(table.Read(memory, limit).second);
-        CHECK_FALSE(table.Read(memory, limit).second);
+        CHECK((table.Read(memory, limit) != VideoCommon::DescriptorRead::Same));
+        CHECK_FALSE((table.Read(memory, limit) != VideoCommon::DescriptorRead::Same));
     }
     for (const u32 limit :
          {std::numeric_limits<u32>::max(), std::numeric_limits<u32>::max() - 0x1000}) {
         VideoCommon::DescriptorTable<u64> table;
         table.Refresh(0x1000, limit);
-        CHECK(table.Read(memory, 0).second);
+        CHECK((table.Read(memory, 0) != VideoCommon::DescriptorRead::Same));
         table.Invalidate();
-        CHECK(table.Read(memory, 0).second);
-        CHECK_FALSE(table.Read(memory, 0).second);
+        CHECK((table.Read(memory, 0) != VideoCommon::DescriptorRead::Same));
+        CHECK_FALSE((table.Read(memory, 0) != VideoCommon::DescriptorRead::Same));
     }
 }
 
@@ -154,7 +160,7 @@ TEST_CASE("Descriptor invalidation CPU benchmark", "[.][cache_bench]") {
                 }
             }
             for (auto& table : tables) {
-                changed += table.Read(memory, 0).second;
+                changed += (table.Read(memory, 0) != VideoCommon::DescriptorRead::Same);
             }
         }
         const auto ms =
