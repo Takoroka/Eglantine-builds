@@ -244,6 +244,7 @@ void GpuSplit::WaitForWriters() {
 void GpuSplit::RecordWrite(const Tegra::MemoryManager& memory, GPUVAddr address, size_t size,
                            const void* data) {
     const auto* bytes = static_cast<const u8*>(data);
+    const u64 position = run_count != 0 ? InRun : write_position;
     while (size != 0) {
         // A piece per 4 KiB page: each maps contiguous device memory.
         const size_t piece = std::min<size_t>(size, 0x1000 - (address & 0xfff));
@@ -260,9 +261,9 @@ void GpuSplit::RecordWrite(const Tegra::MemoryManager& memory, GPUVAddr address,
                 last->address + last->size == *device && last->data + last->size == index &&
                 last_unplaced_write <= last->position && last->size < 0x10000) {
                 last->size += piece;
-                last->position = write_position;
+                last->position = position;
             } else {
-                pending_writes.push_back({write_position, *device, piece, index});
+                pending_writes.push_back({position, *device, piece, index});
             }
         }
         // Unmapped: the back skips the write too.
@@ -444,6 +445,12 @@ void GpuSplit::FlushRun() {
     }
     std::memcpy(entry + head, run_writes.data(), size_t{count} * sizeof(u64));
     Commit(size);
+    // Writes recorded while the run was collected (constant buffer data for ReadAhead) are made
+    // when the back runs this entry. Any other entry flushes the run first, so they are the last.
+    for (size_t i = pending_writes.size();
+         i > pending_head && pending_writes[i - 1].position == InRun; --i) {
+        pending_writes[i - 1].position = write_position;
+    }
 }
 
 void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {

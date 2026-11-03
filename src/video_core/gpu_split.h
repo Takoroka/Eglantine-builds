@@ -258,6 +258,9 @@ private:
         u64 data; ///< Index of the bytes in pending_data, or NoData
     };
     static constexpr u64 NoData = ~u64{0};
+    /// Position of writes recorded while a run (StateWrite, DataWrite) is still being collected:
+    /// the back makes them once it runs that entry, whose end FlushRun fills in.
+    static constexpr u64 InRun = ~u64{0};
     void RecordWrite(const Tegra::MemoryManager& memory, GPUVAddr address, size_t size,
                      const void* data);
     void PrunePendingWrites();

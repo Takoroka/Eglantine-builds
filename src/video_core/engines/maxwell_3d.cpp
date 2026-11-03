@@ -1223,6 +1223,10 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
                 if (fs.state_runs) {
                     // Consecutive words land next to each other: one guest memory write.
                     split.DataWrite(this, method, value);
+                    if (split.ReadsAhead()) {
+                        FrontNoteWrite(split, memory_manager, fs.regs.data(), fs.upload, method,
+                                       value, from_macro || is_last_call);
+                    }
                     return;
                 }
             } else if (!FrontHandledOutsideDrawManager(method)) {
