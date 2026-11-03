@@ -164,6 +164,7 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
         kind_map.Map(gpu_addr, gpu_addr + size, kind);
         kind_map_generation.fetch_add(1, std::memory_order_release);
     }
+    map_generation.fetch_add(1, std::memory_order_release);
     return gpu_addr;
 }
 
@@ -225,6 +226,7 @@ GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr
         kind_map.Map(gpu_addr, gpu_addr + size, kind);
         kind_map_generation.fetch_add(1, std::memory_order_release);
     }
+    map_generation.fetch_add(1, std::memory_order_release);
     return gpu_addr;
 }
 

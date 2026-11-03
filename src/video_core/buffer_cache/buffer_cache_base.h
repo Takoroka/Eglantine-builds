@@ -517,6 +517,11 @@ private:
     [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
                                                bool is_written) const;
 
+    /// The binding of a storage buffer whose address and following word (its size, when the
+    /// shader packs one) were read already.
+    [[nodiscard]] Binding StorageBufferBinding(GPUVAddr gpu_addr, u64 next_qword, u32 cbuf_index,
+                                               bool is_written) const;
+
     [[nodiscard]] TextureBufferBinding GetTextureBufferBinding(GPUVAddr gpu_addr, u32 size,
                                                                PixelFormat format);
 
@@ -634,6 +639,31 @@ private:
     VirtualRangeCache virtual_ranges;
     std::vector<MultiRangeSegment> graphics_segments;
     std::vector<MultiRangeSegment> compute_segments;
+
+    /// The binding each compute storage buffer source gave last: the same two words read from the
+    /// constant buffer under the same page tables give the same binding, without the memory
+    /// layout lookup and address translations (every storage buffer of thousands of dispatches a
+    /// second).
+    struct StorageBindingSource {
+        size_t as_id;
+        GPUVAddr ssbo_addr;
+        std::array<u64, 2> words;
+        u64 map_generation;
+        bool is_written;
+        bool valid;
+        Binding binding;
+    };
+    std::array<StorageBindingSource, 64> compute_storage_binding_sources{};
+
+    /// Storage buffer ranges the virtual range cache found in one piece, with the page tables
+    /// they were found under (ResolveMultiRangeStorage).
+    struct SingleRange {
+        size_t as_id;
+        GPUVAddr gpu_addr;
+        u32 size;
+        u64 map_generation;
+    };
+    std::array<SingleRange, 256> single_ranges{};
     u64 frame_tick = 0;
     u64 total_used_memory = 0;
     u64 buffer_bytes = 0; ///< The buffers' own size (total_used_memory may be the device's)

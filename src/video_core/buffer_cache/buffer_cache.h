@@ -667,8 +667,31 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
 
     const auto& cbufs = launch_desc.const_buffer_config;
     const GPUVAddr ssbo_addr = cbufs[cbuf_index].Address() + cbuf_offset;
-    channel_state->compute_storage_buffers[ssbo_index] =
-        StorageBufferBinding(ssbo_addr, cbuf_index, is_written);
+    // The storage buffer's address and size as the shader reads them: the same words under the same
+    // page tables give the binding of last time.
+    std::array<u64, 2> words;
+    gpu_memory->ReadBlockUnsafe(ssbo_addr, words.data(), sizeof(words));
+    const size_t as_id = gpu_memory->GetID();
+    const u64 map_generation = gpu_memory->MapGeneration();
+    StorageBindingSource& source =
+        compute_storage_binding_sources[((ssbo_addr >> 4) ^ (as_id << 5)) %
+                                        compute_storage_binding_sources.size()];
+    if (!source.valid || source.ssbo_addr != ssbo_addr || source.as_id != as_id ||
+        source.words != words || source.map_generation != map_generation ||
+        source.is_written != is_written) {
+        source = StorageBindingSource{
+            .as_id = as_id,
+            .ssbo_addr = ssbo_addr,
+            .words = words,
+            .map_generation = map_generation,
+            .is_written = is_written,
+            .valid = true,
+            .binding = words[0] == 0
+                           ? NULL_BINDING
+                           : StorageBufferBinding(words[0], words[1], cbuf_index, is_written),
+        };
+    }
+    channel_state->compute_storage_buffers[ssbo_index] = source.binding;
 }
 
 template <class P>
@@ -1241,9 +1264,26 @@ void BufferCache<P>::ResolveMultiRangeStorage(Binding& binding, bool is_written,
         if (is_written && !runtime.PrefersSparseSources()) {
             return;
         }
+        // A range found in one piece stays so while the page tables do (unmaps reach the virtual
+        // range cache from the page table operations): most storage buffers are, and asking the
+        // cache for each of every draw and dispatch cost ~1.5% of the GPU thread.
+        const size_t as_id = gpu_memory->GetID();
+        const u64 map_generation = gpu_memory->MapGeneration();
+        SingleRange& known = single_ranges[((binding.gpu_addr >> 6) ^ binding.size ^ (as_id << 7)) %
+                                           single_ranges.size()];
+        if (known.gpu_addr == binding.gpu_addr && known.size == binding.size &&
+            known.as_id == as_id && known.map_generation == map_generation) {
+            return;
+        }
         const VirtualSegments* found =
             virtual_ranges.Query(*gpu_memory, binding.gpu_addr, binding.size);
         if (!found || found->size() < 2) {
+            known = SingleRange{
+                .as_id = as_id,
+                .gpu_addr = binding.gpu_addr,
+                .size = binding.size,
+                .map_generation = map_generation,
+            };
             return;
         }
         const VirtualSegments segments = *found;
@@ -2547,11 +2587,16 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     if (gpu_addr == 0) {
         return NULL_BINDING;
     }
+    return StorageBufferBinding(gpu_addr, gpu_memory->Read<u64>(ssbo_addr + 8), cbuf_index,
+                                is_written);
+}
 
+template <class P>
+Binding BufferCache<P>::StorageBufferBinding(GPUVAddr gpu_addr, u64 next_qword, u32 cbuf_index,
+                                             bool is_written) const {
     const auto size = [&]() {
         const u32 memory_layout_size =
             static_cast<u32>(gpu_memory->GetMemoryLayoutSize(gpu_addr));
-        const u64 next_qword = gpu_memory->Read<u64>(ssbo_addr + 8);
         const u32 packed_size = static_cast<u32>(next_qword);
         const bool next_qword_is_size = static_cast<u32>(next_qword >> 32) == 0 &&
                                         packed_size != 0 &&
