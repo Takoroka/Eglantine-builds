@@ -61,8 +61,8 @@ public:
         if (page_end < page || page_end >= pages.size()) {
             return;
         }
-        touched_begin = std::min(touched_begin, page);
-        touched_end = std::max(touched_end, page_end + 1);
+        touched_begin = (std::min)(touched_begin, page);
+        touched_end = (std::max)(touched_end, page_end + 1);
         TrackPage(page, offset, size);
         if (page == page_end) {
             return;

@@ -916,7 +916,7 @@ struct FrontUpload {
 
     void Word(VideoCommon::GpuSplit& split, const MemoryManager& memory, const u32* regs,
               u32 value, bool is_last_call) {
-        const u32 bytes = offset <= size ? std::min(4U, size - offset) : 4U;
+        const u32 bytes = offset <= size ? (std::min)(4U, size - offset) : 4U;
         const auto* const data = reinterpret_cast<const u8*>(&value);
         run.insert(run.end(), data, data + bytes);
         offset += bytes;
@@ -938,7 +938,7 @@ struct FrontUpload {
             split.NoteUnplacedWrite();
             return;
         }
-        const u32 count = offset <= size ? std::min(amount * 4, size - offset) : amount * 4;
+        const u32 count = offset <= size ? (std::min)(amount * 4, size - offset) : amount * 4;
         if (count != 0) {
             split.NoteWrite(memory, Destination(regs) + offset, count, words);
             offset += count;
