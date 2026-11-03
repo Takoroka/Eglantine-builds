@@ -2148,6 +2148,12 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
     constexpr bool use_optimized_vertex_buffers = true;
 #endif
 
+    // Most binds find nothing to upload. Look at the range's tracking bits first: walking it for
+    // upload ranges (and collecting pages to track again) was ~2% of Mario Kart World's split GPU
+    // back thread even where nothing changed.
+    if (memory_tracker.IsRegionCpuClean(device_addr, size)) {
+        return true;
+    }
     if (use_optimized_vertex_buffers) {
         upload_copies.clear();
         u64 total_size_bytes = 0;
