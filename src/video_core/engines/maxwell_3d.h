@@ -3202,6 +3202,12 @@ public:
     /// Write multiple values to the register identified by method.
     void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) override;
 
+    /// State writes the split GPU thread's front collected (FrontWrite), applied in one pass.
+    void ApplyStateRun(Core::System& system, const u64* flags, const u64* writes, u32 count,
+                       u8 tags) override;
+    /// Constant buffer data words the front collected, written to guest memory together.
+    void ApplyDataRun(Core::System& system, const u64* writes, u32 count) override;
+
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod: runs macros and macro uploads against a copy of the
     /// registers and sends the register writes to the back thread.
@@ -3213,6 +3219,12 @@ public:
     bool ShouldExecute() const {
         return execute_on;
     }
+
+    /// For state kept per register outside the dirty flags: the bits a state run carries for each
+    /// write that changes the register (set once, at construction), and what the back does with a
+    /// run's bits instead of each write's ProcessDirtyRegisters. Nothing yet.
+    std::array<u8, Regs::NUM_REGS> state_run_tags{};
+    void OnStateRunTags([[maybe_unused]] u8 tags) {}
 
     VideoCore::RasterizerInterface& Rasterizer() {
         return *rasterizer;
