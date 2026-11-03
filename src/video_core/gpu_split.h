@@ -9,11 +9,16 @@
 #include <memory>
 #include <thread>
 #include <type_traits>
+#include <vector>
 
 #include "common/common_types.h"
 
 namespace Core {
 class System;
+}
+
+namespace Tegra {
+class MemoryManager;
 }
 
 namespace Tegra::Engines {
@@ -107,6 +112,45 @@ public:
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     void WaitForWriters();
 
+    // Reads ahead of the back (the 3D engine's MME DMA reads): the front keeps a record of the
+    // guest memory writes it queued for the back that it can predict (constant buffer and inline
+    // uploads, payload releases) and of the last queued work that writes where it can't tell
+    // (compute work, copies). A read then waits only for the latter, and only when there is any,
+    // instead of for everything queued. Front thread only.
+
+    [[nodiscard]] bool ReadsAhead() const {
+        return read_ahead;
+    }
+    /// The entry just sent writes `size` bytes at `address` when the back runs it; `data`: the
+    /// bytes, nullptr when the front can't know them (a timestamp, a counter).
+    void NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, size_t size,
+                   const void* data) {
+        if (read_ahead) {
+            RecordWrite(memory, address, size, data);
+        }
+    }
+    /// A queued payload release: the payload, or (not `one_word`) the payload as a 64-bit value
+    /// and a timestamp.
+    void NoteRelease(const Tegra::MemoryManager& memory, GPUVAddr address, u32 payload,
+                     bool one_word);
+    /// The entry just sent may write guest memory the front can't place.
+    void NoteUnplacedWrite() {
+        last_unplaced_write = write_position;
+    }
+    /// Reads `count` words at `address` as the back will see them once it has run everything
+    /// sent so far. False when the front can't tell (pages the GPU writes, whose newest words may
+    /// be in the back's caches; releases applied late): the caller drains and reads itself.
+    bool ReadAhead(Tegra::MemoryManager& memory, GPUVAddr address, u32* words, u32 count);
+
+    struct ReadAheadStats {
+        u64 reads;
+        u64 fallbacks; ///< ReadAhead returned false
+        u64 waits;     ///< Waited for queued writes it couldn't predict
+        u64 wait_ns;
+        u64 overlays;  ///< Reads that took words from queued writes
+    };
+    ReadAheadStats read_ahead_stats{};
+
 private:
     enum class Kind : u64 {
         Wrap,   ///< The rest of the ring is unused: continue at its start
@@ -153,6 +197,21 @@ private:
     }
     void SwitchEngine(Tegra::Engines::EngineInterface* engine);
 
+    /// A guest memory write queued for the back (NoteWrite).
+    struct PendingWrite {
+        u64 position; ///< The back has made it once it consumed this far
+        DAddr address;
+        u64 size;
+        u64 data; ///< Index of the bytes in pending_data, or NoData
+    };
+    static constexpr u64 NoData = ~u64{0};
+    void RecordWrite(const Tegra::MemoryManager& memory, GPUVAddr address, size_t size,
+                     const void* data);
+    void PrunePendingWrites();
+    void ClearPendingWrites();
+    /// Waits until the back consumed `target`.
+    void WaitFor(u64 target);
+
     void BackLoop(std::stop_token stop_token);
     size_t Execute(const u64* entry);
 
@@ -169,6 +228,15 @@ private:
     /// Words between publishes: small right after a drain, while the back has nothing to do.
     size_t publish_every{PublishEvery};
     Tegra::Engines::EngineInterface* front_engine{};
+    /// Queued guest memory writes (ReadAhead), oldest first from pending_head, and their bytes.
+    bool read_ahead{};
+    std::vector<PendingWrite> pending_writes;
+    size_t pending_head{};
+    std::vector<u8> pending_data;
+    u64 pending_data_base{}; ///< Index of pending_data[0]
+    size_t prune_at{};
+    size_t prune_data_at{};
+    u64 last_unplaced_write{};
 
     // Back side.
     Tegra::Engines::EngineInterface* back_engine{};

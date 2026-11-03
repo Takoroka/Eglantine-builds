@@ -866,6 +866,59 @@ Texture::TSCEntry KeplerCompute::GetTSCEntry(u32 tsc_index) const {
     return tsc_entry;
 }
 
+namespace {
+
+/// The guest memory a compute method writes when the split's back runs it (as
+/// ProcessNativeMethod), for the front's record of queued writes (GpuSplit::NoteWrite), with
+/// `r` past the write. Launches and what the QMD scheduler releases only the back knows.
+void FrontNoteWrite(VideoCommon::GpuSplit& split, const MemoryManager& memory,
+                    const std::array<u32, 0x1000>& r, u32 method, u32 argument) {
+    if (!split.ReadsAhead()) {
+        return;
+    }
+    switch (method) {
+    case 0x6c3: { // As ProcessNativeReportSemaphore
+        const u32 operation = argument & 3;
+        if (operation != 0 && operation != 2) {
+            return;
+        }
+        const GPUVAddr address = (GPUVAddr{r[0x6c0] & 0x1ffffff} << 32) | r[0x6c1];
+        if ((argument >> 3) & 1) {
+            // A reduction of the word in memory.
+            split.NoteWrite(memory, address, sizeof(u32), nullptr);
+            return;
+        }
+        split.NoteRelease(memory, address, r[0x6c2], ((argument >> 28) & 1) != 0);
+        return;
+    }
+    case 0x107: { // An inline QMD: written to memory, then maybe scheduled
+        const GPUVAddr address = ((GPUVAddr{r[0xc6]} << 32) | r[0xc7]) << 8;
+        split.NoteWrite(memory, address, 256, r.data() + 0xc8);
+        if ((r[0xa7] & (1U << 24)) || !(r[0xcc] & (1U << 12))) {
+            split.NoteUnplacedWrite();
+        }
+        return;
+    }
+    case 0xae:
+    case 0xaf:
+    case 0xb0:
+        if (method == 0xae || (method == 0xaf && !(argument & 2)) ||
+            (method == 0xb0 && ((argument & 15) == 0 || (argument & 15) == 1))) {
+            return;
+        }
+        split.NoteUnplacedWrite();
+        return;
+    case KEPLER_COMPUTE_REG_INDEX(exec_upload):
+    case KEPLER_COMPUTE_REG_INDEX(data_upload):
+        split.NoteUnplacedWrite();
+        return;
+    default:
+        return;
+    }
+}
+
+} // Anonymous namespace
+
 // Split GPU thread with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2): the front
 // runs compute macros against its own copy of the native registers (which hold the last value
 // written to each, on the back too) and loads and binds the compute macro code itself.
@@ -965,6 +1018,7 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
     }
     FrontApply(fs, method, argument);
     split.Method(this, method, argument, is_last_call, segment);
+    FrontNoteWrite(split, memory_manager, fs.registers, method, argument);
 }
 
 void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split,
@@ -983,6 +1037,9 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
         }
     }
     split.MultiMethod(this, method, base_start, amount, methods_pending, segment);
+    for (u32 i = 0; i < amount; ++i) {
+        FrontNoteWrite(split, memory_manager, fs.registers, method, base_start[i]);
+    }
 }
 
 void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1011,6 +1068,7 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
             }
             FrontApply(fs, address, value);
             split.MacroWrite(this, address, value);
+            FrontNoteWrite(split, memory_manager, fs.registers, address, value);
             return true;
         });
     if (!result.success) {

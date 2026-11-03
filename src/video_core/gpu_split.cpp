@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <thread>
 
@@ -22,6 +23,7 @@
 #include "core/core.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/gpu_split.h"
+#include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 
@@ -119,6 +121,9 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     const char* jit = std::getenv("EDEN_NX2_MME_JIT");
     front_macros = mode == '2' && (jit == nullptr || jit[0] != '0');
 #endif
+    // EDEN_NX2_READ_AHEAD=0: the front's macros drain the back for every DMA read.
+    const char* read_ahead_mode = std::getenv("EDEN_NX2_READ_AHEAD");
+    read_ahead = front_macros && (read_ahead_mode == nullptr || read_ahead_mode[0] != '0');
     LOG_INFO(HW_GPU, "GPU thread split: engine methods run on a second thread{}",
              front_macros ? ", macros on the first" : "");
 }
@@ -145,6 +150,9 @@ void GpuSplit::Stop() {
     front_engine = nullptr;
     back_engine = nullptr;
     front_macros = false;
+    read_ahead = false;
+    ClearPendingWrites();
+    last_unplaced_write = 0;
     published.store(0, std::memory_order_relaxed);
     consumed.store(0, std::memory_order_relaxed);
     back_waiting.store(false, std::memory_order_relaxed);
@@ -199,6 +207,7 @@ void GpuSplit::Publish() {
 void GpuSplit::Drain() {
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache == write_position) {
+        ClearPendingWrites();
         return;
     }
     Publish();
@@ -207,6 +216,7 @@ void GpuSplit::Drain() {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache == write_position) {
             publish_every = 8;
+            ClearPendingWrites();
             return;
         }
         if (spins < 16384) {
@@ -218,7 +228,172 @@ void GpuSplit::Drain() {
 }
 
 void GpuSplit::WaitForWriters() {
-    const u64 target = std::min(last_writer_position, write_position);
+    WaitFor(std::min(last_writer_position, write_position));
+}
+
+void GpuSplit::RecordWrite(const Tegra::MemoryManager& memory, GPUVAddr address, size_t size,
+                           const void* data) {
+    const auto* bytes = static_cast<const u8*>(data);
+    while (size != 0) {
+        // A piece per 4 KiB page: each maps contiguous device memory.
+        const size_t piece = std::min<size_t>(size, 0x1000 - (address & 0xfff));
+        if (const auto device = memory.GpuToCpuAddress(address)) {
+            const u64 index = bytes != nullptr ? pending_data_base + pending_data.size() : NoData;
+            if (bytes != nullptr) {
+                pending_data.insert(pending_data.end(), bytes, bytes + piece);
+            }
+            // Constant buffer uploads come a word at a time: extend the last write. Its older
+            // bytes count as written later, which only matters past work the front can't place.
+            PendingWrite* const last =
+                pending_head == pending_writes.size() ? nullptr : &pending_writes.back();
+            if (last != nullptr && index != NoData && last->data != NoData &&
+                last->address + last->size == *device && last->data + last->size == index &&
+                last_unplaced_write <= last->position && last->size < 0x10000) {
+                last->size += piece;
+                last->position = write_position;
+            } else {
+                pending_writes.push_back({write_position, *device, piece, index});
+            }
+        }
+        // Unmapped: the back skips the write too.
+        address += piece;
+        size -= piece;
+        if (bytes != nullptr) {
+            bytes += piece;
+        }
+    }
+    if (pending_writes.size() >= prune_at || pending_data.size() >= prune_data_at) {
+        consumed_cache = consumed.load(std::memory_order_acquire);
+        PrunePendingWrites();
+        prune_at = pending_writes.size() + 4096;
+        prune_data_at = pending_data.size() + 0x100000;
+    }
+}
+
+void GpuSplit::PrunePendingWrites() {
+    while (pending_head != pending_writes.size() &&
+           pending_writes[pending_head].position <= consumed_cache) {
+        ++pending_head;
+    }
+    if (pending_head == pending_writes.size()) {
+        ClearPendingWrites();
+        return;
+    }
+    // Drop what the back has written now and then.
+    if (pending_head >= 1024 && pending_head * 2 >= pending_writes.size()) {
+        pending_writes.erase(pending_writes.begin(),
+                             pending_writes.begin() + static_cast<ptrdiff_t>(pending_head));
+        pending_head = 0;
+    }
+    u64 first = pending_data_base + pending_data.size();
+    for (size_t i = pending_head; i < pending_writes.size(); ++i) {
+        if (pending_writes[i].data != NoData) {
+            first = pending_writes[i].data;
+            break;
+        }
+    }
+    const u64 dead = first - pending_data_base;
+    if (dead >= 0x10000 && dead * 2 >= pending_data.size()) {
+        pending_data.erase(pending_data.begin(), pending_data.begin() + static_cast<ptrdiff_t>(dead));
+        pending_data_base = first;
+    }
+}
+
+void GpuSplit::NoteRelease(const Tegra::MemoryManager& memory, GPUVAddr address, u32 payload,
+                           bool one_word) {
+    // As the query cache writes payload reports.
+    if (one_word) {
+        NoteWrite(memory, address, sizeof(payload), &payload);
+        return;
+    }
+    const u64 value = payload;
+    NoteWrite(memory, address, sizeof(value), &value);
+    NoteWrite(memory, address + sizeof(value), sizeof(u64), nullptr);
+}
+
+void GpuSplit::ClearPendingWrites() {
+    pending_writes.clear();
+    pending_head = 0;
+    pending_data.clear();
+    pending_data_base = 0;
+    prune_at = 4096;
+    prune_data_at = 0x100000;
+}
+
+bool GpuSplit::ReadAhead(Tegra::MemoryManager& memory, GPUVAddr address, u32* words, u32 count) {
+    ++read_ahead_stats.reads;
+    // Releases (and their payloads) reach memory as the back runs them only with the default
+    // fence behavior: delayed ones land when the host GPU gets there.
+    const bool delayed_releases = Settings::IsGPUFenceBehaviorDefault()
+                                      ? Settings::IsGPULevelHigh()
+                                      : Settings::IsGPUFenceBehaviorBalanced() ||
+                                            Settings::IsGPUFenceBehaviorAccurate();
+    const u64 size = u64{count} * sizeof(u32);
+    const auto device = memory.GpuToCpuAddress(address);
+    if (!read_ahead || delayed_releases || count == 0 || !device ||
+        memory.GpuToCpuAddress(address + size - 1) != *device + size - 1) {
+        ++read_ahead_stats.fallbacks;
+        return false;
+    }
+    // GPU work writes these pages through the buffer cache: the words may be newer there.
+    const auto gpu_written = [&] {
+        for (DAddr page = *device & ~DAddr{0xfff}; page < *device + size; page += 0x1000) {
+            if (Tegra::Nx2IsGpuWritten(page)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (gpu_written()) {
+        ++read_ahead_stats.fallbacks;
+        return false;
+    }
+    consumed_cache = consumed.load(std::memory_order_acquire);
+    PrunePendingWrites();
+    u64 target = last_unplaced_write;
+    for (size_t i = pending_head; i < pending_writes.size(); ++i) {
+        const PendingWrite& write = pending_writes[i];
+        if (write.data == NoData && write.address < *device + size &&
+            *device < write.address + write.size) {
+            target = std::max(target, write.position);
+        }
+    }
+    if (target > consumed_cache) {
+        const auto start = std::chrono::steady_clock::now();
+        WaitFor(target);
+        ++read_ahead_stats.waits;
+        read_ahead_stats.wait_ns += static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
+                .count());
+        PrunePendingWrites();
+        if (gpu_written()) {
+            ++read_ahead_stats.fallbacks;
+            return false;
+        }
+    }
+    for (u32 i = 0; i < count; ++i) {
+        words[i] = memory.Read<u32>(address + u64{i} * sizeof(u32));
+    }
+    // What the back hasn't written yet, oldest first. The bytes it is writing right now are
+    // among them.
+    u8* const out = reinterpret_cast<u8*>(words);
+    bool overlaid = false;
+    for (size_t i = pending_head; i < pending_writes.size(); ++i) {
+        const PendingWrite& write = pending_writes[i];
+        const DAddr begin = std::max(write.address, *device);
+        const DAddr end = std::min(write.address + write.size, *device + size);
+        if (begin < end && write.data != NoData) {
+            std::memcpy(out + (begin - *device),
+                        pending_data.data() + (write.data - pending_data_base) + (begin - write.address),
+                        end - begin);
+            overlaid = true;
+        }
+    }
+    read_ahead_stats.overlays += overlaid ? 1 : 0;
+    return true;
+}
+
+void GpuSplit::WaitFor(u64 target) {
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache >= target) {
         return;
