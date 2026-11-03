@@ -21,6 +21,9 @@
 #include "video_core/nx2_profile.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
+#ifdef _WIN32
+#include "common/windows/timer_resolution.h"
+#endif
 
 namespace VideoCommon::GPUThread {
 
@@ -78,15 +81,21 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     Tegra::Engines::Puller::may_drain = false;
                 }
                 if (!state.queue.TryPop(next)) {
-                    // The CPU usually releases the semaphore soon after: poll for half a
-                    // millisecond before sleeping, or every wait also waits out a host sleep
-                    // (title 1 waits ~25 times a second).
+                    // The CPU usually releases the semaphore soon after: poll for two
+                    // milliseconds before sleeping, then sleep a timer tick at a time. Both GPU
+                    // threads wait meanwhile, so every bit a sleep runs past the release is
+                    // lost (title 1: ~9% of its race time is spent here; a 1 ms sleep_for
+                    // lasts up to ~1.5 ms).
                     Profile::Scope scope{Profile::Zone::PendingSleep};
                     if (std::chrono::steady_clock::now() - last_progress <
-                        std::chrono::microseconds{500}) {
+                        std::chrono::milliseconds{2}) {
                         std::this_thread::yield();
                     } else {
-                        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+#ifdef _WIN32
+                        Common::Windows::SleepForOneTick();
+#else
+                        std::this_thread::sleep_for(std::chrono::microseconds{250});
+#endif
                     }
                     continue;
                 }
