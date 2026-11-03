@@ -247,8 +247,40 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
     // Mark only data that the GPU wrote. A mark stays for the session and sends later GPU writes
     // in the range to a download at each fence.
     if (!area->preemtive) {
-        memory_tracker.MarkRegionAsPreflushable(device_addr_start_aligned,
-                                                device_addr_end_aligned - device_addr_start_aligned);
+        // Each such read waits for a GPU-thread round trip, and the area used to be the read's own
+        // pages: a guest walking data the GPU had just written (title 1 at its title load, 1,400
+        // reads) paid one per 4 KiB page. The flush takes the read-trapped run around the read, up
+        // to EDEN_NX2_READ_AREA_KIB (2048; 0 = the read's pages only), a quarter of it before.
+        static const u64 max_area = [] {
+            const char* value = std::getenv("EDEN_NX2_READ_AREA_KIB");
+            return (value != nullptr ? std::strtoull(value, nullptr, 10) : 2048ULL) * 1024ULL;
+        }();
+        if (max_area != 0) {
+            constexpr DAddr window = DAddr{64} << 20;
+            const DAddr search = device_addr_start_aligned > window
+                                     ? device_addr_start_aligned - window
+                                     : 0;
+            DAddr trapped_lo = 0;
+            DAddr trapped_hi = 0;
+            read_trapped_ranges.ForEachInRange(search, 2 * window, [&](DAddr lower, DAddr upper) {
+                if (lower <= device_addr && device_addr < upper) {
+                    trapped_lo = lower;
+                    trapped_hi = upper;
+                }
+            });
+            if (trapped_hi > trapped_lo) {
+                const DAddr before = Common::AlignDown(max_area / 4, Core::DEVICE_PAGESIZE);
+                const DAddr lo = device_addr_start_aligned > before
+                                     ? device_addr_start_aligned - before
+                                     : 0;
+                area->start_address =
+                    (std::min)(device_addr_start_aligned, (std::max)(lo, trapped_lo));
+                area->end_address =
+                    (std::max)(device_addr_end_aligned, (std::min)(lo + max_area, trapped_hi));
+            }
+        }
+        memory_tracker.MarkRegionAsPreflushable(area->start_address,
+                                                area->end_address - area->start_address);
     } else {
         // The core keeps this area and has no mark. The next GPU write here must arm the range
         // again, which ends the area and sets the trap.

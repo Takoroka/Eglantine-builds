@@ -22,6 +22,7 @@
 #include "common/thread.h"
 #include "core/core.h"
 #include "video_core/engines/engine_interface.h"
+#include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
@@ -571,6 +572,14 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
 #endif
     u64 read_position = 0;
     t_back_read_position = &read_position;
+    Tegra::GPU& gpu = system->GPU();
+    // Guest CPU read flushes run at the next entry boundary instead of after the work queued
+    // behind them (GPU::HasEarlySyncRequests); checked every 1024 words and after each batch.
+    const auto run_early_syncs = [&gpu] {
+        if (gpu.HasEarlySyncRequests()) [[unlikely]] {
+            gpu.TickWork();
+        }
+    };
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread");
         u64 available = published.load(std::memory_order_acquire);
@@ -595,11 +604,16 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
         }
         u64 last_store = read_position;
+        u64 last_sync_check = read_position;
         g_back_busy.store(true, std::memory_order_relaxed);
         while (read_position != available) {
             const size_t index = read_position & RingMask;
             const size_t size = Execute(&ring[index]);
             read_position += size != 0 ? size : RingWords - index;
+            if (read_position - last_sync_check >= 1024) {
+                last_sync_check = read_position;
+                run_early_syncs();
+            }
             // Hand ring space back now and then while working through a long batch, and at once
             // when the front waits for this position (WaitForWriters).
             if ((read_position - last_store >= 4096 ||
@@ -609,6 +623,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 last_store = read_position;
             }
         }
+        run_early_syncs();
         if (back_idle_hook != nullptr &&
             published.load(std::memory_order_acquire) == read_position) {
             back_idle_hook(back_idle_context);
