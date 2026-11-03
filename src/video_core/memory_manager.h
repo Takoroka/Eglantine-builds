@@ -242,6 +242,9 @@ private:
 
     bool native_tiling{};
     mutable std::mutex guard;
+    /// Bumped (under guard) whenever kind_map changes: GetMemoryLayoutSize's cached runs hold
+    /// while it is the same.
+    std::atomic<u64> kind_map_generation{1};
 
     static constexpr size_t continuous_bits = 64;
 
