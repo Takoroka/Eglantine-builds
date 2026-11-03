@@ -78,12 +78,12 @@ public:
         Commit(1);
     }
     /// A state write (not in the engine's execution_mask) whose effect the front worked out:
-    /// `value` is what the register holds after it (shadow RAM applied) and `flag_a`/`flag_b`
-    /// the dirty flags it sets, none when `changed` is false (it keeps the register's value).
-    /// Consecutive ones go to the back as one entry (EngineInterface::ApplyStateRun), which
-    /// stores the registers and sets the flags the whole run sets in one pass.
+    /// `value` is what the register holds after it (shadow RAM applied), `flag_a`/`flag_b` the
+    /// dirty flags it sets and `tags` the engine's own bits for it (EngineInterface::ApplyStateRun),
+    /// none when `changed` is false (it keeps the register's value). Consecutive ones go to the
+    /// back as one entry, which stores the registers and sets what the whole run sets in one pass.
     void StateWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 value, u8 flag_a,
-                    u8 flag_b, bool changed) {
+                    u8 flag_b, u8 tags, bool changed) {
         if (engine != front_engine || run_data || run_count == MaxRunWrites) [[unlikely]] {
             FlushRun();
             SelectEngine(engine);
@@ -92,6 +92,7 @@ public:
         if (changed) {
             run_flags[flag_a >> 6] |= u64{1} << (flag_a & 63);
             run_flags[flag_b >> 6] |= u64{1} << (flag_b & 63);
+            run_tags |= tags;
         }
     }
     /// A word of a data method the engine takes many of in a row (Maxwell3D's constant buffer
@@ -143,7 +144,7 @@ private:
         Method, ///< Bits 8-23 method, 32-63 argument; flags IsLast, HasSegment (word 1)
         Multi,  ///< Bits 8-23 method, 32-63 amount; word 1 methods pending, [segment], words
         Call,   ///< Bits 8-31 payload size in words; word 1 thunk, then the payload
-        State,  ///< Bits 32-63 count; words 1-4 dirty flags, then a method | value << 32 each
+        State,  ///< Bits 8-15 tags, 32-63 count; words 1-4 dirty flags, then a method | value << 32 each
         Data,   ///< Bits 32-63 count; then a method | value << 32 each
     };
     static constexpr u64 IsLast = 1 << 4;
@@ -212,6 +213,7 @@ private:
     /// dirty flags the state writes set.
     u32 run_count{};
     bool run_data{};
+    u8 run_tags{};
     std::array<u64, RunFlagWords> run_flags{};
     std::array<u64, MaxRunWrites> run_writes{};
 

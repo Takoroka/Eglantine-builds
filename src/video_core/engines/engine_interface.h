@@ -44,10 +44,11 @@ public:
     }
 
     /// Split GPU thread (gpu_split.h): consecutive state writes the front collected, each a
-    /// method | value << 32 with the value the register holds after it, and the dirty flags they
-    /// set together (256 bits). By default they run as the methods they are.
+    /// method | value << 32 with the value the register holds after it, the dirty flags they
+    /// set together (256 bits) and the engine's own tags for them (GpuSplit::StateWrite). By
+    /// default they run as the methods they are.
     virtual void ApplyStateRun(Core::System& system, [[maybe_unused]] const u64* flags,
-                               const u64* writes, u32 count) {
+                               const u64* writes, u32 count, [[maybe_unused]] u8 tags) {
         ConsumeSink(system);
         for (u32 i = 0; i < count; ++i) {
             CallMethod(system, static_cast<u32>(writes[i] & 0xffff), static_cast<u32>(writes[i] >> 32),
@@ -56,7 +57,7 @@ public:
     }
     /// The same for consecutive words of a data method (GpuSplit::DataWrite), no flags.
     virtual void ApplyDataRun(Core::System& system, const u64* writes, u32 count) {
-        EngineInterface::ApplyStateRun(system, nullptr, writes, count);
+        EngineInterface::ApplyStateRun(system, nullptr, writes, count, 0);
     }
 
     std::bitset<(std::numeric_limits<u16>::max)()> execution_mask{};

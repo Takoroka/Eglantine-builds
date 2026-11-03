@@ -585,14 +585,14 @@ void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* bas
 }
 
 void Maxwell3D::ApplyStateRun(Core::System& system, const u64* flags, const u64* writes,
-                              u32 count) {
+                              u32 count, u8 tags) {
     // After the state writes the method sink holds, as when each came as a method.
     ConsumeSink(system);
     if (draw_manager.HasDeferredDraw() || record_write_history || g_trace_first_method_writes)
         [[unlikely]] {
         // CallMethod for each: the first write outside the instance loop draws the waiting
         // instances with the state they were begun with.
-        EngineInterface::ApplyStateRun(system, flags, writes, count);
+        EngineInterface::ApplyStateRun(system, flags, writes, count, tags);
         return;
     }
     // The values are the registers' after the shadow RAM: in Track mode it keeps them too.
@@ -614,6 +614,9 @@ void Maxwell3D::ApplyStateRun(Core::System& system, const u64* flags, const u64*
         for (u64 bits = flags[word]; bits != 0; bits &= bits - 1) {
             dirty.flags[word * 64 + std::countr_zero(bits)] = true;
         }
+    }
+    if (tags != 0) {
+        OnStateRunTags(tags);
     }
 }
 
@@ -1022,7 +1025,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             const bool changed = !SkipSameValueWrites() || fs.regs[method] != value;
             fs.regs[method] = value;
             split.StateWrite(this, method, value, fs.dirty_tables[0][method],
-                             fs.dirty_tables[1][method], changed);
+                             fs.dirty_tables[1][method], state_run_tags[method], changed);
             return;
         }
         fs.regs[method] = value;
