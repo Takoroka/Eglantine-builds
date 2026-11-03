@@ -3311,12 +3311,13 @@ private:
     void CallMacroMethod(Core::System& system, u32 method, std::span<const u32> parameters);
 
     /// Whether state register writes that keep the register's value are dropped (CallMethod).
+    /// Read on every register write: a plain load (a function-local static checked its guard).
+    static inline const bool skip_same_value_writes = [] {
+        const char* value = std::getenv("EDEN_NX2_SKIP_SAME");
+        return value == nullptr || value[0] != '0';
+    }();
     static bool SkipSameValueWrites() {
-        static const bool skip = [] {
-            const char* value = std::getenv("EDEN_NX2_SKIP_SAME");
-            return value == nullptr || value[0] != '0';
-        }();
-        return skip;
+        return skip_same_value_writes;
     }
 
     /// Handles writes to the macro uploading register.
@@ -3363,7 +3364,8 @@ private:
         u32 amount;
         u32 pending;
     };
-    std::array<RecentWrite, 48> recent_writes{};
+    // A power of two: this runs for every method the engine gets.
+    std::array<RecentWrite, 64> recent_writes{};
     size_t recent_write_index = 0;
     const bool record_write_history{
 #ifdef NDEBUG
