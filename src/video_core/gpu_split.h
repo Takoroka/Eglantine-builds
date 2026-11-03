@@ -115,10 +115,20 @@ public:
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
     template <typename Func>
     void Defer(const Func& func) {
+        DeferImpl(func, 0);
+    }
+    /// Defer for work of the 3D engine itself that changes state only through its usual paths
+    /// (method sink, registers): not a back event (BackEvents).
+    template <typename Func>
+    void DeferEngineWork(const Func& func) {
+        DeferImpl(func, Quiet);
+    }
+    template <typename Func>
+    void DeferImpl(const Func& func, u64 flags) {
         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
         constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
         u64* const entry = Reserve(2 + payload);
-        entry[0] = static_cast<u64>(Kind::Call) | (u64{payload} << 8);
+        entry[0] = static_cast<u64>(Kind::Call) | flags | (u64{payload} << 8);
         entry[1] = reinterpret_cast<u64>(&CallThunk<Func>);
         std::memcpy(entry + 2, &func, sizeof(Func));
         Commit(2 + payload);
@@ -134,6 +144,16 @@ public:
     void Publish();
     /// Waits until the back executed everything sent so far.
     void Drain();
+
+    /// Back thread: counts the entries other than 3D engine methods it ran (engine switches and
+    /// deferred calls), the work between two draws that their setup can't see in 3D state.
+    [[nodiscard]] u64 BackEvents() const noexcept {
+        return back_events;
+    }
+    /// Whether the calling thread is the back.
+    [[nodiscard]] static bool OnBackThread() noexcept {
+        return on_back_thread;
+    }
 
     /// Compute or copy work was just sent: what can write GPU-written command lists.
     void NoteWriter() {
@@ -207,6 +227,7 @@ private:
     static constexpr u64 IsLast = 1 << 4;
     static constexpr u64 HasSegment = 1 << 5;
     static constexpr u64 Direct = 1 << 6; ///< Method: call it even if not executable (macros)
+    static constexpr u64 Quiet = 1 << 7;  ///< Call: 3D engine work, not a back event
 
     static constexpr size_t RingWords = size_t{1} << 20; // 8 MiB
     static constexpr size_t RingMask = RingWords - 1;
@@ -307,6 +328,8 @@ private:
     void* back_idle_context{};
     /// The back thread's read position (BackHasMoreWork); null on other threads.
     static inline thread_local const u64* t_back_read_position{};
+    u64 back_events{};
+    static inline thread_local bool on_back_thread{};
 
     static GpuSplit instance;
 

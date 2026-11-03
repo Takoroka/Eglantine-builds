@@ -201,7 +201,7 @@ bool Passes(const std::array<vk::ShaderModule, NUM_STAGES>& modules,
     return true;
 }
 
-using ConfigureFuncPtr = bool (*)(GraphicsPipeline*, bool);
+using ConfigureFuncPtr = GraphicsPipeline::ConfigureResult (*)(GraphicsPipeline*, bool, bool);
 
 template <typename Spec, typename... Specs>
 ConfigureFuncPtr FindSpec(const std::array<vk::ShaderModule, NUM_STAGES>& modules,
@@ -292,6 +292,48 @@ GraphicsPipeline::GraphicsPipeline(
         num_image_elements += Shader::NumDescriptors(info->texture_descriptors);
         num_image_elements += Shader::NumDescriptors(info->image_descriptors);
         num_descriptor_entries += NumDescriptorEntries(*info);
+        // A draw that writes memory (storage buffers and images) can change what the next draw
+        // reads through other bindings: such draws always run the full setup.
+        const auto written = [](const auto& descs) {
+            return std::ranges::any_of(descs, [](const auto& desc) { return desc.is_written; });
+        };
+        can_repeat_draws &= !written(info->storage_buffers_descriptors) &&
+                            !written(info->image_buffer_descriptors) &&
+                            !written(info->image_descriptors) && !info->is_task && !info->is_mesh;
+        // The constant buffer words the setup reads: texture handles and storage buffer
+        // addresses (with their sizes), one range per descriptor: uploads often go to the same
+        // buffer, between them.
+        const auto add_read = [&](u32 slot, u32 begin, u32 end) {
+            setup_cbuf_slots[stage] |= 1u << slot;
+            for (SetupCbufRead& read : setup_cbuf_reads) {
+                if (read.stage == stage && read.slot == slot && begin <= read.end && read.begin <= end) {
+                    read.begin = (std::min)(read.begin, begin);
+                    read.end = (std::max)(read.end, end);
+                    return;
+                }
+            }
+            setup_cbuf_reads.push_back({static_cast<u32>(stage), slot, begin, end});
+        };
+        const auto add_handles = [&](const auto& descs) {
+            for (const auto& desc : descs) {
+                can_refresh_buffers &= desc.handle_program == ~0U;
+                const u32 extent = (((std::max)(desc.count, 1u) - 1) << desc.size_shift) + sizeof(u32);
+                add_read(desc.cbuf_index, desc.cbuf_offset, desc.cbuf_offset + extent);
+                if constexpr (requires { desc.has_secondary; }) {
+                    if (desc.has_secondary) {
+                        add_read(desc.secondary_cbuf_index, desc.secondary_cbuf_offset,
+                                 desc.secondary_cbuf_offset + extent);
+                    }
+                }
+            }
+        };
+        add_handles(info->texture_buffer_descriptors);
+        add_handles(info->image_buffer_descriptors);
+        add_handles(info->texture_descriptors);
+        add_handles(info->image_descriptors);
+        for (const auto& desc : info->storage_buffers_descriptors) {
+            add_read(desc.cbuf_index, desc.cbuf_offset, desc.cbuf_offset + 16);
+        }
     }
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
 
@@ -564,7 +606,37 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         buffer_cache.UpdateGraphicsBuffers(is_indexed);
         buffer_cache.BindHostGeometryBuffers(is_indexed);
     }
+    if (can_refresh_buffers) {
+        last_views.assign(views.begin(), views.end());
+        last_samplers.assign(samplers.begin(), samplers.end());
+    }
+    return ConfigureDescriptors<Spec>(std::span<const VideoCommon::ImageViewInOut>{views.data(), views.size()},
+                                      samplers.data(), true);
+}
 
+template <typename Spec>
+GraphicsPipeline::ConfigureResult GraphicsPipeline::RefreshImpl(bool is_indexed) {
+    namespace Profile = VideoCommon::Nx2Profile;
+    buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks, &uniform_buffer_sizes);
+    {
+        Profile::Scope scope{Profile::Zone::UpdateBuffers};
+        // Resolving a new buffer may join others: then every binding is resolved again.
+        if (!buffer_cache.RefreshGraphicsBuffers(is_indexed)) {
+            return ConfigureResult::Retry;
+        }
+        buffer_cache.BindHostGeometryBuffers(is_indexed);
+    }
+    return ConfigureDescriptors<Spec>(last_views, last_samplers.data(), false)
+               ? ConfigureResult::Done
+               : ConfigureResult::Failed;
+}
+
+template <typename Spec>
+bool GraphicsPipeline::ConfigureDescriptors(std::span<const VideoCommon::ImageViewInOut> views,
+                                            const VideoCommon::SamplerId* samplers,
+                                            bool full_setup) {
+    namespace Profile = VideoCommon::Nx2Profile;
+    const auto& regs{maxwell3d->regs};
     {
         Profile::Scope scope{Profile::Zone::DescriptorAcquire};
         guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
@@ -572,7 +644,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
     RescalingPushConstant rescaling;
     RenderAreaPushConstant render_area;
-    const VideoCommon::SamplerId* samplers_it{samplers.data()};
+    const VideoCommon::SamplerId* samplers_it{samplers};
     const VideoCommon::ImageViewInOut* views_it{views.data()};
     const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         {
@@ -613,11 +685,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         buffer_cache.runtime.PostCopyBarrier();
         buffer_cache.any_buffer_uploaded = false;
     }
-    {
+    if (full_setup) {
         Profile::Scope scope{Profile::Zone::RenderTargets};
         texture_cache.UpdateRenderTargets(false);
-        texture_cache.CheckFeedbackLoop(
-            std::span<const VideoCommon::ImageViewInOut>{views.data(), views.size()});
+        texture_cache.CheckFeedbackLoop(views);
     }
     if (IsBuilt() && !pipeline) {
         return false;

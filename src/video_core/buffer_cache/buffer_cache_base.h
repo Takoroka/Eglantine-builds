@@ -352,6 +352,16 @@ public:
     /// no longer holds the page.
     void Nx2NoteListHostWrite(DAddr device_addr, u64 size);
 
+    /// Bytes of the index buffer the last graphics setup bound and synchronized.
+    [[nodiscard]] u32 IndexBindingSize() const noexcept {
+        return channel_state->index_buffer.size;
+    }
+
+    /// UpdateGraphicsBuffers for a draw whose storage and texture buffers are those of the last
+    /// setup: resolves the index, vertex and uniform bindings that changed. False when that
+    /// deleted buffers (joined into a new one): the full update must run.
+    [[nodiscard]] bool RefreshGraphicsBuffers(bool is_indexed);
+
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);
 

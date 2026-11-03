@@ -505,6 +505,7 @@ size_t GpuSplit::Execute(const u64* entry) {
         return 0;
     case Kind::Engine:
         back_engine = reinterpret_cast<Tegra::Engines::EngineInterface*>(entry[1]);
+        ++back_events;
         return 2;
     case Kind::Method: {
         const u32 method = static_cast<u32>((head >> 8) & 0xffff);
@@ -543,6 +544,7 @@ size_t GpuSplit::Execute(const u64* entry) {
     case Kind::Call: {
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
         reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
+        back_events += (head & Quiet) == 0 ? 1 : 0;
         return 2 + payload;
     }
     case Kind::State: {
@@ -567,6 +569,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
     system->RegisterHostThread();
+    on_back_thread = true;
 #ifdef _WIN32
     g_back_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
 #endif

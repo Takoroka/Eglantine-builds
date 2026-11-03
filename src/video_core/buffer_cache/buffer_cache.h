@@ -488,6 +488,19 @@ void BufferCache<P>::UpdateGraphicsBuffers(bool is_indexed) {
 }
 
 template <class P>
+bool BufferCache<P>::RefreshGraphicsBuffers(bool is_indexed) {
+    channel_state->has_deleted_buffers = false;
+    if (is_indexed) {
+        UpdateIndexBuffer();
+    }
+    UpdateVertexBuffers();
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        UpdateUniformBuffers(stage);
+    }
+    return !channel_state->has_deleted_buffers;
+}
+
+template <class P>
 void BufferCache<P>::UpdateComputeBuffers() {
     do {
         channel_state->has_deleted_buffers = false;

@@ -3138,6 +3138,33 @@ public:
 
     EngineHint engine_state{EngineHint::None};
 
+    /// Kinds of state a draw's setup reads. Register writes, uploads and HLE macros bump the serial
+    /// of what they change (draw parameters and registers no setup reads bump none):
+    /// RasterizerVulkan reuses the previous draw's setup while none changed, and redoes only its
+    /// buffer bindings while only uniforms and geometry changed.
+    enum SameStateKind : u8 {
+        SameStateNone,
+        SameStateUniforms, ///< constant buffer uploads, addresses and binds
+        SameStateGeometry, ///< vertex and index buffer addresses
+        SameStateOther,    ///< everything else
+        NumSameStateKinds,
+    };
+    std::array<u64, NumSameStateKinds> same_state_serials{};
+
+    /// Constant buffer memory written by uploads and slots bound since the last draw (the
+    /// rasterizer resets them).
+    struct ConstBufferChanges {
+        std::array<std::pair<GPUVAddr, GPUVAddr>, 32> writes{};
+        u32 num_writes{};
+        std::array<u32, Regs::MaxShaderStage> bound_slots{};
+
+        void Reset() noexcept {
+            num_writes = 0;
+            bound_slots.fill(0);
+        }
+    };
+    ConstBufferChanges cbuf_changes{};
+
     enum class HLEReplacementAttributeType : u32 {
         BaseVertex = 0x0,
         BaseInstance = 0x1,
@@ -3222,9 +3249,15 @@ public:
 
     /// For state kept per register outside the dirty flags: the bits a state run carries for each
     /// write that changes the register (set once, at construction), and what the back does with a
-    /// run's bits instead of each write's ProcessDirtyRegisters. Nothing yet.
+    /// run's bits instead of each write's ProcessDirtyRegisters: bit k bumps same_state_serials[k].
     std::array<u8, Regs::NUM_REGS> state_run_tags{};
-    void OnStateRunTags([[maybe_unused]] u8 tags) {}
+    void OnStateRunTags(u8 tags) {
+        for (u32 kind = SameStateNone + 1; kind < NumSameStateKinds; ++kind) {
+            if ((tags >> kind) & 1) {
+                ++same_state_serials[kind];
+            }
+        }
+    }
 
     VideoCore::RasterizerInterface& Rasterizer() {
         return *rasterizer;
@@ -3284,6 +3317,9 @@ public:
     void ProcessInlineIndexMultiData(u32 method, const u32* start_base, u32 amount);
 
 private:
+    /// The kind of state each register is (same_state_serials).
+    std::array<SameStateKind, Regs::NUM_REGS> same_state_kinds{};
+
     void InitializeRegisterDefaults();
 
     void ProcessMacro(Core::System& system, u32 method, const u32* base_start, u32 amount, bool is_last_call);

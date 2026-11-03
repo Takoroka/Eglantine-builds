@@ -11,6 +11,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
+#include <span>
 #include <type_traits>
 #include <vector>
 
@@ -103,6 +104,39 @@ public:
     [[nodiscard]] bool IsMeshPipeline() const noexcept {
         return stage_infos[0].is_task || stage_infos[0].is_mesh;
     }
+
+    /// Whether a draw may reuse the setup of a previous draw with this pipeline (none of its
+    /// stages writes memory).
+    [[nodiscard]] bool CanRepeatDraws() const noexcept {
+        return can_repeat_draws;
+    }
+
+    /// Constant buffer bytes the setup reads (texture handles, storage buffer addresses): byte
+    /// range [begin, end) of `slot` in `stage`.
+    struct SetupCbufRead {
+        u32 stage;
+        u32 slot;
+        u32 begin;
+        u32 end;
+    };
+    [[nodiscard]] std::span<const SetupCbufRead> SetupCbufReads() const noexcept {
+        return setup_cbuf_reads;
+    }
+    /// Per stage, the constant buffer slots the setup reads.
+    [[nodiscard]] const std::array<u32, NUM_STAGES>& SetupCbufSlots() const noexcept {
+        return setup_cbuf_slots;
+    }
+    /// Whether texture handles all come from constant buffers (none computed from storage
+    /// buffers), so RefreshBuffers may keep the last setup's image views.
+    [[nodiscard]] bool CanRefreshBuffers() const noexcept {
+        return can_refresh_buffers;
+    }
+
+    enum class ConfigureResult {
+        Done,
+        Failed, ///< skip the draw
+        Retry,  ///< RefreshBuffers only: nothing was recorded, run the full setup
+    };
     GraphicsPipeline& operator=(GraphicsPipeline&&) noexcept = delete;
     GraphicsPipeline(GraphicsPipeline&&) noexcept = delete;
 
@@ -112,7 +146,14 @@ public:
     void AddTransition(GraphicsPipeline* transition);
 
     bool Configure(bool is_indexed) {
-        return configure_func(this, is_indexed);
+        return configure_func(this, is_indexed, false) == ConfigureResult::Done;
+    }
+
+    /// Setup of a draw that differs from the last configured draw of this pipeline only in its
+    /// uniform buffers (bindings and contents) and vertex and index buffers: binds those again and
+    /// pushes the descriptors with the last setup's image views and samplers.
+    ConfigureResult RefreshBuffers(bool is_indexed) {
+        return configure_func(this, is_indexed, true);
     }
 
     [[nodiscard]] GraphicsPipeline* Next(const GraphicsPipelineCacheKey& current_key) noexcept {
@@ -145,7 +186,11 @@ public:
 
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
-        return [](GraphicsPipeline* pl, bool is_indexed) { return pl->ConfigureImpl<Spec>(is_indexed); };
+        return [](GraphicsPipeline* pl, bool is_indexed, bool refresh) {
+            return refresh ? pl->RefreshImpl<Spec>(is_indexed)
+                           : (pl->ConfigureImpl<Spec>(is_indexed) ? ConfigureResult::Done
+                                                                  : ConfigureResult::Failed);
+        };
     }
 
     void SetEngine(Tegra::Engines::Maxwell3D* maxwell3d_, Tegra::MemoryManager* gpu_memory_) {
@@ -156,6 +201,15 @@ public:
 private:
     template <typename Spec>
     bool ConfigureImpl(bool is_indexed);
+
+    template <typename Spec>
+    ConfigureResult RefreshImpl(bool is_indexed);
+
+    /// The setup after the buffer updates: descriptors, render targets (full setups) and the
+    /// pipeline and descriptor binds.
+    template <typename Spec>
+    bool ConfigureDescriptors(std::span<const VideoCommon::ImageViewInOut> views,
+                              const VideoCommon::SamplerId* samplers, bool full_setup);
 
     bool ConfigureDraw(const RescalingPushConstant& rescaling,
                        const RenderAreaPushConstant& render_are);
@@ -175,7 +229,7 @@ private:
     GuestDescriptorQueue& guest_descriptor_queue;
     DescriptorBufferRing& descriptor_buffer_ring;
 
-    bool (*configure_func)(GraphicsPipeline*, bool){};
+    ConfigureResult (*configure_func)(GraphicsPipeline*, bool, bool){};
 
     std::vector<GraphicsPipelineCacheKey> transition_keys;
     std::vector<GraphicsPipeline*> transitions;
@@ -190,6 +244,13 @@ private:
     size_t num_image_elements{};
     u32 num_textures{};
     bool fragment_has_color0_output{};
+    bool can_repeat_draws{true};
+    bool can_refresh_buffers{true};
+    std::vector<SetupCbufRead> setup_cbuf_reads;
+    std::array<u32, NUM_STAGES> setup_cbuf_slots{};
+    /// The last full setup's image views and samplers (RefreshBuffers).
+    std::vector<VideoCommon::ImageViewInOut> last_views;
+    std::vector<VideoCommon::SamplerId> last_samplers;
 
     vk::DescriptorSetLayout descriptor_set_layout;
     DescriptorAllocator descriptor_allocator;
