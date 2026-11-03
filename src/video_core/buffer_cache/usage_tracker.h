@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <utility>
 #include <vector>
@@ -27,8 +28,18 @@ public:
     }
 
     void Reset() noexcept {
-        std::ranges::fill(pages, 0ULL);
-        recent.fill({~u64{0}, 0});
+        // Every buffer the GPU is done with is reset each frame (BufferCacheRuntime::TickFrame),
+        // used or not: clear only the pages tracked since the last reset. Filling every page of
+        // every buffer cost ~1% of the split GPU thread's back half in Mario Kart World.
+        if (touched_begin < touched_end) {
+            std::fill(pages.begin() + touched_begin, pages.begin() + touched_end, 0ULL);
+        }
+        touched_begin = ~size_t{0};
+        touched_end = 0;
+        if (recent_cursor != 0) {
+            recent.fill({~u64{0}, 0});
+            recent_cursor = 0;
+        }
     }
 
     void Track(u64 offset, u64 size) noexcept {
@@ -46,6 +57,8 @@ public:
         if (page_end < page || page_end >= pages.size()) {
             return;
         }
+        touched_begin = std::min(touched_begin, page);
+        touched_end = std::max(touched_end, page_end + 1);
         TrackPage(page, offset, size);
         if (page == page_end) {
             return;
@@ -99,7 +112,10 @@ private:
     std::vector<u64> pages;
     /// Ranges tracked last, (offset, size).
     std::array<std::pair<u64, u64>, 4> recent{{{~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}}};
-    size_t recent_cursor{};
+    size_t recent_cursor{}; ///< 0: no ranges in `recent` since the last reset
+    /// Pages [touched_begin, touched_end) hold every page tracked since the last reset.
+    size_t touched_begin{~size_t{0}};
+    size_t touched_end{};
 };
 
 } // namespace VideoCommon
