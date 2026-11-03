@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -132,6 +133,14 @@ public:
 
     /// Makes what was sent visible to the back.
     void Publish();
+
+    /// Past their spin, the front's waits for the back (Drain, WaitFor, WaitForSpace) sleep until
+    /// the back stores `consumed` instead of yielding. EDEN_NX2_WAIT_WAKE=0 turns that off
+    /// (comparisons); it can flip at run time.
+    static inline std::atomic<bool> wait_wake{[] {
+        const char* value = std::getenv("EDEN_NX2_WAIT_WAKE");
+        return value == nullptr || value[0] != '0';
+    }()};
     /// Waits until the back executed everything sent so far.
     void Drain();
 
@@ -267,6 +276,15 @@ private:
     void ClearPendingWrites();
     /// Waits until the back consumed `target`.
     void WaitFor(u64 target);
+    /// Front, past the spin of a wait for `consumed` (last seen as `seen`).
+    void SleepForBack(u64 seen);
+    /// Back: hands `consumed` to the front and wakes it if it sleeps on it.
+    void StoreConsumed(u64 position) {
+        consumed.store(position, std::memory_order_seq_cst);
+        if (front_sleeping.load(std::memory_order_seq_cst)) {
+            consumed.notify_all();
+        }
+    }
 
     void BackLoop(std::stop_token stop_token);
     size_t Execute(const u64* entry);
@@ -315,6 +333,8 @@ private:
     /// A position the front waits for (WaitForWriters): the back stores `consumed` once past it.
     alignas(64) std::atomic<u64> wait_target{~u64{0}};
     alignas(64) std::atomic<bool> back_waiting{};
+    /// The front sleeps on `consumed` (SleepForBack): the back wakes it when it stores one.
+    alignas(64) std::atomic<bool> front_sleeping{};
     std::atomic<u32> wake{};
     std::jthread back_thread;
 };
