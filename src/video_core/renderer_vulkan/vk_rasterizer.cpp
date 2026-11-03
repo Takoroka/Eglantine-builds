@@ -1115,7 +1115,11 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
 }
 
 void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
-    {
+    // Before nearly every draw (constant buffer writes), mostly where no image lives: no lock then.
+    if (!VideoCommon::InvalidationFilterOn() ||
+        std::ranges::any_of(sequences, [this](const std::pair<DAddr, std::size_t>& sequence) {
+            return texture_cache.MayHaveImages(sequence.first, sequence.second);
+        })) {
         std::scoped_lock lock{texture_cache.mutex};
         for (const auto& [addr, size] : sequences) {
             texture_cache.WriteMemory(addr, size);

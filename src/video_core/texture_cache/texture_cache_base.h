@@ -39,6 +39,7 @@
 #include "video_core/surface.h"
 #include "video_core/texture_cache/descriptor_table.h"
 #include "video_core/texture_cache/image_base.h"
+#include "video_core/page_occupancy.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/render_targets.h"
@@ -266,6 +267,11 @@ public:
 
     /// Mark images in a range as modified from the CPU
     void WriteMemory(DAddr cpu_addr, size_t size);
+
+    /// False when no image is registered in the range (without the lock: callers skip WriteMemory)
+    [[nodiscard]] bool MayHaveImages(DAddr cpu_addr, size_t size) const noexcept {
+        return page_occupancy.MayHave(cpu_addr, size);
+    }
 
     /// Download contents of host images to guest memory in a region
     void DownloadMemory(DAddr cpu_addr, size_t size);
@@ -530,6 +536,8 @@ private:
 
     ::Common::unordered_map<RenderTargets, FramebufferId> framebuffers;
     ::Common::unordered_map<u64, std::vector<ImageMapId>, Common::IdentityHash<u64>> page_table;
+    /// Map ids per page_table page
+    PageOccupancy<YUZU_PAGEBITS> page_occupancy;
     ::Common::unordered_map<ImageId, boost::container::small_vector<ImageViewId, 16>> sparse_views;
 
     DAddr virtual_invalid_space{};
