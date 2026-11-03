@@ -59,6 +59,13 @@ void DrainBack() {
     VideoCommon::GpuSplit::Get().Drain();
 }
 
+/// A payload release just queued for the back, for the front's record of queued writes.
+void NoteRelease(DmaPusher& dma_pusher, GPUVAddr address, u32 payload, bool one_word) {
+    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+        split.NoteRelease(dma_pusher.memory_manager, address, payload, one_word);
+    }
+}
+
 } // Anonymous namespace
 
 bool Puller::PendingAcquire::Matches(u32 current) const {
@@ -228,6 +235,12 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                 rasterizer->Query(mirror, VideoCommon::QueryType::Payload, properties, payload, 0);
             }
         });
+        NoteRelease(dma_pusher, sequence_address, payload,
+                    properties == VideoCommon::QueryPropertiesFlags::IsAFence);
+        if (mirror != 0) {
+            NoteRelease(dma_pusher, mirror, payload,
+                        properties == VideoCommon::QueryPropertiesFlags::IsAFence);
+        }
     } else if (g_nx2_ampere) {
         // Switch 2 waits on semaphores the CPU (or another channel) releases, e.g. once it has
         // written the commands this channel runs next: suspend the channel until the value is
@@ -302,6 +315,7 @@ void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
         rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload,
                           VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
     });
+    NoteRelease(dma_pusher, sequence_address, payload, true);
 }
 
 void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
@@ -331,6 +345,7 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
             rasterizer->Query(address, VideoCommon::QueryType::Payload,
                               VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
         });
+        NoteRelease(dma_pusher, address, payload, true);
         return;
     }
     // Acquires: check once after flushing pending fences; never block the GPU thread on them.
