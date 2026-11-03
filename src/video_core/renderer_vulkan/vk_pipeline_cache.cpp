@@ -897,6 +897,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }
 }
 
+void PipelineCache::StopTranslation() {
+    std::unique_lock lock{translation_mutex};
+    translation_stopped = true;
+}
+
 void PipelineCache::QueueVulkanPipelineCacheFlush() {
     if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty()) {
         return;
@@ -982,11 +987,43 @@ void ReportNewPipelineKey(const GraphicsPipelineCacheKey& key) {
 } // Anonymous namespace
 
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
+    using State = PendingGraphicsPipeline::State;
     const auto [pair, is_new]{graphics_cache.try_emplace(graphics_key)};
     auto& pipeline{pair->second};
     if (is_new) {
         ReportNewPipelineKey(graphics_key);
+        if (use_asynchronous_shaders && CanSkipDraw()) {
+            // Translated on the workers too, not only built there: its draws are skipped
+            // meanwhile, instead of the GPU thread stopping for the translation.
+            QueueGraphicsPipeline();
+            return nullptr;
+        }
         pipeline = CreateGraphicsPipeline();
+    } else if (!pipeline) {
+        const auto it{pending_graphics.find(graphics_key)};
+        if (it == pending_graphics.end()) {
+            return nullptr; // Failed to build
+        }
+        PendingGraphicsPipeline& job{*it->second};
+        if (job.state.load(std::memory_order_acquire) != State::Done) {
+            if (CanSkipDraw()) {
+                return nullptr;
+            }
+            // A draw that can't be skipped: build it here, unless a worker already is.
+            State expected{State::Queued};
+            if (!job.state.compare_exchange_strong(expected, State::Cancelled,
+                                                   std::memory_order_acq_rel)) {
+                job.state.wait(State::Running, std::memory_order_acquire);
+            }
+        }
+        const State state{job.state.load(std::memory_order_relaxed)};
+        if (state == State::Done) {
+            pipeline = TakePendingPipeline(job);
+        }
+        if (!pipeline && (state == State::Cancelled || job.needs_gpu_thread)) {
+            pipeline = CreateGraphicsPipeline();
+        }
+        pending_graphics.erase(it);
     }
     if (!pipeline) {
         return nullptr;
@@ -1005,6 +1042,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
 
 void PipelineCache::TickFrame() {
     ++frame_count;
+    CollectPendingPipelines();
     while (!evicted_pipelines.empty() && scheduler.IsFree(evicted_pipelines.front().first)) {
         evicted_pipelines.pop_front();
     }
@@ -1063,19 +1101,97 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
     if (!use_asynchronous_shaders) {
         return pipeline;
     }
+    return CanSkipDraw() ? nullptr : pipeline;
+}
+
+bool PipelineCache::CanSkipDraw() const noexcept {
     // If something is using depth, we can assume that games are not rendering anything which
     // will be used one time.
     if (maxwell3d->regs.zeta_enable) {
-        return nullptr;
+        return true;
     }
     // If games are using a small index count, we can assume these are full screen quads.
     // Usually these shaders are only used once for building textures so we can assume they
     // can't be built async
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
-    if (draw_state.draw_element_count <= 6) {
-        return pipeline;
+    return draw_state.draw_element_count > 6;
+}
+
+void PipelineCache::QueueGraphicsPipeline() {
+    auto job{std::make_shared<PendingGraphicsPipeline>()};
+    job->key = graphics_key;
+    GetGraphicsEnvironments(job->environments, graphics_key.unique_hashes);
+    for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
+        if (graphics_key.unique_hashes[index] != 0) {
+            job->environments.envs[index].DetachFromEngine();
+        }
     }
-    return nullptr;
+    pending_graphics.emplace(graphics_key, job);
+    workers.QueueWork([this, job] { BuildPendingPipeline(*job); });
+}
+
+void PipelineCache::BuildPendingPipeline(PendingGraphicsPipeline& job) {
+    using State = PendingGraphicsPipeline::State;
+    State expected{State::Queued};
+    if (!job.state.compare_exchange_strong(expected, State::Running, std::memory_order_acq_rel)) {
+        return; // Built on the GPU thread
+    }
+    std::shared_lock lock{translation_mutex};
+    if (translation_stopped) {
+        job.needs_gpu_thread = true;
+        job.state.store(State::Done, std::memory_order_release);
+        job.state.notify_all();
+        return;
+    }
+    try {
+        ShaderPools pools;
+        job.pipeline =
+            CreateGraphicsPipeline(pools, job.key, job.environments.Span(), nullptr, false);
+    } catch (const VideoCommon::EngineStateMissing&) {
+        job.needs_gpu_thread = true;
+    } catch (const std::exception& exception) {
+        LOG_ERROR(Render_Vulkan, "Building a pipeline on a worker failed: {}", exception.what());
+        job.needs_gpu_thread = true;
+    }
+    for (GraphicsEnvironment& env : job.environments.envs) {
+        env.ReleaseEngineCopy();
+    }
+    job.state.store(State::Done, std::memory_order_release);
+    job.state.notify_all();
+}
+
+std::unique_ptr<GraphicsPipeline> PipelineCache::TakePendingPipeline(PendingGraphicsPipeline& job) {
+    if (!job.pipeline) {
+        return nullptr;
+    }
+    if (!std::ranges::all_of(job.environments.envs, [](GraphicsEnvironment& env) {
+            return env.DescriptorsUnchanged();
+        })) {
+        job.needs_gpu_thread = true;
+        job.pipeline.reset();
+        return nullptr;
+    }
+    StorePipeline(*job.pipeline, job.key, job.environments);
+    // Not unused since boot: eviction looks at this.
+    job.pipeline->MarkUsed(frame_count);
+    return std::move(job.pipeline);
+}
+
+void PipelineCache::CollectPendingPipelines() {
+    for (auto it = pending_graphics.begin(); it != pending_graphics.end();) {
+        PendingGraphicsPipeline& job{*it->second};
+        if (job.state.load(std::memory_order_acquire) != PendingGraphicsPipeline::State::Done) {
+            ++it;
+            continue;
+        }
+        std::unique_ptr<GraphicsPipeline> pipeline{TakePendingPipeline(job)};
+        if (job.needs_gpu_thread) {
+            ++it; // Built on the GPU thread at its next draw, which has the engine state for it
+            continue;
+        }
+        graphics_cache[job.key] = std::move(pipeline);
+        it = pending_graphics.erase(it);
+    }
 }
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
@@ -1247,22 +1363,30 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     main_pools.ReleaseContents();
     auto pipeline{
         CreateGraphicsPipeline(main_pools, graphics_key, environments.Span(), nullptr, true)};
-    if (!pipeline || pipeline_cache_filename.empty()) {
-        return pipeline;
+    if (pipeline) {
+        StorePipeline(*pipeline, graphics_key, environments);
     }
-    if (pipeline->IsMeshPipeline()) {
+    return pipeline;
+}
+
+void PipelineCache::StorePipeline(const GraphicsPipeline& pipeline,
+                                  const GraphicsPipelineCacheKey& key,
+                                  GraphicsEnvironments& environments) {
+    if (pipeline_cache_filename.empty()) {
+        return;
+    }
+    if (pipeline.IsMeshPipeline()) {
         // Not stored: task and mesh programs are translated with the mesh registers, which the
         // cache format does not carry. The few of them rebuild quickly from the driver cache.
         QueueVulkanPipelineCacheFlush();
-        return pipeline;
+        return;
     }
-    if (disk_pipelines.contains(graphics_key.Hash())) {
+    if (!disk_pipelines.insert(key.Hash()).second) {
         // In the disk cache already, only not built at boot.
         QueueVulkanPipelineCacheFlush();
-        return pipeline;
+        return;
     }
-    disk_pipelines.insert(graphics_key.Hash());
-    serialization_thread.QueueWork([this, key = graphics_key, envs = std::move(environments.envs)] {
+    serialization_thread.QueueWork([this, key, envs = std::move(environments.envs)] {
         boost::container::static_vector<const GenericEnvironment*, Maxwell::MaxShaderProgram>
             env_ptrs;
         for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
@@ -1273,7 +1397,6 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
         SerializePipeline(key, env_ptrs, pipeline_cache_filename, CACHE_VERSION);
     });
     QueueVulkanPipelineCacheFlush();
-    return pipeline;
 }
 
 std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
