@@ -240,6 +240,12 @@ public:
 
     void WriteMemory(DAddr device_addr, u64 size);
 
+    /// The guest may have written memory the commands that follow read (a command list starts,
+    /// a semaphore acquire is checked): pages left without write protection are read again.
+    void OnGuestSyncPoint() {
+        memory_tracker.ReArmHotPages();
+    }
+
     void CachedWriteMemory(DAddr device_addr, u64 size);
 
     bool OnCPUWrite(DAddr device_addr, u64 size);

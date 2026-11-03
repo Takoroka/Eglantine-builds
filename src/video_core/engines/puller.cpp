@@ -55,8 +55,11 @@ void OnBack(const Func& func) {
     }
 }
 
-void DrainBack() {
+void DrainBack(DmaPusher& dma_pusher) {
     VideoCommon::GpuSplit::Get().Drain();
+    // An acquire is checked next: the guest may have written what the commands after it read
+    // before releasing the semaphore.
+    OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->OnGuestSyncPoint(); });
 }
 
 } // Anonymous namespace
@@ -80,7 +83,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     }
     // The release may still be queued for the split GPU thread's back half (and the caches
     // ReadSemaphoreWord asks are its state).
-    DrainBack();
+    DrainBack(dma_pusher);
     const u32 current = ReadSemaphoreWord(dma_pusher, pending_acquire->address);
     if (Nx2SemaphoreWaiters::Get().Latched(this)) {
         if (static std::atomic<u32> rescued{};
@@ -245,7 +248,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
-        DrainBack();
+        DrainBack(dma_pusher);
         if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
             return;
         }
@@ -264,7 +267,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             waiters.Remove(this);
         }
     } else {
-        DrainBack();
+        DrainBack(dma_pusher);
         do {
             const u32 word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
             regs.acquire_source = true;
@@ -305,7 +308,7 @@ void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
 }
 
 void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
-    DrainBack();
+    DrainBack(dma_pusher);
     u32 word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
     const auto value = regs.semaphore_acquire;
     while (word != value) {
@@ -334,7 +337,7 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
         return;
     }
     // Acquires: check once after flushing pending fences; never block the GPU thread on them.
-    DrainBack();
+    DrainBack(dma_pusher);
     dma_pusher.rasterizer->ReleaseFences();
     const u32 word = dma_pusher.memory_manager.Read<u32>(address);
     const bool ready = operation == 0   ? word == payload
