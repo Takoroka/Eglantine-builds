@@ -27,6 +27,7 @@
 
 #include "common/alignment.h"
 #include "common/div_ceil.h"
+#include "common/game_presets.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
@@ -1717,13 +1718,33 @@ private:
         // only after this present returns: while a channel stays suspended on one, wait for the
         // previous frame's fence instead and let the game prepare frame N+1 meanwhile (waiting
         // for this frame there cost 8-56 ms of every 34-105 ms frame, or never finished).
-        // EDEN_NX2_FRAMES_AHEAD=1 always waits for the previous frame, =0 always for this one.
+        // EDEN_NX2_FRAMES_AHEAD=1 always waits for the previous frame (and this one too while the
+        // GPU is behind), =0 always for this one, =2 only ever for the previous one (Mario Kart
+        // World's default, below), =a as described here for every title.
         static const int frames_ahead = [] {
             const char* value = std::getenv("EDEN_NX2_FRAMES_AHEAD");
-            return value == nullptr ? -1 : value[0] == '1' ? 1 : 0;
+            if (value == nullptr) {
+                return -1;
+            }
+            return value[0] == '0' ? 0 : value[0] == '1' ? 1 : value[0] == '2' ? 2 : -2;
         }();
+        // Mario Kart World cycles three present images, as the console lets it: its compositor
+        // frees a buffer once the frame two presents back has passed its fence, so the game
+        // builds frame N+1 while the GPU still runs frame N. Waiting here for this frame made the
+        // game and Eden's GPU thread take turns (the present waited ~3.8 ms on the fence, then
+        // the GPU thread sat idle waiting for the next frame's command lists). Wait for the
+        // previous frame only. Not for every title: Splatoon Raiders reuses its command memory
+        // as if the GPU were at most a frame behind (below).
+        if (!m_title_checked) {
+            m_title_checked = true;
+            m_previous_frame_only =
+                system.GetApplicationProcessProgramID() == Settings::MarioKartWorldProgramId;
+        }
         const auto entered = std::chrono::steady_clock::now();
-        if (frames_ahead == 1 || (frames_ahead == -1 && !WaitForFrame(~w[22], w[24], true))) {
+        if (frames_ahead == 2 || (frames_ahead == -1 && m_previous_frame_only)) {
+            WaitForFrame(m_previous_fence_id, m_previous_fence_value);
+        } else if (frames_ahead == 1 ||
+                   (frames_ahead < 0 && !WaitForFrame(~w[22], w[24], true))) {
             LOG_DEBUG(Service, "nx2:vi2 present #{} fence ({}, {:#x}), waiting for ({}, {:#x}); now {:#x}",
                       m_presents, ~w[22], w[24], m_previous_fence_id, m_previous_fence_value,
                       ~w[22] < 192 ? system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(~w[22]) : 0U);
@@ -1800,6 +1821,8 @@ private:
     } m_stats{};
     u32 m_previous_fence_id{~0U}; // none yet (WaitForFrame ignores ids >= 192)
     u32 m_previous_fence_value{};
+    bool m_title_checked{};
+    bool m_previous_frame_only{}; ///< Presents wait for the previous frame only (see there)
 
     // The console flips one frame per 60 Hz vblank and keeps the rest queued, so a game can't
     // present faster than that. Every slot is reported free here: hold each present until the
