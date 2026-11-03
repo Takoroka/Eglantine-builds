@@ -144,6 +144,7 @@ void GpuSplit::Stop() {
     publish_every = PublishEvery;
     front_engine = nullptr;
     run_count = 0;
+    run_data = false;
     run_flags = {};
     back_engine = nullptr;
     front_macros = false;
@@ -249,16 +250,21 @@ void GpuSplit::WaitForWriters() {
 
 void GpuSplit::FlushRun() {
     const u32 count = run_count;
+    const bool data = run_data;
+    run_count = 0; // Reserve flushes while it is set
+    run_data = false;
     if (count == 0) {
         return;
     }
-    run_count = 0; // Reserve flushes while it is set
-    const size_t size = 1 + RunFlagWords + count;
+    const size_t head = data ? 1 : 1 + RunFlagWords;
+    const size_t size = head + count;
     u64* const entry = Reserve(size);
-    entry[0] = static_cast<u64>(Kind::State) | (u64{count} << 32);
-    std::memcpy(entry + 1, run_flags.data(), sizeof(run_flags));
-    std::memcpy(entry + 1 + RunFlagWords, run_writes.data(), size_t{count} * sizeof(u64));
-    run_flags = {};
+    entry[0] = static_cast<u64>(data ? Kind::Data : Kind::State) | (u64{count} << 32);
+    if (!data) {
+        std::memcpy(entry + 1, run_flags.data(), sizeof(run_flags));
+        run_flags = {};
+    }
+    std::memcpy(entry + head, run_writes.data(), size_t{count} * sizeof(u64));
     Commit(size);
 }
 
@@ -355,6 +361,12 @@ size_t GpuSplit::Execute(const u64* entry) {
         Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
         back_engine->ApplyStateRun(*system, entry + 1, entry + 1 + RunFlagWords, count);
         return 1 + RunFlagWords + count;
+    }
+    case Kind::Data: {
+        const u32 count = static_cast<u32>(head >> 32);
+        Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+        back_engine->ApplyDataRun(*system, entry + 1, count);
+        return 1 + count;
     }
     }
     return 1;

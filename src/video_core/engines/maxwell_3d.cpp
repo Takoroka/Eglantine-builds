@@ -617,6 +617,37 @@ void Maxwell3D::ApplyStateRun(Core::System& system, const u64* flags, const u64*
     }
 }
 
+void Maxwell3D::ApplyDataRun(Core::System& system, const u64* writes, u32 count) {
+    ConsumeSink(system);
+    if (record_write_history || g_trace_first_method_writes) [[unlikely]] {
+        EngineInterface::ApplyDataRun(system, writes, count);
+        return;
+    }
+    // What CallMethod does for each word: the first ends an instance loop (ProcessDirtyRegisters),
+    // each sets its register (and shadow copy in Track mode) and goes to the current buffer.
+    if (draw_manager.HasDeferredDraw()) [[unlikely]] {
+        draw_manager.DrawDeferred(*this, true);
+    }
+    const auto control = shadow_state.shadow_ram_control;
+    const bool track = control == Regs::ShadowRamControl::Track ||
+                       control == Regs::ShadowRamControl::TrackWithFilter;
+    std::array<u32, 64> words;
+    u32 pending = 0;
+    for (u32 i = 0; i < count; ++i) {
+        const u32 method = static_cast<u32>(writes[i] & 0xffff);
+        const u32 value = static_cast<u32>(writes[i] >> 32);
+        regs.reg_array[method] = value;
+        if (track) {
+            shadow_state.reg_array[method] = value;
+        }
+        words[pending++] = value;
+        if (pending == words.size() || i + 1 == count) {
+            ProcessCBMultiData(words.data(), pending);
+            pending = 0;
+        }
+    }
+}
+
 void Maxwell3D::ProcessMacroUpload(u32 data) {
     GetNativeMacroEngine().AddCode(regs.load_mme.instruction_ptr++, data);
 }
@@ -920,7 +951,8 @@ bool FrontSkipSame() {
     return skip;
 }
 
-// EDEN_NX2_STATE_RUNS=0: send each state write as its own method, which the back processes alone.
+// EDEN_NX2_STATE_RUNS=0: send each state write and constant buffer data word as its own method,
+// which the back processes alone.
 bool FrontStateRuns() {
     static const bool runs = [] {
         const char* value = std::getenv("EDEN_NX2_STATE_RUNS");
@@ -1025,6 +1057,11 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         default:
             if (method >= cb_data && method < cb_data + 16) {
                 fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)] += sizeof(u32);
+                if (fs.state_runs) {
+                    // Consecutive words land next to each other: one guest memory write.
+                    split.DataWrite(this, method, value);
+                    return;
+                }
             } else if (!FrontHandledOutsideDrawManager(method)) {
                 fs.draw_pending = true;
             }

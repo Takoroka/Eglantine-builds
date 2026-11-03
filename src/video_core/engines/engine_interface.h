@@ -54,6 +54,10 @@ public:
                        true);
         }
     }
+    /// The same for consecutive words of a data method (GpuSplit::DataWrite), no flags.
+    virtual void ApplyDataRun(Core::System& system, const u64* writes, u32 count) {
+        EngineInterface::ApplyStateRun(system, nullptr, writes, count);
+    }
 
     std::bitset<(std::numeric_limits<u16>::max)()> execution_mask{};
     std::vector<std::pair<u32, u32>> method_sink{};
