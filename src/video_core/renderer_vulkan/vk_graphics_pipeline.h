@@ -205,11 +205,31 @@ private:
     template <typename Spec>
     ConfigureResult RefreshImpl(bool is_indexed);
 
+    /// What the descriptor setup does with the texture set: nothing, store this setup's texture
+    /// descriptors in it, or push its stored descriptors instead of the views'.
+    enum class TextureSetUse {
+        None,
+        Record,
+        Replay,
+    };
+
     /// The setup after the buffer updates: descriptors, render targets (full setups) and the
     /// pipeline and descriptor binds.
     template <typename Spec>
     bool ConfigureDescriptors(std::span<const VideoCommon::ImageViewInOut> views,
-                              const VideoCommon::SamplerId* samplers, bool full_setup);
+                              const VideoCommon::SamplerId* samplers, bool full_setup,
+                              TextureSetUse texture_set_use);
+
+    /// Whether the texture set still holds what these handles resolve to: same handles, nothing
+    /// in the texture cache changed that the resolution read, the same TIC and TSC entries.
+    [[nodiscard]] bool TextureSetCurrent(std::span<const std::pair<u32, u32>> handles,
+                                         bool via_header_index);
+
+    /// Starts a texture set from a full setup's handles, views and samplers; the descriptor setup
+    /// completes it (TextureSetUse::Record).
+    void RecordTextureSet(std::span<const std::pair<u32, u32>> handles,
+                          std::span<const VideoCommon::ImageViewInOut> views,
+                          std::span<const VideoCommon::SamplerId> samplers, bool via_header_index);
 
     bool ConfigureDraw(const RescalingPushConstant& rescaling,
                        const RenderAreaPushConstant& render_are);
@@ -251,6 +271,23 @@ private:
     /// The last full setup's image views and samplers (RefreshBuffers).
     std::vector<VideoCommon::ImageViewInOut> last_views;
     std::vector<VideoCommon::SamplerId> last_samplers;
+
+    /// Texture set (EDEN_NX2_BINDLESS): what the textures of the last full setup that resolved
+    /// them came to. Later setups with the same handles reuse it while it is current
+    /// (TextureSetCurrent) instead of looking up views and samplers and preparing their images.
+    struct TextureSet {
+        u64 generation{}; ///< TextureCache::TextureSetGeneration when it was resolved
+        bool via_header_index{};
+        bool valid{};
+        std::vector<std::pair<u32, u32>> handles; ///< (TIC, TSC) per texture element
+        std::vector<VideoCommon::ImageViewInOut> views;
+        std::vector<VideoCommon::SamplerId> samplers;
+        std::vector<DescriptorUpdateEntry> descriptors; ///< per texture element, stage order
+        std::array<u32, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> rescaling{};
+    };
+    TextureSet texture_set;
+    /// Textures all read from constant buffer handles, no texture buffers or images.
+    bool uses_texture_sets{true};
 
     vk::DescriptorSetLayout descriptor_set_layout;
     DescriptorAllocator descriptor_allocator;
