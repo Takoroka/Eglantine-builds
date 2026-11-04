@@ -17,6 +17,7 @@
 #include "common/range_sets.inc"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
+#include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
@@ -190,9 +191,15 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
     // structures next to the draw arguments its compute dispatches fill in; the draws then read
     // leftover bytes as vertex counts. Download those bytes first (the CPU's own were subtracted
     // above, so they aren't overwritten).
+    // Only the thread that records GPU commands may download. Device memory writes and unmaps, CPU
+    // inner invalidations and ThreadManager::InvalidateRegion get here on guest and service
+    // threads; a copy recorded there raced the GPU thread's command chunk and crashed at scene
+    // transitions (CopyBuffer on a null chunk, Mario Kart World and Splatoon Raiders). Those
+    // writes keep the behaviour from before the download.
     const DAddr page_begin = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
     const DAddr page_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
-    if (keep_page_gpu_data && gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
+    if (keep_page_gpu_data && VideoCommon::GpuSplit::OnRecordingThread() &&
+        gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
         DownloadMemory(page_begin, page_end - page_begin);
     }
     memory_tracker.MarkRegionAsCpuModified(device_addr, size);

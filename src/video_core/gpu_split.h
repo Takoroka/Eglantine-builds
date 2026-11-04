@@ -50,6 +50,18 @@ public:
     [[nodiscard]] static bool OnBackThread() {
         return on_back_thread;
     }
+    /// Called once on the GPU thread (gpu_thread.cpp).
+    static void MarkGpuThread() {
+        on_gpu_thread = true;
+    }
+    /// Whether the calling thread records GPU commands: the back while the split runs, the GPU
+    /// thread otherwise. Guest and service threads that invalidate caches never do.
+    [[nodiscard]] static bool OnRecordingThread() {
+        if (on_back_thread) {
+            return true;
+        }
+        return on_gpu_thread && !instance.active;
+    }
     /// Called on the back before it sleeps waiting for work (the rasterizer submits deferred work).
     void SetIdleHook(void (*hook)(void*), void* argument) {
         idle_hook = hook;
@@ -196,6 +208,7 @@ private:
 
     static GpuSplit instance;
     static inline thread_local bool on_back_thread{};
+    static inline thread_local bool on_gpu_thread{};
     void (*idle_hook)(void*){};
     void* idle_argument{};
     alignas(64) std::atomic<bool> hook_requested{};

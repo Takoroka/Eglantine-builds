@@ -239,7 +239,8 @@ public:
     void UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size);
 
     /// `keep_page_gpu_data`: download GPU-written bytes sharing the written pages first (false
-    /// when the memory is going away).
+    /// when the memory is going away). Only on the thread that records GPU commands; other
+    /// threads skip the download.
     void WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data = true);
 
     void CachedWriteMemory(DAddr device_addr, u64 size);
