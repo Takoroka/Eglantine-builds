@@ -778,7 +778,13 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     functions.vkGetInstanceProcAddr = dld.vkGetInstanceProcAddr;
     functions.vkGetDeviceProcAddr = dld.vkGetDeviceProcAddr;
 
-    VmaAllocatorCreateFlags flags = VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT;
+    // The texture cache frees deleted images on a thread of its own (TextureCacheRuntime::
+    // DestroyImage), so VMA locks for itself; EDEN_NX2_DEFERRED_FREE=0 frees them on the GPU
+    // thread and keeps the allocator unlocked.
+    const char* const deferred_free = std::getenv("EDEN_NX2_DEFERRED_FREE");
+    VmaAllocatorCreateFlags flags = deferred_free != nullptr && deferred_free[0] == '0'
+                                        ? VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT
+                                        : 0;
     if (extensions.memory_budget) {
         flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
     }

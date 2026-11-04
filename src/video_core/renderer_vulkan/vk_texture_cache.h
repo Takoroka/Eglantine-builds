@@ -6,12 +6,14 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <deque>
 #include <memory>
 #include <optional>
 #include <span>
 
+#include "common/thread_worker.h"
 #include "video_core/texture_cache/texture_cache_base.h"
 
 #include "shader_recompiler/shader_info.h"
@@ -79,6 +81,16 @@ public:
     [[nodiscard]] u64 CurrentTick() const noexcept;
 
     [[nodiscard]] bool IsFree(u64 tick) const noexcept;
+
+    /// Destroys a deleted image the GPU is done with, on the image deleter thread: returning its
+    /// memory to the driver (vkFreeMemory of dedicated allocations) took ~1.2% of the GPU
+    /// thread's busy time in title 1's races. EDEN_NX2_DEFERRED_FREE=0 destroys it here.
+    void DestroyImage(Image&& image, u64 bytes);
+
+    /// Bytes of the images handed to the deleter thread that it has not freed yet.
+    [[nodiscard]] u64 PendingDestroyBytes() const noexcept {
+        return pending_destroy_bytes.load(std::memory_order_relaxed);
+    }
 
     u64 GetDeviceMemoryBudget() const;
 
@@ -306,6 +318,10 @@ public:
     std::vector<MsaaScratchImage> msaa_scratch_images;
     ::Common::unordered_map<VkImage, ResolveShadow> resolve_shadows;
     std::vector<std::pair<u64, ResolveShadow>> pending_resolve_shadows;
+
+    std::atomic<u64> pending_destroy_bytes{};
+    /// Last: destroyed (joined) first, while what its work uses is still alive.
+    Common::ThreadWorker image_deleter{1, "ImageDeleter", {}, Common::ThreadPlacement::Background};
 };
 
 class Framebuffer {
@@ -436,6 +452,10 @@ public:
 
     Image(Image&&) = default;
     Image& operator=(Image&&) = default;
+
+    /// Drops what the runtime keeps for this image (its MSAA resolve shadows). After it, the
+    /// image's destruction only releases its own Vulkan objects and can run on another thread.
+    void DetachFromRuntime();
 
     void UploadMemory(VkBuffer buffer, VkDeviceSize offset,
                       std::span<const VideoCommon::BufferImageCopy> copies);
