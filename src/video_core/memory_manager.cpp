@@ -590,6 +590,21 @@ void MemoryManager::WriteBlockUnsafe(GPUVAddr gpu_dest_addr, const void* src_buf
 }
 
 void MemoryManager::WriteBlockCached(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size) {
+    // Constant buffer uploads (ProcessCBMultiData, every draw's uniforms) are small writes within
+    // one page: one cached translation and a copy instead of the walk over the big and the small
+    // page entries. A page's device memory is contiguous on the host; anything else (unmapped,
+    // no host pointer, across pages) takes the walk.
+    static constexpr u64 cpu_page_size = 1ULL << cpu_page_bits;
+    if ((gpu_dest_addr & (cpu_page_size - 1)) + size <= cpu_page_size) [[likely]] {
+        Tegra::Nx2BackSparseWrite(gpu_dest_addr, size, src_buffer);
+        if (const auto dev_addr = GpuToCpuAddress(gpu_dest_addr)) [[likely]] {
+            if (u8* const physical = memory.GetPointer<u8>(*dev_addr)) [[likely]] {
+                std::memcpy(physical, src_buffer, size);
+                accumulator.Add(gpu_dest_addr, size);
+                return;
+            }
+        }
+    }
     WriteBlockImpl(gpu_dest_addr, src_buffer, size, VideoCommon::CacheType::None, true);
     accumulator.Add(gpu_dest_addr, size);
 }
