@@ -456,17 +456,33 @@ std::pair<typename P::Buffer*, u32> BufferCache<P>::ObtainCPUBuffer(
 template <class P>
 void BufferCache<P>::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
                                                u32 size) {
-    const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
-    if (!device_addr) {
-        channel_state->uniform_buffers[stage][index] = NULL_BINDING;
+    Binding& current = channel_state->uniform_buffers[stage][index];
+    u64& generation = channel_state->uniform_buffer_map_generations[stage][index];
+    // Before translating: a map that lands meanwhile leaves the binding to be translated again.
+    const u64 map_generation = gpu_memory->MapGeneration();
+    // EDEN_NX2_CB_BIND_SKIP=0 translates every bind (comparisons).
+    static const bool skip_enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_CB_BIND_SKIP");
+        return value == nullptr || value[0] != '0';
+    }();
+    // Drivers bind most slots again for every draw, at the same address: while the page tables
+    // stay the same, the binding (and the buffer it resolved to) still holds.
+    if (skip_enabled && current.gpu_addr == gpu_addr && current.size == size &&
+        current.device_addr != 0 && generation == map_generation) {
         return;
     }
-    const Binding binding{
+    generation = map_generation;
+    const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+    if (!device_addr) {
+        current = NULL_BINDING;
+        return;
+    }
+    current = Binding{
         .device_addr = *device_addr,
+        .gpu_addr = gpu_addr,
         .size = size,
         .buffer_id = BufferId{},
     };
-    channel_state->uniform_buffers[stage][index] = binding;
 }
 
 template <class P>

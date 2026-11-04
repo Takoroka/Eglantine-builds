@@ -172,6 +172,9 @@ public:
     std::array<u32, NUM_STAGES> fast_bound_uniform_buffers{};
     std::array<std::array<u32, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
         uniform_buffer_binding_sizes{};
+    /// The GPU page tables' generation each uniform binding was translated with.
+    std::array<std::array<u64, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
+        uniform_buffer_map_generations{};
 };
 
 template <class P>
