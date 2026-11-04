@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <memory>
 #include <variant>
 #include <vector>
@@ -58,6 +59,16 @@ public:
 
     const DescriptorUpdateEntry* UpdateData() const noexcept {
         return upload_start;
+    }
+
+    /// Where the next entry goes: the entries added from here on can be copied out.
+    const DescriptorUpdateEntry* Next() const noexcept {
+        return payload_cursor;
+    }
+
+    /// Adds entries copied out earlier (see Next).
+    void AddEntries(const DescriptorUpdateEntry* entries, size_t count) {
+        payload_cursor = std::copy_n(entries, count, payload_cursor);
     }
 
     void AddSampledImage(VkImageView image_view, VkSampler sampler) {
