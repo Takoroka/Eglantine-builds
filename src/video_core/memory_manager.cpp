@@ -262,45 +262,53 @@ void MemoryManager::Unmap(GPUVAddr gpu_addr, std::size_t size) {
 }
 
 std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr gpu_addr) const {
-    // Draws translate the same few pages again and again (buffer bindings, semaphores): keep the
-    // last pages translated, per thread, while no page table entry changed.
+    // Draws translate the same pages again and again (vertex, index, uniform and storage buffers,
+    // semaphores): keep the pages translated, per thread, while no page table entry changed. A draw
+    // touches more pages than a few: the tables are direct mapped, one by big page (a big mapped
+    // page in one entry) and one by small page, so a lookup is one compare.
     struct CachedPage {
         size_t owner;
         u64 generation; // 0: empty
         GPUVAddr begin;
-        u64 mask;
         DAddr dev_addr_base;
     };
-    thread_local std::array<CachedPage, 4> cached_pages{};
-    thread_local u32 next_cached_page = 0;
+    static constexpr size_t CachedPages = 64;
+    thread_local std::array<CachedPage, CachedPages> cached_big_pages{};
+    thread_local std::array<CachedPage, CachedPages> cached_small_pages{};
     const u64 generation = translation_generation.load(std::memory_order_acquire);
-    for (const CachedPage& page : cached_pages) {
-        if (page.generation == generation && page.owner == unique_identifier &&
-            (gpu_addr & ~page.mask) == page.begin) {
-            return page.dev_addr_base + (gpu_addr & page.mask);
-        }
+    CachedPage& big = cached_big_pages[(gpu_addr >> big_page_bits) % CachedPages];
+    if (big.generation == generation && big.owner == unique_identifier &&
+        (gpu_addr & ~big_page_mask) == big.begin) {
+        return big.dev_addr_base + (gpu_addr & big_page_mask);
+    }
+    CachedPage& small = cached_small_pages[(gpu_addr >> page_bits) % CachedPages];
+    if (small.generation == generation && small.owner == unique_identifier &&
+        (gpu_addr & ~page_mask) == small.begin) {
+        return small.dev_addr_base + (gpu_addr & page_mask);
     }
     if (!IsWithinGPUAddressRange(gpu_addr)) [[unlikely]] {
         return std::nullopt;
     }
-    u64 mask = big_page_mask;
-    DAddr dev_addr_base{};
     if (GetEntry(gpu_addr, true) != EntryType::Mapped) [[unlikely]] {
         if (GetEntry(gpu_addr, false) != EntryType::Mapped)
             return std::nullopt;
-        mask = page_mask;
-        dev_addr_base = DAddr(page_table[PageEntryIndex(gpu_addr, false)]) << cpu_page_bits;
-    } else {
-        dev_addr_base = DAddr(big_page_table_dev[PageEntryIndex(gpu_addr, true)]) << cpu_page_bits;
+        const DAddr dev_addr_base = DAddr(page_table[PageEntryIndex(gpu_addr, false)]) << cpu_page_bits;
+        small = {
+            .owner = unique_identifier,
+            .generation = generation,
+            .begin = gpu_addr & ~page_mask,
+            .dev_addr_base = dev_addr_base,
+        };
+        return dev_addr_base + (gpu_addr & page_mask);
     }
-    cached_pages[next_cached_page++ % cached_pages.size()] = {
+    const DAddr dev_addr_base = DAddr(big_page_table_dev[PageEntryIndex(gpu_addr, true)]) << cpu_page_bits;
+    big = {
         .owner = unique_identifier,
         .generation = generation,
-        .begin = gpu_addr & ~mask,
-        .mask = mask,
+        .begin = gpu_addr & ~big_page_mask,
         .dev_addr_base = dev_addr_base,
     };
-    return dev_addr_base + (gpu_addr & mask);
+    return dev_addr_base + (gpu_addr & big_page_mask);
 }
 
 std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr addr, std::size_t size) const {
