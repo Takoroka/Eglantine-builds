@@ -397,6 +397,15 @@ private:
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);
 
+    /// Erases an image view's slot, counting the erasure for the table entries that point at it
+    void EraseImageView(ImageViewId image_view_id);
+
+    [[nodiscard]] u32 ImageViewErasures(ImageViewId image_view_id) const noexcept {
+        return image_view_id.index < image_view_erasures.size()
+                   ? image_view_erasures[image_view_id.index]
+                   : 0;
+    }
+
     /// Find or create a framebuffer with the given render target parameters
     FramebufferId GetFramebufferId(const RenderTargets& key);
 
@@ -585,6 +594,8 @@ private:
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageMapView> slot_map_views;
     Common::SlotVector<ImageView> slot_image_views;
+    /// Per image view slot: how often a view was erased from it (EraseImageView)
+    std::vector<u32> image_view_erasures;
     Common::SlotVector<ImageAlloc> slot_image_allocs;
     Common::SlotVector<Sampler> slot_samplers;
     Common::SlotVector<Framebuffer> slot_framebuffers;
