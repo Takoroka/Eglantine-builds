@@ -506,6 +506,16 @@ void KeplerCompute::CallMethod(Core::System& system, u32 method, u32 method_argu
     }
 }
 
+void KeplerCompute::ApplyDataRun(Core::System& system, const u64* writes, u32 count) {
+    ConsumeSink(system);
+    // As the macro wrote them (each a last call), except that only the run's last word ends the upload's
+    // piece: the words before it are collected, and guest memory is written once for the run.
+    for (u32 i = 0; i < count; ++i) {
+        CallMethod(system, static_cast<u32>(writes[i] & 0xffff), static_cast<u32>(writes[i] >> 32),
+                   i + 1 == count);
+    }
+}
+
 void KeplerCompute::CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) {
     if (native_mode) {
         for (u32 i = 0; i < amount; ++i) CallMethod(system, method, base_start[i], methods_pending - i <= 1);
@@ -1408,7 +1418,12 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
                 return false;
             }
             FrontApply(fs, address, value);
-            split.MacroWrite(this, address, value);
+            if (address == KEPLER_COMPUTE_REG_INDEX(data_upload)) {
+                // Consecutive words go as one entry (ApplyDataRun).
+                split.DataWrite(this, address, value);
+            } else {
+                split.MacroWrite(this, address, value);
+            }
             FrontNoteWrite(split, memory_manager, fs.registers, address, value);
             return true;
         });
