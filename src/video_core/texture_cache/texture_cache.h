@@ -602,13 +602,12 @@ SamplerId TextureCache<P>::GetSamplerId(u32 index, bool compute) {
         LOG_TRACE(HW_GPU, "Invalid sampler index={}", index);
         return NULL_SAMPLER_ID;
     }
-    auto const [descriptor, is_new] = table.Read(*gpu_memory, index);
-    if (is_new) {
-        auto const id = FindSampler(descriptor, compute);
-        table.bound_ids[index] = id;
-        return id;
+    if (table.ReadEntry(*gpu_memory, index) == DescriptorRead::Same) {
+        return table.bound_ids[index];
     }
-    return table.bound_ids[index];
+    auto const id = FindSampler(table.descriptors[index], compute);
+    table.bound_ids[index] = id;
+    return id;
 }
 
 template <class P>
@@ -837,28 +836,44 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
         LOG_TRACE(HW_GPU, "Invalid image view index={}", index);
         return NULL_IMAGE_VIEW_ID;
     }
-    auto const [descriptor, is_new] = table.Read(*gpu_memory, index);
-    if (is_new) {
-        if (IsValidEntry(*gpu_memory, descriptor)) {
-            const auto [pair, is_new_tc] = channel_state->image_views.try_emplace(descriptor);
-            if (is_new_tc) {
-                pair->second = CreateImageView(descriptor);
-                if (pair->second != NULL_IMAGE_VIEW_ID) {
-                    image_view_descriptors[pair->second].emplace_back(current_channel_id,
-                                                                      descriptor);
-                }
-            }
-            PrepareImageView(pair->second, false, false);
-            table.bound_ids[index] = pair->second;
-            return pair->second;
+    const DescriptorRead read = table.ReadEntry(*gpu_memory, index);
+    if (read != DescriptorRead::New) {
+        const ImageViewId id = table.bound_ids[index];
+        // An entry not read since the tables were invalidated (for each deleted image) keeps its
+        // view while its words are the same and the view's slot was not erased since.
+        if (read == DescriptorRead::Same ||
+            (id != NULL_IMAGE_VIEW_ID && id != CORRUPT_ID &&
+             table.BoundErasures(index) == ImageViewErasures(id))) {
+            if (id != NULL_IMAGE_VIEW_ID)
+                PrepareImageView(id, false, false);
+            return id;
         }
-        table.bound_ids[index] = NULL_IMAGE_VIEW_ID;
-        return NULL_IMAGE_VIEW_ID;
     }
-    const auto id = table.bound_ids[index];
-    if (id != NULL_IMAGE_VIEW_ID)
-        PrepareImageView(id, false, false);
-    return id;
+    const TICEntry descriptor = table.descriptors[index];
+    if (IsValidEntry(*gpu_memory, descriptor)) {
+        const auto [pair, is_new_tc] = channel_state->image_views.try_emplace(descriptor);
+        if (is_new_tc) {
+            pair->second = CreateImageView(descriptor);
+            if (pair->second != NULL_IMAGE_VIEW_ID) {
+                image_view_descriptors[pair->second].emplace_back(current_channel_id, descriptor);
+            }
+        }
+        PrepareImageView(pair->second, false, false);
+        table.bound_ids[index] = pair->second;
+        table.SetBoundErasures(index, ImageViewErasures(pair->second));
+        return pair->second;
+    }
+    table.bound_ids[index] = NULL_IMAGE_VIEW_ID;
+    return NULL_IMAGE_VIEW_ID;
+}
+
+template <class P>
+void TextureCache<P>::EraseImageView(ImageViewId image_view_id) {
+    if (image_view_id.index >= image_view_erasures.size()) {
+        image_view_erasures.resize(image_view_id.index + 1);
+    }
+    ++image_view_erasures[image_view_id.index];
+    slot_image_views.erase(image_view_id);
 }
 
 template <class P>
@@ -2157,7 +2172,7 @@ void TextureCache<P>::InvalidateScale(Image& image) {
     RemoveFramebuffers(image_view_ids);
     for (const ImageViewId image_view_id : image_view_ids) {
         sentenced_image_view.Push(std::move(slot_image_views[image_view_id]));
-        slot_image_views.erase(image_view_id);
+        EraseImageView(image_view_id);
     }
     image.image_view_ids.clear();
     image.image_view_infos.clear();
@@ -3367,7 +3382,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         if (!immediate_delete) {
             sentenced_image_view.Push(std::move(slot_image_views[image_view_id]));
         }
-        slot_image_views.erase(image_view_id);
+        EraseImageView(image_view_id);
     }
     const bool retained = RetainPendingImageDownloads(image_id, slot_images[image_id],
                                                        uncommitted_downloads, committed_downloads);
