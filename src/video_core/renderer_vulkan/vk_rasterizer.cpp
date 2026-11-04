@@ -216,7 +216,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       guest_descriptor_queue(device, UpdateDescriptorQueue::GUEST_FRAME_PAYLOAD_SIZE,
                              device.IsExtDescriptorBufferSupported()),
       compute_pass_descriptor_queue(device, UpdateDescriptorQueue::COMPUTE_FRAME_PAYLOAD_SIZE),
-      descriptor_buffer_ring(device, memory_allocator),
+      descriptor_buffer_ring(device, memory_allocator), bindless_heap(device),
       blit_image(device, scheduler, state_tracker, descriptor_pool), render_pass_cache(device),
       texture_cache_runtime{
           device,     scheduler,         memory_allocator, staging_pool,
@@ -229,12 +229,24 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
                           staging_pool, compute_pass_descriptor_queue, descriptor_pool, texture_cache),
       query_cache(gpu, *this, device_memory, query_cache_runtime),
       pipeline_cache(device_memory, device, scheduler, descriptor_pool, guest_descriptor_queue,
-                     descriptor_buffer_ring, render_pass_cache, buffer_cache, texture_cache,
-                     gpu.ShaderNotify()),
+                     descriptor_buffer_ring, bindless_heap, render_pass_cache, buffer_cache,
+                     texture_cache, gpu.ShaderNotify()),
       accelerate_dma(buffer_cache, texture_cache, scheduler),
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
       wfi_event(device.GetLogical().CreateEvent()) {
     scheduler.SetQueryCache(query_cache);
+    bindless_heap.Attach(texture_cache_runtime.bindless_table);
+    if (bindless_heap.Enabled()) {
+        // Slot 0 of each image binding: what a texture without a view of the shader's type reads.
+        std::array<VkImageView, Shader::NUM_TEXTURE_TYPES> null_views{};
+        ImageView& null_view{texture_cache.GetImageView(VideoCommon::NULL_IMAGE_VIEW_ID)};
+        for (u32 type = 0; type < Shader::NUM_TEXTURE_TYPES; ++type) {
+            if (static_cast<Shader::TextureType>(type) != Shader::TextureType::Buffer) {
+                null_views[type] = null_view.Handle(static_cast<Shader::TextureType>(type));
+            }
+        }
+        bindless_heap.WriteNullSlots(null_views);
+    }
     // Buffer downloads fences put off go out before the split's back runs out of work.
     VideoCommon::GpuSplit::Get().SetBackIdleHook(
         [](void* self) {

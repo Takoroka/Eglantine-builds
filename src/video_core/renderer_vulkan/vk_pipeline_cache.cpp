@@ -383,11 +383,12 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                              DescriptorPool& descriptor_pool_,
                              GuestDescriptorQueue& guest_descriptor_queue_,
                              DescriptorBufferRing& descriptor_buffer_ring_,
+                             BindlessHeap& bindless_heap_,
                              RenderPassCache& render_pass_cache_, BufferCache& buffer_cache_,
                              TextureCache& texture_cache_, VideoCore::ShaderNotify& shader_notify_)
     : VideoCommon::ShaderCache{device_memory_}, device{device_}, scheduler{scheduler_},
       descriptor_pool{descriptor_pool_}, guest_descriptor_queue{guest_descriptor_queue_},
-      descriptor_buffer_ring{descriptor_buffer_ring_},
+      descriptor_buffer_ring{descriptor_buffer_ring_}, bindless_heap{bindless_heap_},
       render_pass_cache{render_pass_cache_}, buffer_cache{buffer_cache_},
       texture_cache{texture_cache_}, shader_notify{shader_notify_},
       use_asynchronous_shaders{Settings::values.use_asynchronous_shaders.GetValue()},
@@ -1281,13 +1282,32 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
     std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
 
-    const Shader::IR::Program* previous_stage{};
-    Shader::Backend::Bindings binding;
-    for (size_t index = uses_vertex_a && uses_vertex_b ? 1 : 0; index < Maxwell::MaxShaderProgram;
-         ++index) {
+    const size_t first_program{uses_vertex_a && uses_vertex_b ? 1U : 0U};
+    const auto is_emitted = [&](size_t index) {
         const bool is_emulated_stage = layer_source_program != nullptr &&
                                        index == static_cast<u32>(Maxwell::ShaderType::Geometry);
-        if (key.unique_hashes[index] == 0 && !is_emulated_stage) {
+        return key.unique_hashes[index] != 0 || is_emulated_stage;
+    };
+    // Bindless textures when the heap is on and the pipeline's texture elements fit in the push
+    // constant words; the whole pipeline either way. Not task/mesh pipelines: the heap and the
+    // push constant range are for the classic graphics stages.
+    u32 texture_words{};
+    bool task_or_mesh{};
+    for (size_t index = first_program; index < Maxwell::MaxShaderProgram; ++index) {
+        if (index != 0 && is_emitted(index)) {
+            const Shader::Info& info{programs[index].info};
+            texture_words += Shader::NumDescriptors(info.texture_descriptors);
+            task_or_mesh |= info.is_task || info.is_mesh;
+        }
+    }
+    const bool bindless{bindless_heap.Enabled() && !task_or_mesh && texture_words != 0 &&
+                        texture_words <= Shader::Backend::SPIRV::NUM_BINDLESS_WORDS};
+    u32 bindless_word_base{};
+
+    const Shader::IR::Program* previous_stage{};
+    Shader::Backend::Bindings binding;
+    for (size_t index = first_program; index < Maxwell::MaxShaderProgram; ++index) {
+        if (!is_emitted(index)) {
             continue;
         }
         UNIMPLEMENTED_IF(index == 0);
@@ -1296,7 +1316,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         const size_t stage_index{index - 1};
         infos[stage_index] = &program.info;
 
-        const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
+        auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
+        runtime_info.bindless_textures = bindless;
+        runtime_info.bindless_word_base = bindless_word_base;
+        bindless_word_base += Shader::NumDescriptors(program.info.texture_descriptors);
         ConvertLegacyToGeneric(program, runtime_info);
         const std::vector<u32> code{EmitSPIRV(profile, runtime_info, program, binding)};
         device.SaveShader(code);
@@ -1329,8 +1352,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
     return std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
-        descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
-        render_pass_cache, key, std::move(modules), infos);
+        descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring,
+        bindless ? &bindless_heap : nullptr, thread_worker, statistics, render_pass_cache, key,
+        std::move(modules), infos);
 
 } catch (const Shader::Exception& exception) {
     auto hash = key.Hash();

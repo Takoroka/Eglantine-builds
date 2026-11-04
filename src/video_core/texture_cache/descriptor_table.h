@@ -121,6 +121,24 @@ public:
         invalidated = true;
     }
 
+    /// True when entry `index` was read since the table was last invalidated or refreshed and
+    /// its words in guest memory still equal the copy Read kept, i.e. Read would report it
+    /// unchanged. Changes nothing but the page cache.
+    template <class MemoryManager>
+    [[nodiscard]] bool Matches(const MemoryManager& gpu_memory, u32 index) noexcept {
+        if (invalidated || index > current_limit ||
+            (read_descriptors[index / 64] & (1ULL << (index % 64))) == 0) {
+            return false;
+        }
+        const GPUVAddr gpu_addr = current_gpu_addr + index * sizeof(T);
+        if (const u8* const host = EntryPointer(gpu_memory, gpu_addr)) {
+            return std::memcmp(host, std::addressof(descriptors[index]), sizeof(T)) == 0;
+        }
+        T entry;
+        gpu_memory.ReadBlockUnsafe(gpu_addr, std::addressof(entry), sizeof(T));
+        return entry == descriptors[index];
+    }
+
     template <class MemoryManager>
     [[nodiscard]] std::pair<T, bool> Read(const MemoryManager& gpu_memory, u32 index) noexcept {
         DEBUG_ASSERT(index <= current_limit);

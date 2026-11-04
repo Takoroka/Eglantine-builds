@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <span>
@@ -55,6 +56,12 @@ using VideoCore::Surface::PixelFormatFromRenderTargetFormat;
 
 constexpr size_t NUM_STAGES = Maxwell::MaxShaderStage;
 
+// EDEN_NX2_BINDLESS=0: every full setup looks up its image views and samplers (no texture sets).
+const bool texture_sets_enabled = [] {
+    const char* const value = std::getenv("EDEN_NX2_BINDLESS");
+    return value == nullptr || value[0] != '0';
+}();
+
 // The stage of a program: task and mesh programs sit in the vertex and tessellation slots.
 VkShaderStageFlagBits StageFlag(const Shader::Info& info, VkShaderStageFlagBits slot_stage) {
     if (info.is_task) {
@@ -66,8 +73,12 @@ VkShaderStageFlagBits StageFlag(const Shader::Info& info, VkShaderStageFlagBits 
     return slot_stage;
 }
 
-DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader::Info> infos) {
+DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader::Info> infos,
+                                    const BindlessHeap* bindless_heap) {
     DescriptorLayoutBuilder builder{device};
+    if (bindless_heap) {
+        builder.SetBindless(bindless_heap->Layout());
+    }
     for (size_t index = 0; index < infos.size(); ++index) {
         static constexpr std::array stages{
             VK_SHADER_STAGE_VERTEX_BIT,
@@ -267,14 +278,15 @@ GraphicsPipeline::GraphicsPipeline(
     vk::PipelineCache& pipeline_cache_, VideoCore::ShaderNotify* shader_notify,
     const Device& device_, DescriptorPool& descriptor_pool,
     GuestDescriptorQueue& guest_descriptor_queue_, DescriptorBufferRing& descriptor_buffer_ring_,
-    Common::ThreadWorker* worker_thread,
+    BindlessHeap* bindless_heap_, Common::ThreadWorker* worker_thread,
     PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
     const GraphicsPipelineCacheKey& key_, std::array<vk::ShaderModule, NUM_STAGES> stages,
     const std::array<const Shader::Info*, NUM_STAGES>& infos)
     : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
       pipeline_cache(pipeline_cache_), scheduler{scheduler_},
       guest_descriptor_queue{guest_descriptor_queue_},
-      descriptor_buffer_ring{descriptor_buffer_ring_}, spv_modules{std::move(stages)} {
+      descriptor_buffer_ring{descriptor_buffer_ring_}, bindless_heap{bindless_heap_},
+      spv_modules{std::move(stages)} {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }
@@ -291,7 +303,13 @@ GraphicsPipeline::GraphicsPipeline(
         num_textures += Shader::NumDescriptors(info->texture_descriptors);
         num_image_elements += Shader::NumDescriptors(info->texture_descriptors);
         num_image_elements += Shader::NumDescriptors(info->image_descriptors);
-        num_descriptor_entries += NumDescriptorEntries(*info);
+        num_descriptor_entries += NumDescriptorEntries(*info, bindless_heap != nullptr);
+        uses_texture_sets &= info->texture_buffer_descriptors.empty() &&
+                             info->image_buffer_descriptors.empty() &&
+                             info->image_descriptors.empty() &&
+                             std::ranges::all_of(info->texture_descriptors, [](const auto& desc) {
+                                 return desc.handle_program == ~0U;
+                             });
         // A draw that writes memory (storage buffers and images) can change what the next draw
         // reads through other bindings: such draws always run the full setup.
         const auto written = [](const auto& descs) {
@@ -335,9 +353,10 @@ GraphicsPipeline::GraphicsPipeline(
             add_read(desc.cbuf_index, desc.cbuf_offset, desc.cbuf_offset + 16);
         }
     }
+    uses_texture_sets &= num_textures != 0;
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
 
-    DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos)};
+    DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos, bindless_heap)};
     uses_push_descriptor = builder.CanUsePushDescriptor();
     uses_descriptor_buffer = builder.CanUseDescriptorBuffer() && descriptor_buffer_ring.IsValid();
     descriptor_set_layout =
@@ -430,6 +449,16 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
     // Texture handles of a draw sit together in its constant buffers: one translation a page.
     VideoCommon::GuestPageCache handle_pages;
+    // Texture sets: all handles are read first; when they and everything they resolved through
+    // are as at the set's setup, its views, samplers and descriptors are taken as they are.
+    bool use_texture_set{};
+    if constexpr (!Spec::has_texture_buffers && !Spec::has_image_buffers && !Spec::has_images) {
+        use_texture_set = uses_texture_sets && texture_sets_enabled;
+    }
+    if (!use_texture_set) {
+        texture_set.valid = false;
+    }
+    small_vector<std::pair<u32, u32>, 32> texture_handles;
     const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         const Shader::Info& info{stage_infos[stage]};
         buffer_cache.UnbindGraphicsStorageBuffers(stage);
@@ -502,6 +531,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         for (const auto& desc : info.texture_descriptors) {
             for (u32 index = 0; index < desc.count; ++index) {
                 const auto handle{read_handle(desc, index)};
+                if (use_texture_set) {
+                    texture_handles.push_back(handle);
+                    continue;
+                }
                 views.push_back({handle.first});
 
                 VideoCommon::SamplerId sampler{texture_cache.GetSamplerId(handle.second, false)};
@@ -534,9 +567,15 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             config_stage(4);
         }
     }
-    ASSERT(views.size() == num_image_elements);
-    ASSERT(samplers.size() == num_textures);
-    {
+    const bool texture_set_hit{use_texture_set &&
+                               TextureSetCurrent(texture_handles, via_header_index)};
+    if (!texture_set_hit) {
+        for (const auto& handle : texture_handles) {
+            views.push_back({handle.first});
+            samplers.push_back(texture_cache.GetSamplerId(handle.second, false));
+        }
+        ASSERT(views.size() == num_image_elements);
+        ASSERT(samplers.size() == num_textures);
         Profile::Scope scope{Profile::Zone::FillImageViews};
         texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
                                      Spec::has_images);
@@ -628,12 +667,53 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         buffer_cache.UpdateGraphicsBuffers(is_indexed);
         buffer_cache.BindHostGeometryBuffers(is_indexed);
     }
+    const std::span<const VideoCommon::ImageViewInOut> setup_views{
+        texture_set_hit ? std::span<const VideoCommon::ImageViewInOut>{texture_set.views}
+                        : std::span<const VideoCommon::ImageViewInOut>{views.data(), views.size()}};
+    const std::span<const VideoCommon::SamplerId> setup_samplers{
+        texture_set_hit ? std::span<const VideoCommon::SamplerId>{texture_set.samplers}
+                        : std::span<const VideoCommon::SamplerId>{samplers.data(), samplers.size()}};
     if (can_refresh_buffers) {
-        last_views.assign(views.begin(), views.end());
-        last_samplers.assign(samplers.begin(), samplers.end());
+        last_views.assign(setup_views.begin(), setup_views.end());
+        last_samplers.assign(setup_samplers.begin(), setup_samplers.end());
     }
-    return ConfigureDescriptors<Spec>(std::span<const VideoCommon::ImageViewInOut>{views.data(), views.size()},
-                                      samplers.data(), true);
+    TextureSetUse texture_set_use{TextureSetUse::None};
+    if (texture_set_hit) {
+        texture_set_use = TextureSetUse::Replay;
+    } else if (use_texture_set) {
+        RecordTextureSet(texture_handles, setup_views, setup_samplers, via_header_index);
+        texture_set_use = TextureSetUse::Record;
+    }
+    return ConfigureDescriptors<Spec>(setup_views, setup_samplers.data(), true, texture_set_use);
+}
+
+bool GraphicsPipeline::TextureSetCurrent(std::span<const std::pair<u32, u32>> handles,
+                                         bool via_header_index) {
+    if (!texture_set.valid || texture_set.generation != texture_cache.TextureSetGeneration() ||
+        texture_set.via_header_index != via_header_index ||
+        !std::ranges::equal(handles, texture_set.handles)) {
+        return false;
+    }
+    // The TIC and TSC entries may have been rewritten in place.
+    return std::ranges::all_of(handles, [this](const std::pair<u32, u32>& handle) {
+        return texture_cache.ImageTableMatches(handle.first) &&
+               texture_cache.SamplerTableMatches(handle.second);
+    });
+}
+
+void GraphicsPipeline::RecordTextureSet(std::span<const std::pair<u32, u32>> handles,
+                                        std::span<const VideoCommon::ImageViewInOut> views,
+                                        std::span<const VideoCommon::SamplerId> samplers,
+                                        bool via_header_index) {
+    // Taken before the render targets are prepared: a render target that aliases one of these
+    // images changes the generation, and the next draw synchronizes it again.
+    texture_set.generation = texture_cache.TextureSetGeneration();
+    texture_set.via_header_index = via_header_index;
+    texture_set.valid = false;
+    texture_set.handles.assign(handles.begin(), handles.end());
+    texture_set.views.assign(views.begin(), views.end());
+    texture_set.samplers.assign(samplers.begin(), samplers.end());
+    texture_set.descriptors.clear();
 }
 
 template <typename Spec>
@@ -648,7 +728,11 @@ GraphicsPipeline::ConfigureResult GraphicsPipeline::RefreshImpl(bool is_indexed)
         }
         buffer_cache.BindHostGeometryBuffers(is_indexed);
     }
-    return ConfigureDescriptors<Spec>(last_views, last_samplers.data(), false)
+    // The last full setup's views are the texture set's while it is current.
+    const bool replay{texture_set.valid &&
+                      texture_set.generation == texture_cache.TextureSetGeneration()};
+    return ConfigureDescriptors<Spec>(last_views, last_samplers.data(), false,
+                                      replay ? TextureSetUse::Replay : TextureSetUse::None)
                ? ConfigureResult::Done
                : ConfigureResult::Failed;
 }
@@ -656,7 +740,7 @@ GraphicsPipeline::ConfigureResult GraphicsPipeline::RefreshImpl(bool is_indexed)
 template <typename Spec>
 bool GraphicsPipeline::ConfigureDescriptors(std::span<const VideoCommon::ImageViewInOut> views,
                                             const VideoCommon::SamplerId* samplers,
-                                            bool full_setup) {
+                                            bool full_setup, TextureSetUse texture_set_use) {
     namespace Profile = VideoCommon::Nx2Profile;
     const auto& regs{maxwell3d->regs};
     {
@@ -668,6 +752,10 @@ bool GraphicsPipeline::ConfigureDescriptors(std::span<const VideoCommon::ImageVi
     RenderAreaPushConstant render_area;
     const VideoCommon::SamplerId* samplers_it{samplers};
     const VideoCommon::ImageViewInOut* views_it{views.data()};
+    // Bindless pipelines: each texture element becomes the slots of its view and sampler.
+    std::array<BindlessTexture, Shader::Backend::SPIRV::NUM_BINDLESS_WORDS> bindless_textures;
+    BindlessTexture* bindless_it{bindless_textures.data()};
+    const DescriptorUpdateEntry* texture_set_it{texture_set.descriptors.data()};
     const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         {
             Profile::Scope scope{Profile::Zone::BindStageBuffers};
@@ -675,8 +763,29 @@ bool GraphicsPipeline::ConfigureDescriptors(std::span<const VideoCommon::ImageVi
         }
         {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
-            PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
-                                 rescaling, samplers_it, views_it);
+            if (texture_set_use == TextureSetUse::Replay) {
+                // This stage's textures, in descriptor order (texture set pipelines have no
+                // texture buffers or images); bindless sets keep slot words instead.
+                if (!bindless_heap) {
+                    const u32 count{Shader::NumDescriptors(stage_infos[stage].texture_descriptors)};
+                    guest_descriptor_queue.AddEntries(texture_set_it, count);
+                    texture_set_it += count;
+                }
+            } else if (bindless_heap) {
+                // A texture without a slot reads slot 0 (the null view): the shader has no other
+                // way to reach it.
+                static_cast<void>(PushBindlessImageDescriptors(
+                    texture_cache, bindless_heap->Table(), guest_descriptor_queue,
+                    stage_infos[stage], rescaling, samplers_it, views_it, bindless_it));
+            } else {
+                const DescriptorUpdateEntry* const first{guest_descriptor_queue.Next()};
+                PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
+                                     rescaling, samplers_it, views_it);
+                if (texture_set_use == TextureSetUse::Record) {
+                    texture_set.descriptors.insert(texture_set.descriptors.end(), first,
+                                                   guest_descriptor_queue.Next());
+                }
+            }
         }
         const auto& info{stage_infos[stage]};
         if (info.uses_render_area) {
@@ -703,6 +812,12 @@ bool GraphicsPipeline::ConfigureDescriptors(std::span<const VideoCommon::ImageVi
     if constexpr (Spec::enabled_stages[4]) {
         prepare_stage(4);
     }
+    if (texture_set_use == TextureSetUse::Replay) {
+        rescaling.SetData(texture_set.rescaling);
+    } else if (texture_set_use == TextureSetUse::Record) {
+        texture_set.rescaling = rescaling.Data();
+        texture_set.valid = true;
+    }
     if (buffer_cache.any_buffer_uploaded) {
         buffer_cache.runtime.PostCopyBarrier();
         buffer_cache.any_buffer_uploaded = false;
@@ -712,15 +827,35 @@ bool GraphicsPipeline::ConfigureDescriptors(std::span<const VideoCommon::ImageVi
         texture_cache.UpdateRenderTargets(false);
         texture_cache.CheckFeedbackLoop(views);
     }
+    BindlessWords bindless_words;
+    if (bindless_heap && texture_set_use == TextureSetUse::Replay) {
+        bindless_words = texture_set.bindless_words;
+    } else if (bindless_heap) {
+        bindless_words.count = static_cast<u32>(bindless_it - bindless_textures.data());
+        for (u32 index = 0; index < bindless_words.count; ++index) {
+            const BindlessTexture& texture{bindless_textures[index]};
+            const auto slot = [](u32 value) {
+                return value != BindlessTable::INVALID_SLOT ? value : 0U;
+            };
+            bindless_words.words[index] = Shader::Backend::SPIRV::BindlessWord(
+                slot(texture.image_slot), slot(texture.sampler_slot));
+        }
+        // New slots are written before the draw that reads them is recorded.
+        bindless_heap->Apply();
+        if (texture_set_use == TextureSetUse::Record) {
+            texture_set.bindless_words = bindless_words;
+        }
+    }
     if (IsBuilt() && !pipeline) {
         return false;
     }
     Profile::Scope scope{Profile::Zone::ConfigureDraw};
-    return ConfigureDraw(rescaling, render_area);
+    return ConfigureDraw(rescaling, render_area, bindless_heap ? &bindless_words : nullptr);
 }
 
 bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
-                                     const RenderAreaPushConstant& render_area) {
+                                     const RenderAreaPushConstant& render_area,
+                                     const BindlessWords* bindless_words) {
     const void* const descriptor_data{guest_descriptor_queue.UpdateData()};
 
     VkDeviceSize descriptor_buffer_offset{};
@@ -786,56 +921,89 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             last_descriptor_payload.assign(entries, entries + num_descriptor_entries);
         }
     }
-    scheduler.Record([this, descriptor_data, bind_pipeline, update_descriptors,
-                      descriptor_buffer_offset, descriptor_buffer_chunk, bind_descriptor_buffer,
-                      rescaling_data = rescaling.Data(), is_rescaling, update_rescaling,
-                      uses_render_area = render_area.uses_render_area,
-                      render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
-        if (bind_descriptor_buffer) {
-            const VkDescriptorBufferBindingInfoEXT binding_info{
-                descriptor_buffer_ring.BindingInfo(descriptor_buffer_chunk)};
-            cmdbuf.BindDescriptorBuffersEXT(binding_info);
-        }
-        if (bind_pipeline) {
-            if (!pipeline) {
-                return;
-            }
-            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline);
-        }
-        cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
-                             RESCALING_LAYOUT_WORDS_OFFSET, sizeof(rescaling_data),
-                             rescaling_data.data());
-        if (update_rescaling) {
-            const f32 config_down_factor{Settings::values.resolution_info.down_factor};
-            const f32 scale_down_factor{is_rescaling ? config_down_factor : 1.0f};
-            cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
-                                 RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, sizeof(scale_down_factor),
-                                 &scale_down_factor);
-        }
-        if (uses_render_area) {
-            cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
-                                 RENDERAREA_LAYOUT_OFFSET, sizeof(render_area_data),
-                                 &render_area_data);
-        }
-        if (!descriptor_set_layout) {
+    const DrawRecord draw{
+        .descriptor_data = descriptor_data,
+        .descriptor_buffer_offset = descriptor_buffer_offset,
+        .descriptor_buffer_chunk = descriptor_buffer_chunk,
+        .bind_pipeline = bind_pipeline,
+        .update_descriptors = update_descriptors,
+        .bind_descriptor_buffer = bind_descriptor_buffer,
+        .is_rescaling = is_rescaling,
+        .update_rescaling = update_rescaling,
+        .uses_render_area = render_area.uses_render_area,
+        .rescaling_data = rescaling.Data(),
+        .render_area_data = render_area.words,
+    };
+    if (bindless_words) {
+        scheduler.Record([this, draw, words = *bindless_words](vk::CommandBuffer cmdbuf) {
+            RecordDraw(cmdbuf, draw, std::span<const u32>(words.words.data(), words.count));
+        });
+    } else {
+        scheduler.Record([this, draw](vk::CommandBuffer cmdbuf) { RecordDraw(cmdbuf, draw, {}); });
+    }
+    return true;
+}
+
+void GraphicsPipeline::RecordDraw(vk::CommandBuffer cmdbuf, const DrawRecord& draw,
+                                  std::span<const u32> bindless_words) {
+    using namespace Shader::Backend::SPIRV;
+    if (draw.bind_descriptor_buffer) {
+        const VkDescriptorBufferBindingInfoEXT binding_info{
+            descriptor_buffer_ring.BindingInfo(draw.descriptor_buffer_chunk)};
+        cmdbuf.BindDescriptorBuffersEXT(binding_info);
+    }
+    if (draw.bind_pipeline) {
+        if (!pipeline) {
             return;
         }
-        if (uses_descriptor_buffer) {
-            const u32 buffer_index{};
-            cmdbuf.SetDescriptorBufferOffsetsEXT(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout,
-                                                 0, buffer_index, descriptor_buffer_offset);
-        } else if (uses_push_descriptor) {
-            cmdbuf.PushDescriptorSetWithTemplateKHR(*descriptor_update_template, *pipeline_layout,
-                                                    0, descriptor_data);
-        } else if (update_descriptors) {
-            const VkDescriptorSet descriptor_set{descriptor_allocator.Commit()};
-            const vk::Device& dev{device.GetLogical()};
-            dev.UpdateDescriptorSet(descriptor_set, *descriptor_update_template, descriptor_data);
-            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout, 0,
-                                      descriptor_set, nullptr);
+        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline);
+        if (bindless_heap) {
+            // Every bindless layout has the heap's set layout and push constant range: the set
+            // stays bound for the bindless pipelines after this one.
+            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout,
+                                      BINDLESS_HEAP_SET, bindless_heap->Set(), {});
         }
-    });
-    return true;
+    }
+    cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
+                         RESCALING_LAYOUT_WORDS_OFFSET, sizeof(draw.rescaling_data),
+                         draw.rescaling_data.data());
+    // Bindless and bound layouts have different push constant ranges: switching between them
+    // leaves the down factor undefined, so it goes again with every pipeline bind.
+    if (draw.update_rescaling || (draw.bind_pipeline && device.IsBindlessSupported())) {
+        const f32 config_down_factor{Settings::values.resolution_info.down_factor};
+        const f32 scale_down_factor{draw.is_rescaling ? config_down_factor : 1.0f};
+        cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
+                             RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, sizeof(scale_down_factor),
+                             &scale_down_factor);
+    }
+    if (draw.uses_render_area) {
+        cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
+                             bindless_heap ? BINDLESS_RENDER_AREA_OFFSET : RENDERAREA_LAYOUT_OFFSET,
+                             sizeof(draw.render_area_data), &draw.render_area_data);
+    }
+    if (!bindless_words.empty()) {
+        cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS, BINDLESS_WORDS_OFFSET,
+                             static_cast<u32>(bindless_words.size_bytes()),
+                             bindless_words.data());
+    }
+    if (!descriptor_set_layout) {
+        return;
+    }
+    const u32 set{bindless_heap ? BINDLESS_PER_DRAW_SET : 0U};
+    if (uses_descriptor_buffer) {
+        const u32 buffer_index{};
+        cmdbuf.SetDescriptorBufferOffsetsEXT(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout,
+                                             set, buffer_index, draw.descriptor_buffer_offset);
+    } else if (uses_push_descriptor) {
+        cmdbuf.PushDescriptorSetWithTemplateKHR(*descriptor_update_template, *pipeline_layout, set,
+                                                draw.descriptor_data);
+    } else if (draw.update_descriptors) {
+        const VkDescriptorSet descriptor_set{descriptor_allocator.Commit()};
+        const vk::Device& dev{device.GetLogical()};
+        dev.UpdateDescriptorSet(descriptor_set, *descriptor_update_template, draw.descriptor_data);
+        cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout, set,
+                                  descriptor_set, nullptr);
+    }
 }
 
 void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {

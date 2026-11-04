@@ -17,6 +17,7 @@
 #include "video_core/texture_cache/texture_cache_base.h"
 
 #include "shader_recompiler/shader_info.h"
+#include "video_core/renderer_vulkan/vk_bindless_table.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_dlss_network_probe.h"
 #include "video_core/renderer_vulkan/vk_fsr3_upscaler.h"
@@ -222,6 +223,9 @@ public:
     RenderPassCache& render_pass_cache;
     DescriptorPool& descriptor_pool;
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
+
+    /// Bindless textures: the slots of the image views and samplers the draws use.
+    BindlessTable bindless_table;
 
     /// FSR 3.1 in place of a DLSS evaluation (TemporalUpscale), created on first use.
     bool UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageView& input_color,
@@ -699,6 +703,16 @@ public:
         return *image_views[static_cast<size_t>(texture_type)];
     }
 
+    /// This view's bindless image slot for `texture_type` (allocated on first use); INVALID_SLOT
+    /// when the table is full or the view has no handle of that type.
+    [[nodiscard]] u32 BindlessSlot(BindlessTable& table, Shader::TextureType texture_type) {
+        const VkImageView handle = Handle(texture_type);
+        if (handle == VK_NULL_HANDLE) {
+            return BindlessTable::INVALID_SLOT;
+        }
+        return bindless_slots.Get(table, texture_type, handle);
+    }
+
     [[nodiscard]] VkImage ImageHandle() const noexcept {
         return image_handle;
     }
@@ -769,6 +783,8 @@ private:
     bool requires_border_color_format = false;
     bool supports_minmax_filter = false;
     bool has_identity_swizzle = true;
+
+    BindlessViewSlots bindless_slots;
 };
 
 class ImageAlloc : public VideoCommon::ImageAllocBase {};
@@ -803,6 +819,11 @@ public:
 
     [[nodiscard]] VkSampler HandleFor(const ImageView& image_view, bool is_depth);
 
+    /// HandleFor's variant and its bindless sampler slot (allocated on first use; INVALID_SLOT
+    /// when the table is full).
+    [[nodiscard]] std::pair<VkSampler, u32> HandleAndSlotFor(const ImageView& image_view,
+                                                             bool is_depth, BindlessTable& table);
+
 private:
     struct VariantKey {
         bool reduce_anisotropy;
@@ -822,6 +843,7 @@ private:
     struct Variant {
         VariantKey key;
         vk::Sampler sampler;
+        u32 bindless_slot = BindlessTable::INVALID_SLOT;
     };
 
     static constexpr size_t MAX_VARIANTS = 32;

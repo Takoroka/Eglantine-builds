@@ -134,18 +134,26 @@ inline void WriteDescriptorBuffer(const Device& device, const DescriptorBufferLa
     }
 }
 
-[[nodiscard]] inline u32 NumDescriptorEntries(const Shader::Info& info) {
+/// Entries the stage adds to the descriptor queue per draw (no textures with bindless textures).
+[[nodiscard]] inline u32 NumDescriptorEntries(const Shader::Info& info, bool bindless = false) {
     return Shader::NumDescriptors(info.constant_buffer_descriptors) +
            Shader::NumDescriptors(info.storage_buffers_descriptors) +
            Shader::NumDescriptors(info.texture_buffer_descriptors) +
            Shader::NumDescriptors(info.image_buffer_descriptors) +
-           Shader::NumDescriptors(info.texture_descriptors) +
+           (bindless ? 0U : Shader::NumDescriptors(info.texture_descriptors)) +
            Shader::NumDescriptors(info.image_descriptors);
 }
 
 class DescriptorLayoutBuilder {
 public:
     DescriptorLayoutBuilder(const Device& device_) : device{&device_} {}
+
+    /// Bindless textures (before the first Add): the textures are left out (the shaders read them
+    /// from the heap), the per-draw set is BINDLESS_PER_DRAW_SET after the heap's layout, and the
+    /// push constant range is the whole bindless block, the same in every bindless layout.
+    void SetBindless(VkDescriptorSetLayout heap_layout_) noexcept {
+        heap_layout = heap_layout_;
+    }
 
     bool CanUsePushDescriptor() const noexcept {
         if (!device->IsKhrPushDescriptorSupported() ||
@@ -158,8 +166,9 @@ public:
 
     bool CanUseDescriptorBuffer() const noexcept {
         const auto& props = device->DescriptorBufferProperties();
+        // A descriptor buffer set can't share a layout with the heap's ordinary set.
         if (!device->IsExtDescriptorBufferSupported() || bindings.empty() ||
-            !props.combinedImageSamplerDescriptorSingleArray) {
+            !props.combinedImageSamplerDescriptorSingleArray || heap_layout != VK_NULL_HANDLE) {
             return false;
         }
         return !props.bufferlessPushDescriptors || !CanUsePushDescriptor();
@@ -238,13 +247,31 @@ public:
             .pipelineBindPoint =
                 is_compute ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS,
             .pipelineLayout = pipeline_layout,
-            .set = 0,
+            .set = heap_layout ? Shader::Backend::SPIRV::BINDLESS_PER_DRAW_SET : 0U,
         });
     }
 
     vk::PipelineLayout CreatePipelineLayout(VkDescriptorSetLayout descriptor_set_layout) const {
         using Shader::Backend::SPIRV::RenderAreaLayout;
         using Shader::Backend::SPIRV::RescalingLayout;
+        if (heap_layout) {
+            const VkPushConstantRange bindless_range{
+                .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS,
+                .offset = 0,
+                .size = Shader::Backend::SPIRV::BINDLESS_PUSH_CONSTANT_SIZE,
+            };
+            const std::array<VkDescriptorSetLayout, 2> set_layouts{heap_layout,
+                                                                   descriptor_set_layout};
+            return device->GetLogical().CreatePipelineLayout({
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .setLayoutCount = descriptor_set_layout ? 2U : 1U,
+                .pSetLayouts = set_layouts.data(),
+                .pushConstantRangeCount = 1,
+                .pPushConstantRanges = &bindless_range,
+            });
+        }
         const u32 size_offset = is_compute ? sizeof(RescalingLayout::down_factor) : 0u;
         const VkPushConstantRange range{
             .stageFlags = static_cast<VkShaderStageFlags>(
@@ -271,7 +298,9 @@ public:
         Add(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage, info.storage_buffers_descriptors);
         Add(VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, stage, info.texture_buffer_descriptors);
         Add(VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, stage, info.image_buffer_descriptors);
-        Add(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage, info.texture_descriptors);
+        if (!heap_layout) {
+            Add(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage, info.texture_descriptors);
+        }
         Add(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage, info.image_descriptors);
     }
 
@@ -302,6 +331,7 @@ private:
     }
 
     const Device* device{};
+    VkDescriptorSetLayout heap_layout{}; ///< SetBindless
     bool is_compute{};
     boost::container::small_vector<VkDescriptorSetLayoutBinding, 32> bindings;
     boost::container::small_vector<VkDescriptorUpdateTemplateEntry, 32> entries;
@@ -334,6 +364,11 @@ public:
 
     const std::array<u32, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS>& Data() const noexcept {
         return words;
+    }
+
+    /// Takes the words of an earlier setup whole (a pipeline's texture set).
+    void SetData(const std::array<u32, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS>& data) noexcept {
+        words = data;
     }
 
 private:
@@ -392,6 +427,61 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
         }
         rescaling.PushImage(is_rescaled);
     }
+}
+
+/// Bindless PushImageDescriptors: the stage's textures go to `slots` (one BindlessTexture per
+/// element, in descriptor order) instead of the descriptor queue; storage images are pushed as
+/// before. Returns false when a texture got no slot (table full, no view of its type): the draw
+/// then binds its textures through the descriptor queue instead.
+[[nodiscard]] inline bool PushBindlessImageDescriptors(
+    TextureCache& texture_cache, BindlessTable& table,
+    GuestDescriptorQueue& guest_descriptor_queue, const Shader::Info& info,
+    RescalingPushConstant& rescaling, const VideoCommon::SamplerId*& samplers,
+    const VideoCommon::ImageViewInOut*& views, BindlessTexture*& slots) {
+    const u32 num_texture_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors);
+    const u32 num_image_buffers = Shader::NumDescriptors(info.image_buffer_descriptors);
+    views += num_texture_buffers;
+    views += num_image_buffers;
+    bool complete = true;
+    for (const auto& desc : info.texture_descriptors) {
+        bool is_rescaled{};
+        for (u32 index = 0; index < desc.count; ++index) {
+            const VideoCommon::ImageViewId image_view_id{(views++)->id};
+            const VideoCommon::SamplerId sampler_id{*(samplers++)};
+            ImageView& image_view{texture_cache.GetImageView(image_view_id)};
+            // No view of this type: the null view's, as the bound path does.
+            ImageView& slot_view{image_view.Handle(desc.type) != VK_NULL_HANDLE
+                                     ? image_view
+                                     : texture_cache.GetImageView(VideoCommon::NULL_IMAGE_VIEW_ID)};
+            const u32 image_slot = slot_view.BindlessSlot(table, desc.type);
+            Sampler& sampler{texture_cache.GetSampler(sampler_id)};
+            const u32 sampler_slot =
+                sampler.HandleAndSlotFor(image_view, desc.is_depth, table).second;
+            complete &= image_slot != BindlessTable::INVALID_SLOT &&
+                        sampler_slot != BindlessTable::INVALID_SLOT;
+            *(slots++) = BindlessTexture{
+                .image_slot = image_slot,
+                .sampler_slot = sampler_slot,
+            };
+            is_rescaled |= texture_cache.IsRescaling(image_view);
+        }
+        rescaling.PushTexture(is_rescaled);
+    }
+    for (const auto& desc : info.image_descriptors) {
+        bool is_rescaled{};
+        for (u32 index = 0; index < desc.count; ++index) {
+            ImageView& image_view{texture_cache.GetImageView((views++)->id)};
+            if (desc.is_written) {
+                texture_cache.MarkModification(image_view.image_id);
+            }
+            const VkImageView vk_image_view{image_view.StorageView(desc.type, desc.format)};
+            guest_descriptor_queue.AddImage(vk_image_view);
+            const bool element_rescaled{texture_cache.IsRescaling(image_view)};
+            is_rescaled |= element_rescaled;
+        }
+        rescaling.PushImage(is_rescaled);
+    }
+    return complete;
 }
 
 } // namespace Vulkan

@@ -282,6 +282,7 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
 
 template <class P>
 void TextureCache<P>::TickFrame() {
+    BumpTextureSetGeneration(); // the once-a-frame LRU touch in PrepareImage
     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
     // rather than kept for the rest of the session.
     for (auto* const scratch : {&swizzle_data_buffer, &unswizzle_data_buffer}) {
@@ -604,14 +605,33 @@ typename P::Sampler* TextureCache<P>::GetSampler(u32 index, bool compute) {
 }
 
 template <class P>
+bool TextureCache<P>::ImageTableMatches(u32 tic_handle) {
+    auto& table = channel_state->graphics_image_table;
+    const u32 index = Tegra::Texture::TextureHeaderIndex(tic_handle, table.current_limit,
+                                                         gpu_memory->UsesNativeTiling());
+    // Out of the limit resolves to the null view; a limit change bumps the generation.
+    return index > table.current_limit || table.Matches(*gpu_memory, index);
+}
+
+template <class P>
+bool TextureCache<P>::SamplerTableMatches(u32 tsc_index) {
+    auto& table = channel_state->graphics_sampler_table;
+    return tsc_index > table.current_limit || table.Matches(*gpu_memory, tsc_index);
+}
+
+template <class P>
 SamplerId TextureCache<P>::GetSamplerId(u32 index, bool compute) {
     auto& table = compute ? channel_state->compute_sampler_table : channel_state->graphics_sampler_table;
     if (index > table.current_limit) {
         LOG_TRACE(HW_GPU, "Invalid sampler index={}", index);
         return NULL_SAMPLER_ID;
     }
-    if (table.ReadEntry(*gpu_memory, index) == DescriptorRead::Same) {
+    const DescriptorRead read = table.ReadEntry(*gpu_memory, index);
+    if (read == DescriptorRead::Same) {
         return table.bound_ids[index];
+    }
+    if (read == DescriptorRead::New && !compute) {
+        BumpTextureSetGeneration(); // the table's copy changes for every graphics draw
     }
     auto const id = FindSampler(table.descriptors[index], compute);
     table.bound_ids[index] = id;
@@ -657,6 +677,7 @@ void TextureCache<P>::SynchronizeDescriptors(bool compute) {
             bindings_changed = true;
         if (bindings_changed) {
             ++texture_bindings_serial;
+            BumpTextureSetGeneration();
         }
     }
 }
@@ -845,6 +866,9 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
         return NULL_IMAGE_VIEW_ID;
     }
     const DescriptorRead read = table.ReadEntry(*gpu_memory, index);
+    if (read == DescriptorRead::New && !compute) {
+        BumpTextureSetGeneration(); // the table's copy changes for every graphics draw
+    }
     if (read != DescriptorRead::New) {
         const ImageViewId id = table.bound_ids[index];
         // An entry not read since the tables were invalidated (for each deleted image) keeps its
@@ -905,6 +929,7 @@ template <class P>
 void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
     ForEachImageInRegion(cpu_addr, size, [this, cpu_addr, size](ImageId image_id, Image& image) {
         ++written_images;
+        BumpTextureSetGeneration();
         if (True(image.flags & ImageFlagBits::UnwrittenSparse)) {
             // Written at last: a backed image replaces it where it is used next.
             image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
@@ -1046,6 +1071,7 @@ void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t siz
                             [&](ImageId id, Image&) { deleted_images.push_back(id); });
     for (const ImageId id : deleted_images) {
         Image& image = slot_images[id];
+        BumpTextureSetGeneration();
         if (False(image.flags & ImageFlagBits::CpuModified)) {
             image.flags |= ImageFlagBits::CpuModified;
             if (True(image.flags & ImageFlagBits::Tracked)) {
@@ -2195,6 +2221,7 @@ void TextureCache<P>::InvalidateScale(Image& image) {
 #endif
         channel_info.graphics_image_table.Invalidate();
         channel_info.compute_image_table.Invalidate();
+        BumpTextureSetGeneration();
     }
     has_deleted_images = true;
 }
@@ -2603,6 +2630,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     }
     const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
     Image& new_image = slot_images[new_image_id];
+    BumpTextureSetGeneration(); // it may delete overlaps and add aliases
 
     new_image.allocation_tick = frame_tick;
     {
@@ -3147,6 +3175,7 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    BumpTextureSetGeneration();
     total_used_memory += ImageMemoryBytes(slot_images[image_id]);
     image.lru_index = lru_cache.Insert(image_id, frame_tick);
 
@@ -3186,6 +3215,7 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
                "Trying to unregister an already registered image");
     image.flags &= ~ImageFlagBits::Registered;
     image.flags &= ~ImageFlagBits::BadOverlap;
+    BumpTextureSetGeneration();
     lru_cache.Free(image.lru_index);
     const auto& clear_page_table =
         [image_id](u64 page, ::Common::unordered_map<u64, std::vector<ImageId>, Common::IdentityHash<u64>>& selected_page_table) {
@@ -3423,6 +3453,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
 #endif
         channel_info.graphics_image_table.Invalidate();
         channel_info.compute_image_table.Invalidate();
+        BumpTextureSetGeneration();
     }
     has_deleted_images = true;
 }
@@ -3474,6 +3505,10 @@ template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     image.flags |= ImageFlagBits::GpuModified;
     image.modification_tick = ++modification_tick;
+    if (!image.aliased_images.empty()) {
+        // Its aliases are synchronized from it when they are prepared next.
+        BumpTextureSetGeneration();
+    }
 }
 
 template <class P>
@@ -3574,6 +3609,7 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
         }
         if (True(image.flags & ImageFlagBits::UnwrittenSparse) &&
             False(image.flags & ImageFlagBits::Remapped)) {
+            BumpTextureSetGeneration();
             // The GPU renders into it: these writes are lost, later uses get a backed image.
             LOG_WARNING(HW_GPU, "GPU write into unwritten sparse image {:#x}; replacing it",
                         image.gpu_addr);
@@ -3764,6 +3800,12 @@ bool TextureCache<P>::IsFullClear(ImageViewId id) {
     // Make sure the clear covers all texels in the subresource
     return scissor.min_x == 0 && scissor.min_y == 0 && scissor.max_x >= size.width &&
            scissor.max_y >= size.height;
+}
+
+template <class P>
+void TextureCache<P>::BindToChannel(s32 id) {
+    VideoCommon::ChannelSetupCaches<TextureCacheChannelInfo>::BindToChannel(id);
+    BumpTextureSetGeneration(); // other descriptor tables
 }
 
 template <class P>

@@ -27,6 +27,7 @@
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -723,6 +724,31 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     // Descriptors feature list
     {
         auto& descriptor_indexing = features.descriptor_indexing;
+        // Bindless textures (EDEN_NX2_BINDLESS=0 turns them off): sampled images and samplers in
+        // arrays the back thread fills while command buffers that read other slots are pending.
+        using namespace Shader::Backend::SPIRV;
+        const char* const bindless_env = std::getenv("EDEN_NX2_BINDLESS");
+        const auto& limits = properties.descriptor_indexing;
+        const u32 heap_images = Shader::NUM_TEXTURE_TYPES * BINDLESS_IMAGE_CAPACITY;
+        bindless_supported =
+            (bindless_env == nullptr || bindless_env[0] != '0') &&
+            (extensions.descriptor_indexing || instance_version >= VK_API_VERSION_1_2) &&
+            features.features.shaderSampledImageArrayDynamicIndexing &&
+            descriptor_indexing.shaderSampledImageArrayNonUniformIndexing &&
+            descriptor_indexing.descriptorBindingSampledImageUpdateAfterBind &&
+            descriptor_indexing.descriptorBindingPartiallyBound &&
+            descriptor_indexing.descriptorBindingUpdateUnusedWhilePending &&
+            limits.maxPerStageDescriptorUpdateAfterBindSampledImages >= heap_images &&
+            limits.maxDescriptorSetUpdateAfterBindSampledImages >= heap_images &&
+            limits.maxPerStageDescriptorUpdateAfterBindSamplers >= BINDLESS_SAMPLER_CAPACITY &&
+            limits.maxDescriptorSetUpdateAfterBindSamplers >= BINDLESS_SAMPLER_CAPACITY &&
+            limits.maxPerStageUpdateAfterBindResources >= heap_images + BINDLESS_SAMPLER_CAPACITY &&
+            limits.maxUpdateAfterBindDescriptorsInAllPools >= heap_images + BINDLESS_SAMPLER_CAPACITY &&
+            properties.properties.limits.maxPushConstantsSize >= BINDLESS_PUSH_CONSTANT_SIZE;
+        LOG_INFO(Render_Vulkan, "Bindless textures: {}",
+                 bindless_supported ? "on"
+                 : bindless_env != nullptr && bindless_env[0] == '0' ? "off (EDEN_NX2_BINDLESS=0)"
+                                                                     : "not supported");
         descriptor_indexing.shaderInputAttachmentArrayDynamicIndexing = false;
         descriptor_indexing.shaderUniformTexelBufferArrayDynamicIndexing = false;
         descriptor_indexing.shaderStorageTexelBufferArrayDynamicIndexing = false;
@@ -730,12 +756,12 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         descriptor_indexing.shaderStorageBufferArrayNonUniformIndexing = false;
         descriptor_indexing.shaderInputAttachmentArrayNonUniformIndexing = false;
         descriptor_indexing.descriptorBindingUniformBufferUpdateAfterBind = false;
-        descriptor_indexing.descriptorBindingSampledImageUpdateAfterBind = false;
+        descriptor_indexing.descriptorBindingSampledImageUpdateAfterBind = bindless_supported;
         descriptor_indexing.descriptorBindingStorageImageUpdateAfterBind = false;
         descriptor_indexing.descriptorBindingStorageBufferUpdateAfterBind = false;
         descriptor_indexing.descriptorBindingUniformTexelBufferUpdateAfterBind = false;
         descriptor_indexing.descriptorBindingStorageTexelBufferUpdateAfterBind = false;
-        descriptor_indexing.descriptorBindingUpdateUnusedWhilePending = false;
+        descriptor_indexing.descriptorBindingUpdateUnusedWhilePending = bindless_supported;
         descriptor_indexing.descriptorBindingVariableDescriptorCount = false;
         descriptor_indexing.runtimeDescriptorArray = false;
     }
@@ -1310,6 +1336,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
         properties.push_descriptor.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR;
         SetNext(next, properties.push_descriptor);
+    }
+    if (extensions.descriptor_indexing || instance_version >= VK_API_VERSION_1_2) {
+        properties.descriptor_indexing.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES;
+        SetNext(next, properties.descriptor_indexing);
     }
     if (extensions.depth_stencil_resolve || instance_version >= VK_API_VERSION_1_2) {
         properties.depth_stencil_resolve.sType =

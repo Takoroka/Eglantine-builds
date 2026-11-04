@@ -112,8 +112,9 @@ public:
                            Scheduler& scheduler, DescriptorPool& descriptor_pool,
                            GuestDescriptorQueue& guest_descriptor_queue,
                            DescriptorBufferRing& descriptor_buffer_ring,
-                           RenderPassCache& render_pass_cache, BufferCache& buffer_cache,
-                           TextureCache& texture_cache, VideoCore::ShaderNotify& shader_notify_);
+                           BindlessHeap& bindless_heap, RenderPassCache& render_pass_cache,
+                           BufferCache& buffer_cache, TextureCache& texture_cache,
+                           VideoCore::ShaderNotify& shader_notify_);
     ~PipelineCache();
 
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
@@ -199,6 +200,7 @@ private:
     DescriptorPool& descriptor_pool;
     GuestDescriptorQueue& guest_descriptor_queue;
     DescriptorBufferRing& descriptor_buffer_ring;
+    BindlessHeap& bindless_heap;
     RenderPassCache& render_pass_cache;
     BufferCache& buffer_cache;
     TextureCache& texture_cache;

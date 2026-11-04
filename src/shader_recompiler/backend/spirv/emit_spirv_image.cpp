@@ -239,8 +239,70 @@ private:
     spv::ImageOperandsMask mask{};
 };
 
+/// A bindless texture element's slot word (image slot in the low BINDLESS_IMAGE_SLOT_BITS, sampler
+/// slot above) and whether the element index varies per invocation.
+std::pair<Id, bool> BindlessWord(EmitContext& ctx, const TextureDefinition& def,
+                                 const IR::Value& index) {
+    Id word_index{ctx.Const(def.bindless_word)};
+    bool non_uniform{};
+    if (def.count > 1) {
+        if (index.IsImmediate()) {
+            word_index = ctx.Const(def.bindless_word + index.U32());
+        } else {
+            const Id idx{ctx.Def(index)};
+            non_uniform = MarkNonUniform(ctx, idx, index, NonUniformKind::SampledImage);
+            word_index = ctx.OpIAdd(ctx.U32[1], word_index, idx);
+            if (non_uniform) {
+                DecorateNonUniform(ctx, word_index);
+            }
+        }
+    }
+    const Id pointer{ctx.OpAccessChain(ctx.bindless_word_pointer, ctx.bindless_push_constants,
+                                       ctx.Const(ctx.bindless_words_member_index), word_index)};
+    const Id word{ctx.OpLoad(ctx.U32[1], pointer)};
+    if (non_uniform) {
+        DecorateNonUniform(ctx, pointer);
+        DecorateNonUniform(ctx, word);
+    }
+    return {word, non_uniform};
+}
+
+Id BindlessImage(EmitContext& ctx, const TextureDefinition& def, Id word, bool non_uniform) {
+    const Id image_slot{
+        ctx.OpBitwiseAnd(ctx.U32[1], word, ctx.Const((1u << BINDLESS_IMAGE_SLOT_BITS) - 1))};
+    const Id pointer{ctx.OpAccessChain(def.pointer_type, def.id, image_slot)};
+    const Id image{ctx.OpLoad(def.image_type, pointer)};
+    if (non_uniform) {
+        DecorateNonUniform(ctx, image_slot);
+        DecorateNonUniform(ctx, pointer);
+        DecorateNonUniform(ctx, image);
+    }
+    return image;
+}
+
+Id BindlessTexture(EmitContext& ctx, const TextureDefinition& def, const IR::Value& index) {
+    const auto [word, non_uniform]{BindlessWord(ctx, def, index)};
+    const Id image{BindlessImage(ctx, def, word, non_uniform)};
+    const Id sampler_slot{
+        ctx.OpShiftRightLogical(ctx.U32[1], word, ctx.Const(BINDLESS_IMAGE_SLOT_BITS))};
+    const Id pointer{
+        ctx.OpAccessChain(ctx.bindless_sampler_pointer, ctx.bindless_samplers, sampler_slot)};
+    const Id sampler{ctx.OpLoad(ctx.bindless_sampler_type, pointer)};
+    const Id object{ctx.OpSampledImage(def.sampled_type, image, sampler)};
+    if (non_uniform) {
+        DecorateNonUniform(ctx, sampler_slot);
+        DecorateNonUniform(ctx, pointer);
+        DecorateNonUniform(ctx, sampler);
+        DecorateNonUniform(ctx, object);
+    }
+    return object;
+}
+
 Id Texture(EmitContext& ctx, IR::TextureInstInfo info, [[maybe_unused]] const IR::Value& index) {
     const TextureDefinition& def{ctx.textures.at(info.descriptor_index)};
+    if (def.is_bindless) {
+        return BindlessTexture(ctx, def, index);
+    }
     if (def.count > 1) {
         auto const idx = index.IsImmediate() ? ctx.Const(index.U32()) : ctx.Def(index);
         const bool non_uniform{MarkNonUniform(ctx, idx, index, NonUniformKind::SampledImage)};
@@ -274,6 +336,10 @@ Id TextureImage(EmitContext& ctx, IR::TextureInstInfo info, const IR::Value& ind
         return ctx.OpLoad(ctx.image_buffer_type, def.id);
     } else {
         const TextureDefinition& def{ctx.textures.at(info.descriptor_index)};
+        if (def.is_bindless) {
+            const auto [word, non_uniform]{BindlessWord(ctx, def, index)};
+            return BindlessImage(ctx, def, word, non_uniform);
+        }
         if (def.count > 1) {
             auto const idx = index.IsImmediate() ? ctx.Const(index.U32()) : ctx.Def(index);
             const bool non_uniform{MarkNonUniform(ctx, idx, index, NonUniformKind::SampledImage)};
