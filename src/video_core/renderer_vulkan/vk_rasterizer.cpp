@@ -359,6 +359,18 @@ void RasterizerVulkan::RememberDrawSetup(GraphicsPipeline* pipeline, bool is_ind
     repeat.index_limit = is_indexed ? buffer_cache.IndexBindingSize() : 0;
     repeat.topology = topology;
     repeat.is_indexed = is_indexed;
+    // The words this setup read from constant buffers: uploads that write them again with the
+    // same words leave the next draw the refresh path (Maxwell3D::RewritesWatchedWords).
+    auto& changes = maxwell3d->cbuf_changes;
+    changes.num_watched = 0;
+    const auto reads = pipeline->SetupCbufReads();
+    if (repeat.valid && pipeline->CanRefreshBuffers() && reads.size() <= changes.watched.size()) {
+        const auto& stages = maxwell3d->state.shader_stages;
+        for (const auto& read : reads) {
+            const GPUVAddr address = stages[read.stage].const_buffers[read.slot].address;
+            changes.watched[changes.num_watched++] = {address + read.begin, address + read.end};
+        }
+    }
 }
 
 template <typename Func>

@@ -896,13 +896,19 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
     const size_t write_size = (std::min)(copy_size, room / sizeof(u32) * sizeof(u32));
     if (write_size != 0) {
         const GPUVAddr address{buffer_address + regs.const_buffer.offset};
+        // Drivers write the texture handles of every draw again, mostly the same ones: such an
+        // upload leaves the next draw the buffer refresh path.
+        const bool rewrite = cbuf_changes.num_watched != 0 &&
+                             RewritesWatchedWords(address, start_base, write_size);
         memory_manager.WriteBlockCached(address, start_base, write_size);
         // Uploads usually continue where the last one ended: one range for a whole buffer. With
         // the list full, the range that grows least takes the write (wider ranges only cost
         // precision). Only the words written count (see below).
         auto& changes = cbuf_changes;
         const GPUVAddr end = address + write_size;
-        if (changes.num_writes != 0 && changes.writes[changes.num_writes - 1].second == address) {
+        if (rewrite) {
+            // Nothing the last full setup read changes.
+        } else if (changes.num_writes != 0 && changes.writes[changes.num_writes - 1].second == address) {
             changes.writes[changes.num_writes - 1].second = end;
         } else if (changes.num_writes < changes.writes.size()) {
             changes.writes[changes.num_writes++] = {address, end};
@@ -928,6 +934,41 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
 
     // Increment the current buffer position.
     regs.const_buffer.offset += static_cast<u32>(copy_size);
+}
+
+bool Maxwell3D::RewritesWatchedWords(GPUVAddr address, const u32* words, size_t size) const {
+    const GPUVAddr end = address + size;
+    const auto overlaps = [address, end](GPUVAddr first, GPUVAddr last) {
+        return address < last && first < end;
+    };
+    // The refresh check looks at uploads into the descriptor pools too.
+    const GPUVAddr tic = regs.tex_header.Address();
+    const GPUVAddr tsc = regs.tex_sampler.Address();
+    if (overlaps(tic, tic + (u64{regs.tex_header.limit} + 1) * sizeof(Texture::TICEntry)) ||
+        overlaps(tsc, tsc + (u64{regs.tex_sampler.limit} + 1) * sizeof(Texture::TSCEntry))) {
+        return false;
+    }
+    const auto* const bytes = reinterpret_cast<const u8*>(words);
+    bool covered = false;
+    for (u32 i = 0; i < cbuf_changes.num_watched; ++i) {
+        const auto [first, last] = cbuf_changes.watched[i];
+        if (!overlaps(first, last)) {
+            continue;
+        }
+        covered = true;
+        GPUVAddr cursor = (std::max)(first, address);
+        const GPUVAddr stop = (std::min)(last, end);
+        while (cursor < stop) {
+            std::array<u8, 256> old;
+            const size_t chunk = (std::min)(static_cast<size_t>(stop - cursor), old.size());
+            memory_manager.ReadBlockUnsafe(cursor, old.data(), chunk);
+            if (std::memcmp(old.data(), bytes + (cursor - address), chunk) != 0) {
+                return false;
+            }
+            cursor += chunk;
+        }
+    }
+    return covered;
 }
 
 void Maxwell3D::ProcessCBData(u32 value) {

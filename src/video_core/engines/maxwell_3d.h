@@ -3157,6 +3157,11 @@ public:
         std::array<std::pair<GPUVAddr, GPUVAddr>, 32> writes{};
         u32 num_writes{};
         std::array<u32, Regs::MaxShaderStage> bound_slots{};
+        /// The words the last full draw setup read (texture handles, storage buffer addresses),
+        /// set by the rasterizer and kept across draws: an upload that writes them with the
+        /// words already there changes nothing the setup read, so it is not recorded.
+        std::array<std::pair<GPUVAddr, GPUVAddr>, 16> watched{};
+        u32 num_watched{};
 
         void Reset() noexcept {
             num_writes = 0;
@@ -3313,6 +3318,11 @@ public:
     /// Handles a write to the CB_DATA[i] register.
     void ProcessCBData(u32 value);
     void ProcessCBMultiData(const u32* start_base, u32 amount);
+
+    /// Whether an upload of `size` bytes of `words` at `address` (not written yet) covers some of
+    /// the watched words (ConstBufferChanges::watched), all of them with the words already there,
+    /// and none of the texture or sampler descriptor pools.
+    [[nodiscard]] bool RewritesWatchedWords(GPUVAddr address, const u32* words, size_t size) const;
 
     void ProcessInlineIndexMultiData(u32 method, const u32* start_base, u32 amount);
 
