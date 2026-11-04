@@ -1983,7 +1983,7 @@ private:
                      static_cast<unsigned long long>(system.CoreTiming().GetClockTicks()),
                      m_trace_catching_up ? 1 : 0,
                      static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(m_frame_debt).count()),
-                     system.CoreTiming().IsSpinWaiting() ? 1 : 0, w[7], Nx2SyncptEventsOn() ? 1 : 0);
+                     0 /* host_spin: no HostTiming sleep in this tree */, w[7], Nx2SyncptEventsOn() ? 1 : 0);
         if ((m_presents % 600) == 0) {
             std::fflush(trace.file);
         }
