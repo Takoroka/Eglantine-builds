@@ -111,14 +111,16 @@ public:
     }
 
     [[nodiscard]] u32 SamplersInUse() const noexcept {
-        return next_sampler;
+        return next_sampler - 1;
     }
 
 private:
     u32 image_capacity = DEFAULT_IMAGE_CAPACITY;
     u32 sampler_capacity = DEFAULT_SAMPLER_CAPACITY;
-    u32 next_image = 0;
-    u32 next_sampler = 0;
+    // Slot 0 of every array is the heap's null view / default sampler, what a draw reads for a
+    // texture without a slot: allocation starts at 1.
+    u32 next_image = 1;
+    u32 next_sampler = 1;
     u32 images_in_use = 0;
     std::vector<u32> free_images;
     std::vector<ImageWrite> image_writes;
