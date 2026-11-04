@@ -102,8 +102,8 @@ public:
         }
     }
     /// A word of a data method the engine takes many of in a row (Maxwell3D's constant buffer
-    /// data, one write to guest memory each): consecutive ones go to the back as one entry
-    /// (EngineInterface::ApplyDataRun), `value` as in StateWrite.
+    /// data and KeplerCompute's inline upload words, one write to guest memory each): consecutive
+    /// ones go to the back as one entry (EngineInterface::ApplyDataRun), `value` as in StateWrite.
     void DataWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 value) {
         if (engine != front_engine || !run_data || run_count == MaxRunWrites) [[unlikely]] {
             FlushRun();
