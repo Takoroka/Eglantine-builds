@@ -119,10 +119,6 @@ TEST_CASE("Descriptor limits clear exposed slots after shrink and growth", "[des
         void ReadBlockUnsafe(GPUVAddr address, void* output, size_t size) const {
             std::memcpy(output, &address, size);
         }
-        // No host memory behind it: reads take the block read.
-        const u8* GetPointer(GPUVAddr) const {
-            return nullptr;
-        }
     } memory;
     constexpr std::array<u32, 9> limits{0, 63, 64, 127, 128, 0x7ffff, 0x80000, 0x80001, 0x100000};
     for (const u32 limit : limits) {
