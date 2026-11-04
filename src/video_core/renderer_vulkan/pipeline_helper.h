@@ -134,18 +134,26 @@ inline void WriteDescriptorBuffer(const Device& device, const DescriptorBufferLa
     }
 }
 
-[[nodiscard]] inline u32 NumDescriptorEntries(const Shader::Info& info) {
+/// Entries the stage adds to the descriptor queue per draw (no textures with bindless textures).
+[[nodiscard]] inline u32 NumDescriptorEntries(const Shader::Info& info, bool bindless = false) {
     return Shader::NumDescriptors(info.constant_buffer_descriptors) +
            Shader::NumDescriptors(info.storage_buffers_descriptors) +
            Shader::NumDescriptors(info.texture_buffer_descriptors) +
            Shader::NumDescriptors(info.image_buffer_descriptors) +
-           Shader::NumDescriptors(info.texture_descriptors) +
+           (bindless ? 0U : Shader::NumDescriptors(info.texture_descriptors)) +
            Shader::NumDescriptors(info.image_descriptors);
 }
 
 class DescriptorLayoutBuilder {
 public:
     DescriptorLayoutBuilder(const Device& device_) : device{&device_} {}
+
+    /// Bindless textures (before the first Add): the textures are left out (the shaders read them
+    /// from the heap), the per-draw set is BINDLESS_PER_DRAW_SET after the heap's layout, and the
+    /// push constant range is the whole bindless block, the same in every bindless layout.
+    void SetBindless(VkDescriptorSetLayout heap_layout_) noexcept {
+        heap_layout = heap_layout_;
+    }
 
     bool CanUsePushDescriptor() const noexcept {
         if (!device->IsKhrPushDescriptorSupported() ||
@@ -158,8 +166,9 @@ public:
 
     bool CanUseDescriptorBuffer() const noexcept {
         const auto& props = device->DescriptorBufferProperties();
+        // A descriptor buffer set can't share a layout with the heap's ordinary set.
         if (!device->IsExtDescriptorBufferSupported() || bindings.empty() ||
-            !props.combinedImageSamplerDescriptorSingleArray) {
+            !props.combinedImageSamplerDescriptorSingleArray || heap_layout != VK_NULL_HANDLE) {
             return false;
         }
         return !props.bufferlessPushDescriptors || !CanUsePushDescriptor();
@@ -238,13 +247,31 @@ public:
             .pipelineBindPoint =
                 is_compute ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS,
             .pipelineLayout = pipeline_layout,
-            .set = 0,
+            .set = heap_layout ? Shader::Backend::SPIRV::BINDLESS_PER_DRAW_SET : 0U,
         });
     }
 
     vk::PipelineLayout CreatePipelineLayout(VkDescriptorSetLayout descriptor_set_layout) const {
         using Shader::Backend::SPIRV::RenderAreaLayout;
         using Shader::Backend::SPIRV::RescalingLayout;
+        if (heap_layout) {
+            const VkPushConstantRange bindless_range{
+                .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS,
+                .offset = 0,
+                .size = Shader::Backend::SPIRV::BINDLESS_PUSH_CONSTANT_SIZE,
+            };
+            const std::array<VkDescriptorSetLayout, 2> set_layouts{heap_layout,
+                                                                   descriptor_set_layout};
+            return device->GetLogical().CreatePipelineLayout({
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .setLayoutCount = descriptor_set_layout ? 2U : 1U,
+                .pSetLayouts = set_layouts.data(),
+                .pushConstantRangeCount = 1,
+                .pPushConstantRanges = &bindless_range,
+            });
+        }
         const u32 size_offset = is_compute ? sizeof(RescalingLayout::down_factor) : 0u;
         const VkPushConstantRange range{
             .stageFlags = static_cast<VkShaderStageFlags>(
@@ -271,7 +298,9 @@ public:
         Add(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage, info.storage_buffers_descriptors);
         Add(VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, stage, info.texture_buffer_descriptors);
         Add(VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, stage, info.image_buffer_descriptors);
-        Add(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage, info.texture_descriptors);
+        if (!heap_layout) {
+            Add(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage, info.texture_descriptors);
+        }
         Add(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage, info.image_descriptors);
     }
 
@@ -302,6 +331,7 @@ private:
     }
 
     const Device* device{};
+    VkDescriptorSetLayout heap_layout{}; ///< SetBindless
     bool is_compute{};
     boost::container::small_vector<VkDescriptorSetLayoutBinding, 32> bindings;
     boost::container::small_vector<VkDescriptorUpdateTemplateEntry, 32> entries;

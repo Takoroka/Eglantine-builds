@@ -66,8 +66,12 @@ VkShaderStageFlagBits StageFlag(const Shader::Info& info, VkShaderStageFlagBits 
     return slot_stage;
 }
 
-DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader::Info> infos) {
+DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader::Info> infos,
+                                    const BindlessHeap* bindless_heap) {
     DescriptorLayoutBuilder builder{device};
+    if (bindless_heap) {
+        builder.SetBindless(bindless_heap->Layout());
+    }
     for (size_t index = 0; index < infos.size(); ++index) {
         static constexpr std::array stages{
             VK_SHADER_STAGE_VERTEX_BIT,
@@ -267,14 +271,15 @@ GraphicsPipeline::GraphicsPipeline(
     vk::PipelineCache& pipeline_cache_, VideoCore::ShaderNotify* shader_notify,
     const Device& device_, DescriptorPool& descriptor_pool,
     GuestDescriptorQueue& guest_descriptor_queue_, DescriptorBufferRing& descriptor_buffer_ring_,
-    Common::ThreadWorker* worker_thread,
+    BindlessHeap* bindless_heap_, Common::ThreadWorker* worker_thread,
     PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
     const GraphicsPipelineCacheKey& key_, std::array<vk::ShaderModule, NUM_STAGES> stages,
     const std::array<const Shader::Info*, NUM_STAGES>& infos)
     : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
       pipeline_cache(pipeline_cache_), scheduler{scheduler_},
       guest_descriptor_queue{guest_descriptor_queue_},
-      descriptor_buffer_ring{descriptor_buffer_ring_}, spv_modules{std::move(stages)} {
+      descriptor_buffer_ring{descriptor_buffer_ring_}, bindless_heap{bindless_heap_},
+      spv_modules{std::move(stages)} {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }
@@ -291,7 +296,7 @@ GraphicsPipeline::GraphicsPipeline(
         num_textures += Shader::NumDescriptors(info->texture_descriptors);
         num_image_elements += Shader::NumDescriptors(info->texture_descriptors);
         num_image_elements += Shader::NumDescriptors(info->image_descriptors);
-        num_descriptor_entries += NumDescriptorEntries(*info);
+        num_descriptor_entries += NumDescriptorEntries(*info, bindless_heap != nullptr);
         // A draw that writes memory (storage buffers and images) can change what the next draw
         // reads through other bindings: such draws always run the full setup.
         const auto written = [](const auto& descs) {
@@ -337,7 +342,7 @@ GraphicsPipeline::GraphicsPipeline(
     }
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
 
-    DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos)};
+    DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos, bindless_heap)};
     uses_push_descriptor = builder.CanUsePushDescriptor();
     uses_descriptor_buffer = builder.CanUseDescriptorBuffer() && descriptor_buffer_ring.IsValid();
     descriptor_set_layout =
@@ -668,6 +673,9 @@ bool GraphicsPipeline::ConfigureDescriptors(std::span<const VideoCommon::ImageVi
     RenderAreaPushConstant render_area;
     const VideoCommon::SamplerId* samplers_it{samplers};
     const VideoCommon::ImageViewInOut* views_it{views.data()};
+    // Bindless pipelines: each texture element becomes the slots of its view and sampler.
+    std::array<BindlessTexture, Shader::Backend::SPIRV::NUM_BINDLESS_WORDS> bindless_textures;
+    BindlessTexture* bindless_it{bindless_textures.data()};
     const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         {
             Profile::Scope scope{Profile::Zone::BindStageBuffers};
@@ -675,8 +683,16 @@ bool GraphicsPipeline::ConfigureDescriptors(std::span<const VideoCommon::ImageVi
         }
         {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
-            PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
-                                 rescaling, samplers_it, views_it);
+            if (bindless_heap) {
+                // A texture without a slot reads slot 0 (the null view): the shader has no other
+                // way to reach it.
+                static_cast<void>(PushBindlessImageDescriptors(
+                    texture_cache, bindless_heap->Table(), guest_descriptor_queue,
+                    stage_infos[stage], rescaling, samplers_it, views_it, bindless_it));
+            } else {
+                PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
+                                     rescaling, samplers_it, views_it);
+            }
         }
         const auto& info{stage_infos[stage]};
         if (info.uses_render_area) {
@@ -712,15 +728,30 @@ bool GraphicsPipeline::ConfigureDescriptors(std::span<const VideoCommon::ImageVi
         texture_cache.UpdateRenderTargets(false);
         texture_cache.CheckFeedbackLoop(views);
     }
+    BindlessWords bindless_words;
+    if (bindless_heap) {
+        bindless_words.count = static_cast<u32>(bindless_it - bindless_textures.data());
+        for (u32 index = 0; index < bindless_words.count; ++index) {
+            const BindlessTexture& texture{bindless_textures[index]};
+            const auto slot = [](u32 value) {
+                return value != BindlessTable::INVALID_SLOT ? value : 0U;
+            };
+            bindless_words.words[index] = Shader::Backend::SPIRV::BindlessWord(
+                slot(texture.image_slot), slot(texture.sampler_slot));
+        }
+        // New slots are written before the draw that reads them is recorded.
+        bindless_heap->Apply();
+    }
     if (IsBuilt() && !pipeline) {
         return false;
     }
     Profile::Scope scope{Profile::Zone::ConfigureDraw};
-    return ConfigureDraw(rescaling, render_area);
+    return ConfigureDraw(rescaling, render_area, bindless_heap ? &bindless_words : nullptr);
 }
 
 bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
-                                     const RenderAreaPushConstant& render_area) {
+                                     const RenderAreaPushConstant& render_area,
+                                     const BindlessWords* bindless_words) {
     const void* const descriptor_data{guest_descriptor_queue.UpdateData()};
 
     VkDeviceSize descriptor_buffer_offset{};
@@ -786,56 +817,89 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             last_descriptor_payload.assign(entries, entries + num_descriptor_entries);
         }
     }
-    scheduler.Record([this, descriptor_data, bind_pipeline, update_descriptors,
-                      descriptor_buffer_offset, descriptor_buffer_chunk, bind_descriptor_buffer,
-                      rescaling_data = rescaling.Data(), is_rescaling, update_rescaling,
-                      uses_render_area = render_area.uses_render_area,
-                      render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
-        if (bind_descriptor_buffer) {
-            const VkDescriptorBufferBindingInfoEXT binding_info{
-                descriptor_buffer_ring.BindingInfo(descriptor_buffer_chunk)};
-            cmdbuf.BindDescriptorBuffersEXT(binding_info);
-        }
-        if (bind_pipeline) {
-            if (!pipeline) {
-                return;
-            }
-            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline);
-        }
-        cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
-                             RESCALING_LAYOUT_WORDS_OFFSET, sizeof(rescaling_data),
-                             rescaling_data.data());
-        if (update_rescaling) {
-            const f32 config_down_factor{Settings::values.resolution_info.down_factor};
-            const f32 scale_down_factor{is_rescaling ? config_down_factor : 1.0f};
-            cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
-                                 RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, sizeof(scale_down_factor),
-                                 &scale_down_factor);
-        }
-        if (uses_render_area) {
-            cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
-                                 RENDERAREA_LAYOUT_OFFSET, sizeof(render_area_data),
-                                 &render_area_data);
-        }
-        if (!descriptor_set_layout) {
+    const DrawRecord draw{
+        .descriptor_data = descriptor_data,
+        .descriptor_buffer_offset = descriptor_buffer_offset,
+        .descriptor_buffer_chunk = descriptor_buffer_chunk,
+        .bind_pipeline = bind_pipeline,
+        .update_descriptors = update_descriptors,
+        .bind_descriptor_buffer = bind_descriptor_buffer,
+        .is_rescaling = is_rescaling,
+        .update_rescaling = update_rescaling,
+        .uses_render_area = render_area.uses_render_area,
+        .rescaling_data = rescaling.Data(),
+        .render_area_data = render_area.words,
+    };
+    if (bindless_words) {
+        scheduler.Record([this, draw, words = *bindless_words](vk::CommandBuffer cmdbuf) {
+            RecordDraw(cmdbuf, draw, std::span<const u32>(words.words.data(), words.count));
+        });
+    } else {
+        scheduler.Record([this, draw](vk::CommandBuffer cmdbuf) { RecordDraw(cmdbuf, draw, {}); });
+    }
+    return true;
+}
+
+void GraphicsPipeline::RecordDraw(vk::CommandBuffer cmdbuf, const DrawRecord& draw,
+                                  std::span<const u32> bindless_words) {
+    using namespace Shader::Backend::SPIRV;
+    if (draw.bind_descriptor_buffer) {
+        const VkDescriptorBufferBindingInfoEXT binding_info{
+            descriptor_buffer_ring.BindingInfo(draw.descriptor_buffer_chunk)};
+        cmdbuf.BindDescriptorBuffersEXT(binding_info);
+    }
+    if (draw.bind_pipeline) {
+        if (!pipeline) {
             return;
         }
-        if (uses_descriptor_buffer) {
-            const u32 buffer_index{};
-            cmdbuf.SetDescriptorBufferOffsetsEXT(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout,
-                                                 0, buffer_index, descriptor_buffer_offset);
-        } else if (uses_push_descriptor) {
-            cmdbuf.PushDescriptorSetWithTemplateKHR(*descriptor_update_template, *pipeline_layout,
-                                                    0, descriptor_data);
-        } else if (update_descriptors) {
-            const VkDescriptorSet descriptor_set{descriptor_allocator.Commit()};
-            const vk::Device& dev{device.GetLogical()};
-            dev.UpdateDescriptorSet(descriptor_set, *descriptor_update_template, descriptor_data);
-            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout, 0,
-                                      descriptor_set, nullptr);
+        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline);
+        if (bindless_heap) {
+            // Every bindless layout has the heap's set layout and push constant range: the set
+            // stays bound for the bindless pipelines after this one.
+            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout,
+                                      BINDLESS_HEAP_SET, bindless_heap->Set(), {});
         }
-    });
-    return true;
+    }
+    cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
+                         RESCALING_LAYOUT_WORDS_OFFSET, sizeof(draw.rescaling_data),
+                         draw.rescaling_data.data());
+    // Bindless and bound layouts have different push constant ranges: switching between them
+    // leaves the down factor undefined, so it goes again with every pipeline bind.
+    if (draw.update_rescaling || (draw.bind_pipeline && device.IsBindlessSupported())) {
+        const f32 config_down_factor{Settings::values.resolution_info.down_factor};
+        const f32 scale_down_factor{draw.is_rescaling ? config_down_factor : 1.0f};
+        cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
+                             RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, sizeof(scale_down_factor),
+                             &scale_down_factor);
+    }
+    if (draw.uses_render_area) {
+        cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
+                             bindless_heap ? BINDLESS_RENDER_AREA_OFFSET : RENDERAREA_LAYOUT_OFFSET,
+                             sizeof(draw.render_area_data), &draw.render_area_data);
+    }
+    if (!bindless_words.empty()) {
+        cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS, BINDLESS_WORDS_OFFSET,
+                             static_cast<u32>(bindless_words.size_bytes()),
+                             bindless_words.data());
+    }
+    if (!descriptor_set_layout) {
+        return;
+    }
+    const u32 set{bindless_heap ? BINDLESS_PER_DRAW_SET : 0U};
+    if (uses_descriptor_buffer) {
+        const u32 buffer_index{};
+        cmdbuf.SetDescriptorBufferOffsetsEXT(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout,
+                                             set, buffer_index, draw.descriptor_buffer_offset);
+    } else if (uses_push_descriptor) {
+        cmdbuf.PushDescriptorSetWithTemplateKHR(*descriptor_update_template, *pipeline_layout, set,
+                                                draw.descriptor_data);
+    } else if (draw.update_descriptors) {
+        const VkDescriptorSet descriptor_set{descriptor_allocator.Commit()};
+        const vk::Device& dev{device.GetLogical()};
+        dev.UpdateDescriptorSet(descriptor_set, *descriptor_update_template, draw.descriptor_data);
+        cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout, set,
+                                  descriptor_set, nullptr);
+    }
 }
 
 void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {

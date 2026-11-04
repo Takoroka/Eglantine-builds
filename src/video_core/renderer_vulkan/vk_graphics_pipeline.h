@@ -21,6 +21,7 @@
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
+#include "video_core/renderer_vulkan/vk_bindless_heap.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
@@ -82,7 +83,8 @@ public:
         vk::PipelineCache& pipeline_cache, VideoCore::ShaderNotify* shader_notify,
         const Device& device, DescriptorPool& descriptor_pool,
         GuestDescriptorQueue& guest_descriptor_queue,
-        DescriptorBufferRing& descriptor_buffer_ring, Common::ThreadWorker* worker_thread,
+        DescriptorBufferRing& descriptor_buffer_ring, BindlessHeap* bindless_heap,
+        Common::ThreadWorker* worker_thread,
         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
         const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
         const std::array<const Shader::Info*, NUM_STAGES>& infos);
@@ -211,8 +213,35 @@ private:
     bool ConfigureDescriptors(std::span<const VideoCommon::ImageViewInOut> views,
                               const VideoCommon::SamplerId* samplers, bool full_setup);
 
+    /// Bindless textures: a draw's push constant slot words (Backend::SPIRV::BindlessWord).
+    struct BindlessWords {
+        std::array<u32, Shader::Backend::SPIRV::NUM_BINDLESS_WORDS> words;
+        u32 count{};
+    };
+
+    /// What ConfigureDraw records for a draw (RecordDraw).
+    struct DrawRecord {
+        const void* descriptor_data;
+        VkDeviceSize descriptor_buffer_offset;
+        u32 descriptor_buffer_chunk;
+        bool bind_pipeline;
+        bool update_descriptors;
+        bool bind_descriptor_buffer;
+        bool is_rescaling;
+        bool update_rescaling;
+        bool uses_render_area;
+        std::array<u32, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> rescaling_data;
+        std::array<f32, 4> render_area_data;
+    };
+
+    /// `bindless_words` for bindless pipelines, else null.
     bool ConfigureDraw(const RescalingPushConstant& rescaling,
-                       const RenderAreaPushConstant& render_are);
+                       const RenderAreaPushConstant& render_are,
+                       const BindlessWords* bindless_words);
+
+    /// On the Vulkan worker: the pipeline and heap binds, push constants and per-draw descriptors.
+    void RecordDraw(vk::CommandBuffer cmdbuf, const DrawRecord& draw,
+                    std::span<const u32> bindless_words);
 
     void MakePipeline(VkRenderPass render_pass);
 
@@ -228,6 +257,8 @@ private:
     Scheduler& scheduler;
     GuestDescriptorQueue& guest_descriptor_queue;
     DescriptorBufferRing& descriptor_buffer_ring;
+    /// The heap when this pipeline's shaders sample bindless (EDEN_NX2_BINDLESS), else null.
+    BindlessHeap* const bindless_heap;
 
     ConfigureResult (*configure_func)(GraphicsPipeline*, bool, bool){};
 
