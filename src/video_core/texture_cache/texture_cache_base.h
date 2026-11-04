@@ -92,15 +92,8 @@ public:
     std::unordered_map<TICEntry, ImageViewId> image_views;
     std::unordered_map<TSCEntry, SamplerId> samplers;
 
-    /// A table entry's view, and how often the view's slot had been erased when the entry found it
-    /// (TextureCache::image_view_erasures): the same count means the same view still lives there.
-    struct TableImageView {
-        ImageViewId id;
-        u32 erasures{};
-    };
-
     ::Common::unordered_map<u32, SamplerId> sampler_ids;
-    ::Common::unordered_map<u32, TableImageView> image_view_ids;
+    ::Common::unordered_map<u32, ImageViewId> image_view_ids;
 
     TextureCacheGPUMap* gpu_page_table = nullptr;
     TextureCacheGPUMap* sparse_page_table = nullptr;
@@ -399,15 +392,6 @@ private:
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);
 
-    /// Erases an image view's slot, counting the erasure for the table entries that point at it
-    void EraseImageView(ImageViewId image_view_id);
-
-    [[nodiscard]] u32 ImageViewErasures(ImageViewId image_view_id) const noexcept {
-        return image_view_id.index < image_view_erasures.size()
-                   ? image_view_erasures[image_view_id.index]
-                   : 0;
-    }
-
     /// Find or create a framebuffer with the given render target parameters
     FramebufferId GetFramebufferId(const RenderTargets& key);
 
@@ -596,8 +580,6 @@ private:
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageMapView> slot_map_views;
     Common::SlotVector<ImageView> slot_image_views;
-    /// Per image view slot: how often a view was erased from it (EraseImageView)
-    std::vector<u32> image_view_erasures;
     Common::SlotVector<ImageAlloc> slot_image_allocs;
     Common::SlotVector<Sampler> slot_samplers;
     Common::SlotVector<Framebuffer> slot_framebuffers;

@@ -591,12 +591,13 @@ SamplerId TextureCache<P>::GetSamplerId(u32 index, bool compute) {
         return NULL_SAMPLER_ID;
     }
     auto const map_index = index | (compute ? Common::SlotId::TAGGED_VALUE : 0);
-    if (table.Read(*gpu_memory, index) == DescriptorRead::Same) {
-        return channel_state->sampler_ids.find(map_index)->second;
+    auto const [descriptor, is_new] = table.Read(*gpu_memory, index);
+    if (is_new) {
+        auto const id = FindSampler(descriptor, compute);
+        channel_state->sampler_ids.insert_or_assign(map_index, id);
+        return id;
     }
-    auto const id = FindSampler(table.descriptors[index], compute);
-    channel_state->sampler_ids.insert_or_assign(map_index, id);
-    return id;
+    return channel_state->sampler_ids.find(map_index)->second;
 }
 
 template <class P>
@@ -822,52 +823,30 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
         return NULL_IMAGE_VIEW_ID;
     }
     auto const map_index = index | (compute ? Common::SlotId::TAGGED_VALUE : 0);
-    const DescriptorRead read = table.Read(*gpu_memory, index);
-    if (read != DescriptorRead::New) {
-        const auto it = channel_state->image_view_ids.find(map_index);
-        // An entry not read since the tables were invalidated (for each deleted image) keeps its
-        // view while its words are the same and the view's slot was not erased since.
-        if (read == DescriptorRead::Same ||
-            (g_descriptor_lookup_reuse.load(std::memory_order_relaxed) &&
-             it != channel_state->image_view_ids.end() && it->second.id &&
-             it->second.id != NULL_IMAGE_VIEW_ID && it->second.id != CORRUPT_ID &&
-             it->second.erasures == ImageViewErasures(it->second.id))) {
-            const ImageViewId image_view_id = it->second.id;
-            if (image_view_id != NULL_IMAGE_VIEW_ID) {
-                PrepareImageView(image_view_id, false, false);
-            }
-            return image_view_id;
-        }
-    }
     // Is new (on the tegra engine side)?
-    const TICEntry descriptor = table.descriptors[index];
-    if (IsValidEntry(*gpu_memory, descriptor)) {
-        // Is new (registered view) on the texture cache side?
-        const auto [pair, is_new_tc] = channel_state->image_views.try_emplace(descriptor);
-        if (is_new_tc) {
-            pair->second = CreateImageView(descriptor);
-            if (pair->second != NULL_IMAGE_VIEW_ID) {
-                image_view_descriptors[pair->second].emplace_back(current_channel_id, descriptor);
+    auto const [descriptor, is_new] = table.Read(*gpu_memory, index);
+    if (is_new) {
+        if (IsValidEntry(*gpu_memory, descriptor)) {
+            // Is new (registered view) on the texture cache side?
+            const auto [pair, is_new_tc] = channel_state->image_views.try_emplace(descriptor);
+            if (is_new_tc) {
+                pair->second = CreateImageView(descriptor);
+                if (pair->second != NULL_IMAGE_VIEW_ID) {
+                    image_view_descriptors[pair->second].emplace_back(current_channel_id,
+                                                                      descriptor);
+                }
             }
+            PrepareImageView(pair->second, false, false);
+            channel_state->image_view_ids.insert_or_assign(map_index, pair->second);
+            return pair->second;
         }
-        PrepareImageView(pair->second, false, false);
-        channel_state->image_view_ids.insert_or_assign(
-            map_index,
-            TextureCacheChannelInfo::TableImageView{pair->second, ImageViewErasures(pair->second)});
-        return pair->second;
+        channel_state->image_view_ids.insert_or_assign(map_index, NULL_IMAGE_VIEW_ID);
+        return NULL_IMAGE_VIEW_ID;
     }
-    channel_state->image_view_ids.insert_or_assign(
-        map_index, TextureCacheChannelInfo::TableImageView{NULL_IMAGE_VIEW_ID});
-    return NULL_IMAGE_VIEW_ID;
-}
-
-template <class P>
-void TextureCache<P>::EraseImageView(ImageViewId image_view_id) {
-    if (image_view_id.index >= image_view_erasures.size()) {
-        image_view_erasures.resize(image_view_id.index + 1);
-    }
-    ++image_view_erasures[image_view_id.index];
-    slot_image_views.erase(image_view_id);
+    auto const it = channel_state->image_view_ids.find(map_index);
+    if (it->second != NULL_IMAGE_VIEW_ID)
+        PrepareImageView(it->second, false, false);
+    return it->second;
 }
 
 template <class P>
@@ -2084,7 +2063,7 @@ void TextureCache<P>::InvalidateScale(Image& image) {
     RemoveFramebuffers(image_view_ids);
     for (const ImageViewId image_view_id : image_view_ids) {
         sentenced_image_view.Push(std::move(slot_image_views[image_view_id]));
-        EraseImageView(image_view_id);
+        slot_image_views.erase(image_view_id);
     }
     image.image_view_ids.clear();
     image.image_view_infos.clear();
@@ -2097,7 +2076,7 @@ void TextureCache<P>::InvalidateScale(Image& image) {
         // it is read.
         if constexpr (ENABLE_VALIDATION)
             for (auto& e : channel_info.image_view_ids)
-                e.second.id = CORRUPT_ID;
+                e.second = CORRUPT_ID;
 #endif
         channel_info.graphics_image_table.Invalidate();
         channel_info.compute_image_table.Invalidate();
@@ -3294,7 +3273,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         if (!immediate_delete) {
             sentenced_image_view.Push(std::move(slot_image_views[image_view_id]));
         }
-        EraseImageView(image_view_id);
+        slot_image_views.erase(image_view_id);
     }
     const bool retained = RetainPendingImageDownloads(image_id, slot_images[image_id],
                                                        uncommitted_downloads, committed_downloads);
@@ -3325,7 +3304,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         // it is read.
         if constexpr (ENABLE_VALIDATION)
             for (auto& e : channel_info.image_view_ids)
-                e.second.id = CORRUPT_ID;
+                e.second = CORRUPT_ID;
 #endif
         channel_info.graphics_image_table.Invalidate();
         channel_info.compute_image_table.Invalidate();
