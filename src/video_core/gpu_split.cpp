@@ -242,7 +242,12 @@ void GpuSplit::Drain() {
 }
 
 void GpuSplit::WaitForWriters() {
-    WaitFor(std::min(last_writer_position, write_position));
+    const u64 target = std::min(last_writer_position, write_position);
+    if (early_submit.load(std::memory_order_relaxed) &&
+        consumed.load(std::memory_order_acquire) < target) {
+        submit_requested.store(true, std::memory_order_relaxed);
+    }
+    WaitFor(target);
 }
 
 void GpuSplit::RecordWrite(const Tegra::MemoryManager& memory, GPUVAddr address, size_t size,
@@ -613,6 +618,13 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             const size_t index = read_position & RingMask;
             const size_t size = Execute(&ring[index]);
             read_position += size != 0 ? size : RingWords - index;
+            if (submit_requested.load(std::memory_order_relaxed)) [[unlikely]] {
+                submit_requested.store(false, std::memory_order_relaxed);
+                if (submit_hook != nullptr &&
+                    read_position < wait_target.load(std::memory_order_relaxed)) {
+                    submit_hook(submit_context);
+                }
+            }
             if (read_position - last_sync_check >= 1024) {
                 last_sync_check = read_position;
                 run_early_syncs();

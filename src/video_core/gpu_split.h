@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -175,6 +176,19 @@ public:
         back_idle_context = context;
         back_idle_hook = hook;
     }
+    /// Runs on the back when the front starts waiting for the writers of a GPU-written command
+    /// list (WaitForWriters) and the back is still short of them: submits the work recorded so
+    /// far, so the host GPU runs it while the back records the rest up to the writers, and the
+    /// writers' copy the front then waits for is done sooner.
+    void SetSubmitHook(void (*hook)(void*), void* context) {
+        submit_context = context;
+        submit_hook = hook;
+    }
+    /// EDEN_NX2_EARLY_SUBMIT=0 turns the submit above off (comparisons); it can flip at run time.
+    static inline std::atomic<bool> early_submit{[] {
+        const char* value = std::getenv("EDEN_NX2_EARLY_SUBMIT");
+        return value == nullptr || value[0] != '0';
+    }()};
     // Reads ahead of the back (the 3D engine's MME DMA reads): the front keeps a record of the
     // guest memory writes it queued for the back that it can predict (constant buffer and inline
     // uploads, payload releases) and of the last queued work that writes where it can't tell
@@ -326,6 +340,8 @@ private:
     Tegra::Engines::EngineInterface* back_engine{};
     void (*back_idle_hook)(void*){};
     void* back_idle_context{};
+    void (*submit_hook)(void*){};
+    void* submit_context{};
     /// The back thread's read position (BackHasMoreWork); null on other threads.
     static inline thread_local const u64* t_back_read_position{};
     u64 back_events{};
@@ -337,6 +353,8 @@ private:
     alignas(64) std::atomic<u64> consumed{};
     /// A position the front waits for (WaitForWriters): the back stores `consumed` once past it.
     alignas(64) std::atomic<u64> wait_target{~u64{0}};
+    /// WaitForWriters asks the back to submit what it recorded (submit_hook).
+    alignas(64) std::atomic<bool> submit_requested{};
     alignas(64) std::atomic<bool> back_waiting{};
     std::atomic<u32> wake{};
     std::jthread back_thread;

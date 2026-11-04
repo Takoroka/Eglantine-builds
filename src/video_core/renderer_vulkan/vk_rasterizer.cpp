@@ -241,10 +241,13 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
             static_cast<RasterizerVulkan*>(self)->fence_manager.FlushDeferredDownloads(true);
         },
         this);
+    VideoCommon::GpuSplit::Get().SetSubmitHook(
+        [](void* self) { static_cast<RasterizerVulkan*>(self)->scheduler.Flush(); }, this);
 }
 
 RasterizerVulkan::~RasterizerVulkan() {
     VideoCommon::GpuSplit::Get().SetBackIdleHook(nullptr, nullptr);
+    VideoCommon::GpuSplit::Get().SetSubmitHook(nullptr, nullptr);
     scheduler.WaitWorker();
     scheduler.Finish();
 }
