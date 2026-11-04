@@ -56,6 +56,7 @@
 #include "core/hle/kernel/k_transfer_memory.h"
 #include "core/hle/kernel/svc_results.h"
 #include "core/memory.h"
+#include "video_core/host1x/guest_syncpoint_hook.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/nx2_video_decoder.h"
 #include "video_core/nx2.h"
@@ -118,6 +119,36 @@ inline void TipcHandshake(HLERequestContext& ctx, std::string_view session) {
     TipcReplyWords(ctx, {w[2], w[3]});
 }
 
+// nx2:gsv syncpoint waits are answered when a guest syncpoint moves (Tegra::Host1x::
+// g_guest_increment_hook), with the timer poll kept as a slower fallback. EDEN_NX2_SYNCPT_EVENTS=0
+// restores the 0.5 ms poll alone; EDEN_NX2_SYNCPT_AB_MS=<ms> alternates the two every <ms> of wall
+// time (odd periods poll only) for in-run A/B tests.
+inline s64 Nx2SyncptAbMs() {
+    static const s64 ab_ms = [] {
+        const char* value = std::getenv("EDEN_NX2_SYNCPT_AB_MS");
+        return value != nullptr ? std::max(0LL, std::atoll(value)) : 0LL;
+    }();
+    return ab_ms;
+}
+
+inline bool Nx2SyncptEventsOn() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_SYNCPT_EVENTS");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!enabled) {
+        return false;
+    }
+    const s64 ab_ms = Nx2SyncptAbMs();
+    if (ab_ms == 0) {
+        return true;
+    }
+    const s64 now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+    return ((now_ms / ab_ms) & 1) == 0;
+}
+
 // EDEN_NX2_PRESENT_TRACE=<file>: one CSV line per present with what paced the frame (fence,
 // vblank pacing, the game's vsync event and GPU syncpoint waits), to find what a game's swap
 // interval follows. Counters are added up between presents and reset by each line.
@@ -149,7 +180,7 @@ private:
                 std::fputs("n,t_us,w12,frame_us,fence_us,comp_us,pace_us,late_us,vs_ticks,"
                            "vs_unconsumed,vs_clears,since_clear_us,since_tick_us,sync_req,"
                            "sync_waits,sync_wait_us,sync_max_us,gpu_ticks,cntpct,catchup,debt_us,host_spin,"
-                           "drawn\n",
+                           "drawn,syncpt_on\n",
                            file);
             }
         }
@@ -1932,7 +1963,7 @@ private:
         static const auto start = entered;
         std::fprintf(trace.file,
                      "%llu,%lld,%x,%lld,%lld,%lld,%lld,%lld,%llu,%llu,%llu,%lld,%lld,%llu,%llu,%llu,"
-                     "%llu,%llu,%llu,%d,%lld,%d,%x\n",
+                     "%llu,%llu,%llu,%d,%lld,%d,%x,%d\n",
                      static_cast<unsigned long long>(m_presents), us(entered - start), w[12],
                      m_trace_previous == std::chrono::steady_clock::time_point{}
                          ? 0LL
@@ -1952,7 +1983,7 @@ private:
                      static_cast<unsigned long long>(system.CoreTiming().GetClockTicks()),
                      m_trace_catching_up ? 1 : 0,
                      static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(m_frame_debt).count()),
-                     system.CoreTiming().IsSpinWaiting() ? 1 : 0, w[7]);
+                     system.CoreTiming().IsSpinWaiting() ? 1 : 0, w[7], Nx2SyncptEventsOn() ? 1 : 0);
         if ((m_presents % 600) == 0) {
             std::fflush(trace.file);
         }
@@ -3254,6 +3285,14 @@ public:
     }
 
     ~INx2GraphicsSystemSession() override {
+        {
+            auto& waiters = GetSyncptWaiters();
+            std::scoped_lock lk{waiters.mutex};
+            std::erase(waiters.sessions, this);
+        }
+        if (m_syncpt_wake) {
+            system.CoreTiming().UnscheduleEvent(m_syncpt_wake);
+        }
         if (m_syncpt_poll) {
             system.CoreTiming().UnscheduleEvent(m_syncpt_poll);
         }
@@ -3420,11 +3459,28 @@ private:
                 m_syncpt_poll = Core::Timing::CreateEvent(
                     "nx2:gsv:SyncptPoll",
                     [this](s64, std::chrono::nanoseconds) -> std::optional<std::chrono::nanoseconds> {
+                        ++m_syncpt_stats.timer_polls;
                         PollSyncpts();
-                        return std::nullopt;
+                        LogSyncptPeriod();
+                        return Nx2SyncptEventsOn() ? SyncptFallbackInterval() : SyncptPollInterval;
                     });
                 system.CoreTiming().ScheduleLoopingEvent(SyncptPollInterval, SyncptPollInterval,
                                                          m_syncpt_poll);
+                m_syncpt_wake = Core::Timing::CreateEvent(
+                    "nx2:gsv:SyncptWake",
+                    [this](s64, std::chrono::nanoseconds) -> std::optional<std::chrono::nanoseconds> {
+                        // Cleared first: an increment during the poll schedules another one.
+                        m_syncpt_wake_pending.store(false);
+                        ++m_syncpt_stats.wake_polls;
+                        PollSyncpts();
+                        return std::nullopt;
+                    });
+                {
+                    auto& waiters = GetSyncptWaiters();
+                    std::scoped_lock lk{waiters.mutex};
+                    waiters.sessions.push_back(this);
+                }
+                Tegra::Host1x::g_guest_increment_hook.store(&OnGuestSyncptIncrement);
             }
         } else {
             LOG_ERROR(Service, "nx2:gsv TIPC 204: missing syncpt transfer memory");
@@ -3455,6 +3511,73 @@ private:
         return changed;
     }
 
+    // Sessions whose waits are answered on guest syncpoint increments.
+    struct SyncptWaiters {
+        std::mutex mutex;
+        std::vector<INx2GraphicsSystemSession*> sessions;
+    };
+
+    static SyncptWaiters& GetSyncptWaiters() {
+        static SyncptWaiters waiters;
+        return waiters;
+    }
+
+    // Tegra::Host1x::g_guest_increment_hook, on the GPU threads: one poll on the timer thread right
+    // away, at most one pending. A client arms its wait after it last read the value, so an
+    // increment between the two is caught by the next increment or the fallback poll.
+    static void OnGuestSyncptIncrement(u32) {
+        auto& waiters = GetSyncptWaiters();
+        std::scoped_lock lk{waiters.mutex};
+        for (auto* session : waiters.sessions) {
+            session->WakeSyncptPoll();
+        }
+    }
+
+    void WakeSyncptPoll() {
+        m_syncpt_stats.increments.fetch_add(1, std::memory_order_relaxed);
+        if (!Nx2SyncptEventsOn() || m_syncpt_wake_pending.exchange(true)) {
+            return;
+        }
+        system.CoreTiming().ScheduleEvent(std::chrono::nanoseconds{0}, m_syncpt_wake);
+    }
+
+    // EDEN_NX2_SYNCPT_FALLBACK_US: the timer poll while waits are answered on increments (2 ms).
+    static std::chrono::nanoseconds SyncptFallbackInterval() {
+        static const std::chrono::nanoseconds interval = [] {
+            const char* value = std::getenv("EDEN_NX2_SYNCPT_FALLBACK_US");
+            return std::chrono::microseconds{value != nullptr ? std::max(100LL, std::atoll(value))
+                                                              : 2000LL};
+        }();
+        return interval;
+    }
+
+    // TEMP (A/B): per EDEN_NX2_SYNCPT_AB_MS period, what woke the polls and how many answered.
+    void LogSyncptPeriod() {
+        const s64 ab_ms = Nx2SyncptAbMs();
+        if (ab_ms == 0) {
+            return;
+        }
+        const s64 now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+        const s64 period = now_ms / ab_ms;
+        if (period == m_syncpt_stats.period) {
+            return;
+        }
+        if (m_syncpt_stats.period != 0) {
+            LOG_INFO(Service,
+                     "nx2 syncpt A/B period {} ({}): {} increments, {} wake polls, {} timer polls, "
+                     "{} answered",
+                     m_syncpt_stats.period, (m_syncpt_stats.period & 1) != 0 ? "poll" : "events",
+                     m_syncpt_stats.increments.exchange(0), m_syncpt_stats.wake_polls,
+                     m_syncpt_stats.timer_polls, m_syncpt_stats.answered);
+        }
+        m_syncpt_stats.period = period;
+        m_syncpt_stats.wake_polls = 0;
+        m_syncpt_stats.timer_polls = 0;
+        m_syncpt_stats.answered = 0;
+    }
+
     // Answers every armed wait: the value page is current, so the client rechecks its threshold
     // and rearms if it still has to wait. Acknowledging without a value change costs the client a
     // wakeup per poll, which keeps waits whose syncpoint we never see from hanging.
@@ -3476,6 +3599,7 @@ private:
         m_syncpt_memory->Write64(m_syncpt_ro + SyncptRoSummaryOffset,
                                  m_syncpt_memory->Read64(m_syncpt_rw + SyncptRwSummaryOffset));
         if (acked) {
+            ++m_syncpt_stats.answered;
             m_syncpt_events[1]->Signal(system.Kernel());
         }
     }
@@ -3905,6 +4029,15 @@ private:
     u64 m_syncpt_ro{};
     u32 m_syncpt_count{};
     std::shared_ptr<Core::Timing::EventType> m_syncpt_poll;
+    std::shared_ptr<Core::Timing::EventType> m_syncpt_wake;
+    std::atomic<bool> m_syncpt_wake_pending{};
+    struct {
+        std::atomic<u64> increments{};
+        u64 wake_polls{};
+        u64 timer_polls{};
+        u64 answered{};
+        s64 period{};
+    } m_syncpt_stats;
 };
 
 } // namespace Service
