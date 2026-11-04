@@ -4370,6 +4370,29 @@ VkSampler Sampler::HandleFor(const ImageView& image_view, bool is_depth) {
     return Emplace(key);
 }
 
+std::pair<VkSampler, u32> Sampler::HandleAndSlotFor(const ImageView& image_view, bool is_depth,
+                                                    BindlessTable& table) {
+    VariantKey key = MakeKey(image_view, is_depth);
+    if (variants.size() >= MAX_VARIANTS) {
+        key.srgb_border = false;
+        key.swizzle = {};
+    }
+    auto it = std::ranges::find(variants, key, &Variant::key);
+    if (it == variants.end()) {
+        const VkSampler handle = Emplace(key);
+        // Emplace may have dropped parts of the key (border color budget): find it by handle.
+        it = std::ranges::find_if(
+            variants, [handle](const Variant& variant) { return *variant.sampler == handle; });
+        if (it == variants.end()) {
+            return {handle, BindlessTable::INVALID_SLOT};
+        }
+    }
+    if (it->bindless_slot == BindlessTable::INVALID_SLOT) [[unlikely]] {
+        it->bindless_slot = table.AllocateSampler(*it->sampler);
+    }
+    return {*it->sampler, it->bindless_slot};
+}
+
 Framebuffer::Framebuffer(TextureCacheRuntime& runtime, std::span<ImageView*, NUM_RT> color_buffers,
                          ImageView* depth_buffer, const VideoCommon::RenderTargets& key)
     : render_area{VkExtent2D{

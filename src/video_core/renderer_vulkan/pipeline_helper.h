@@ -394,4 +394,59 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
     }
 }
 
+/// Bindless PushImageDescriptors: the stage's textures go to `slots` (one BindlessTexture per
+/// element, in descriptor order) instead of the descriptor queue; storage images are pushed as
+/// before. Returns false when a texture got no slot (table full, no view of its type): the draw
+/// then binds its textures through the descriptor queue instead.
+[[nodiscard]] inline bool PushBindlessImageDescriptors(
+    TextureCache& texture_cache, BindlessTable& table,
+    GuestDescriptorQueue& guest_descriptor_queue, const Shader::Info& info,
+    RescalingPushConstant& rescaling, const VideoCommon::SamplerId*& samplers,
+    const VideoCommon::ImageViewInOut*& views, BindlessTexture*& slots) {
+    const u32 num_texture_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors);
+    const u32 num_image_buffers = Shader::NumDescriptors(info.image_buffer_descriptors);
+    views += num_texture_buffers;
+    views += num_image_buffers;
+    bool complete = true;
+    for (const auto& desc : info.texture_descriptors) {
+        bool is_rescaled{};
+        for (u32 index = 0; index < desc.count; ++index) {
+            const VideoCommon::ImageViewId image_view_id{(views++)->id};
+            const VideoCommon::SamplerId sampler_id{*(samplers++)};
+            ImageView& image_view{texture_cache.GetImageView(image_view_id)};
+            // No view of this type: the null view's, as the bound path does.
+            ImageView& slot_view{image_view.Handle(desc.type) != VK_NULL_HANDLE
+                                     ? image_view
+                                     : texture_cache.GetImageView(VideoCommon::NULL_IMAGE_VIEW_ID)};
+            const u32 image_slot = slot_view.BindlessSlot(table, desc.type);
+            Sampler& sampler{texture_cache.GetSampler(sampler_id)};
+            const u32 sampler_slot =
+                sampler.HandleAndSlotFor(image_view, desc.is_depth, table).second;
+            complete &= image_slot != BindlessTable::INVALID_SLOT &&
+                        sampler_slot != BindlessTable::INVALID_SLOT;
+            *(slots++) = BindlessTexture{
+                .image_slot = image_slot,
+                .sampler_slot = sampler_slot,
+            };
+            is_rescaled |= texture_cache.IsRescaling(image_view);
+        }
+        rescaling.PushTexture(is_rescaled);
+    }
+    for (const auto& desc : info.image_descriptors) {
+        bool is_rescaled{};
+        for (u32 index = 0; index < desc.count; ++index) {
+            ImageView& image_view{texture_cache.GetImageView((views++)->id)};
+            if (desc.is_written) {
+                texture_cache.MarkModification(image_view.image_id);
+            }
+            const VkImageView vk_image_view{image_view.StorageView(desc.type, desc.format)};
+            guest_descriptor_queue.AddImage(vk_image_view);
+            const bool element_rescaled{texture_cache.IsRescaling(image_view)};
+            is_rescaled |= element_rescaled;
+        }
+        rescaling.PushImage(is_rescaled);
+    }
+    return complete;
+}
+
 } // namespace Vulkan
