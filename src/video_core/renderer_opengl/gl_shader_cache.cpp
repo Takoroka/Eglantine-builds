@@ -414,15 +414,25 @@ GraphicsPipeline* ShaderCache::BuiltPipeline(GraphicsPipeline* pipeline) const n
     if (!use_asynchronous_shaders) {
         return pipeline;
     }
-    // If something is using depth, we can assume that games are not rendering anything which
-    // will be used one time.
+    // Draws whose result is read for many frames must not be skipped while their pipeline builds
+    // (see the Vulkan pipeline cache): wait for a small colour target and for a draw of at most
+    // 6 elements even with depth.
+    const auto& rt0 = maxwell3d->regs.rt[0];
+    if (rt0.Address() != 0 && u64{rt0.width} * rt0.height <= 512 * 512) {
+        return pipeline;
+    }
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    const auto few = [](u32 count) { return count != 0 && count <= 6; };
+    if (few(draw_state.index_buffer.count) || few(draw_state.vertex_buffer.count)) {
+        return pipeline;
+    }
+    // Other draws using depth render the scene, redrawn every frame: they can be skipped.
     if (maxwell3d->regs.zeta_enable) {
         return nullptr;
     }
     // If games are using a small index count, we can assume these are full screen quads.
     // Usually these shaders are only used once for building textures so we can assume they
     // can't be built async
-    const auto& draw_state = maxwell3d->draw_manager.draw_state;
     if (draw_state.index_buffer.count <= 6 || draw_state.vertex_buffer.count <= 6) {
         return pipeline;
     }
