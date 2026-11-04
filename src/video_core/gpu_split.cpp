@@ -192,9 +192,24 @@ void GpuSplit::WaitForSpace(size_t words) {
         if (spins < 4096) {
             Pause();
         } else {
-            std::this_thread::yield();
+            SleepForBack(consumed_cache);
         }
     }
+}
+
+void GpuSplit::SleepForBack(u64 seen) {
+    if (!wait_wake.load(std::memory_order_relaxed)) {
+        std::this_thread::yield();
+        return;
+    }
+    // A yield hands the core to whatever else is ready (the guest's CPU threads) for the rest of
+    // its time slice, and the back can finish and sit idle meanwhile. Sleep on `consumed` instead:
+    // the back wakes this thread when it stores a new value (BackLoop).
+    front_sleeping.store(true, std::memory_order_seq_cst);
+    if (consumed.load(std::memory_order_seq_cst) == seen) {
+        consumed.wait(seen, std::memory_order_seq_cst);
+    }
+    front_sleeping.store(false, std::memory_order_relaxed);
 }
 
 void GpuSplit::Publish() {
@@ -236,7 +251,7 @@ void GpuSplit::Drain() {
         if (spins < 16384) {
             Pause();
         } else {
-            std::this_thread::yield();
+            SleepForBack(consumed_cache);
         }
     }
 }
@@ -429,7 +444,7 @@ void GpuSplit::WaitFor(u64 target) {
         if (spins < 16384) {
             Pause();
         } else {
-            std::this_thread::yield();
+            SleepForBack(consumed_cache);
         }
     }
 }
@@ -634,7 +649,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if ((read_position - last_store >= 4096 ||
                  read_position >= wait_target.load(std::memory_order_relaxed)) &&
                 read_position != available) {
-                consumed.store(read_position, std::memory_order_release);
+                StoreConsumed(read_position);
                 last_store = read_position;
             }
         }
@@ -644,7 +659,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             back_idle_hook(back_idle_context);
         }
         g_back_busy.store(false, std::memory_order_release);
-        consumed.store(read_position, std::memory_order_release);
+        StoreConsumed(read_position);
     }
 }
 
