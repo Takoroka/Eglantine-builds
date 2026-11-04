@@ -50,7 +50,8 @@ public:
     struct Slot {
         Ref ref{};
         u64 tick{};
-        u32 size{}; // 0: nothing streamed yet
+        u64 device_addr{~u64{0}}; ///< Where the slot's last bind read from
+        u32 size{}; // 0: no bytes kept (nothing streamed yet, or bound from a new address)
         std::array<u8, MaxBytes> bytes{};
     };
 
@@ -59,6 +60,7 @@ public:
             for (Slot& slot : stage) {
                 slot.size = 0;
                 slot.tick = 0;
+                slot.device_addr = ~u64{0};
             }
         }
     }
@@ -109,6 +111,18 @@ template <class Runtime, class DeviceMemory>
         source = reuse.scratch.data();
     }
 
+    if (slot.device_addr != device_addr) {
+        // Bound from a new address: games stream each draw's uniforms to a new place in a ring,
+        // so the bytes are rarely the last bind's. Copy them to the stream once, without comparing
+        // or keeping them; the slot keeps bytes again once binds repeat an address.
+        slot.device_addr = device_addr;
+        slot.size = 0;
+        const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
+        std::memcpy(span.data(), source, size);
+        slot.ref = runtime.LastStreamUniformRef();
+        slot.tick = runtime.CurrentTick();
+        return true;
+    }
     const bool same_bytes =
         slot.size == size && std::memcmp(slot.bytes.data(), source, size) == 0;
     if (same_bytes && slot.tick == runtime.CurrentTick()) {
