@@ -372,7 +372,11 @@ void TextureCache<P>::TickFrame() {
     if constexpr (requires { runtime.CurrentTick(); }) {
         while (!gpu_sentenced_images.empty() &&
                runtime.IsFree(gpu_sentenced_images.front().tick)) {
-            gpu_sentenced_bytes -= gpu_sentenced_images.front().bytes;
+            auto& sentenced = gpu_sentenced_images.front();
+            gpu_sentenced_bytes -= sentenced.bytes;
+            if constexpr (requires { runtime.DestroyImage(std::move(sentenced.image), u64{}); }) {
+                runtime.DestroyImage(std::move(sentenced.image), sentenced.bytes);
+            }
             gpu_sentenced_images.pop_front();
         }
     }
@@ -386,6 +390,10 @@ void TextureCache<P>::TickFrame() {
             total_used_memory -= (std::min)(total_used_memory, bytes);
         }
         total_used_memory -= (std::min)(total_used_memory, gpu_sentenced_bytes);
+        // Freed images still with the deleter thread count as freed too.
+        if constexpr (requires { runtime.PendingDestroyBytes(); }) {
+            total_used_memory -= (std::min)(total_used_memory, runtime.PendingDestroyBytes());
+        }
     }
     // Every 600 frames: device memory in use against the collector's thresholds.
     // Skip expensive heap allocation, map construction, and sorting unless debug logging is explicitly enabled.

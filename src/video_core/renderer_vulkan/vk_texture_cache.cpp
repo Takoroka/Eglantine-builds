@@ -2499,6 +2499,23 @@ bool TextureCacheRuntime::IsFree(u64 tick) const noexcept {
     return scheduler.IsFree(tick);
 }
 
+void TextureCacheRuntime::DestroyImage(Image&& image, u64 bytes) {
+    static const bool deferred = [] {
+        const char* const value = std::getenv("EDEN_NX2_DEFERRED_FREE");
+        return value == nullptr || value[0] != '0';
+    }();
+    image.DetachFromRuntime();
+    if (!deferred) {
+        [[maybe_unused]] Image destroyed_here{std::move(image)};
+        return;
+    }
+    pending_destroy_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    image_deleter.QueueWork([this, dead = std::make_unique<Image>(std::move(image)), bytes]() mutable {
+        dead.reset();
+        pending_destroy_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+    });
+}
+
 u64 TextureCacheRuntime::GetDeviceMemoryBudget() const {
     return device.GetDeviceMemoryBudget();
 }
@@ -2689,6 +2706,10 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
 Image::Image(const VideoCommon::NullImageParams& params) : VideoCommon::ImageBase{params} {}
 
 Image::~Image() {
+    DetachFromRuntime();
+}
+
+void Image::DetachFromRuntime() {
     if (ENABLE_MSAA_RESOLVE_CONSUME && runtime != nullptr) {
         if (original_image) {
             runtime->EraseResolveShadow(*original_image);
@@ -2697,6 +2718,7 @@ Image::~Image() {
             runtime->EraseResolveShadow(*scaled_image);
         }
     }
+    runtime = nullptr;
 }
 
 void Image::AllocateComputeUnswizzleBuffer(u32 max_slices) {
