@@ -148,7 +148,8 @@ private:
             if (file != nullptr) {
                 std::fputs("n,t_us,w12,frame_us,fence_us,comp_us,pace_us,late_us,vs_ticks,"
                            "vs_unconsumed,vs_clears,since_clear_us,since_tick_us,sync_req,"
-                           "sync_waits,sync_wait_us,sync_max_us,gpu_ticks,cntpct,catchup,debt_us\n",
+                           "sync_waits,sync_wait_us,sync_max_us,gpu_ticks,cntpct,catchup,debt_us,host_spin,"
+                           "drawn\n",
                            file);
             }
         }
@@ -1931,7 +1932,7 @@ private:
         static const auto start = entered;
         std::fprintf(trace.file,
                      "%llu,%lld,%x,%lld,%lld,%lld,%lld,%lld,%llu,%llu,%llu,%lld,%lld,%llu,%llu,%llu,"
-                     "%llu,%llu,%llu,%d,%lld\n",
+                     "%llu,%llu,%llu,%d,%lld,%d,%x\n",
                      static_cast<unsigned long long>(m_presents), us(entered - start), w[12],
                      m_trace_previous == std::chrono::steady_clock::time_point{}
                          ? 0LL
@@ -1950,7 +1951,8 @@ private:
                      static_cast<unsigned long long>(system.GPU().GetTicks()),
                      static_cast<unsigned long long>(system.CoreTiming().GetClockTicks()),
                      m_trace_catching_up ? 1 : 0,
-                     static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(m_frame_debt).count()));
+                     static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(m_frame_debt).count()),
+                     system.CoreTiming().IsSpinWaiting() ? 1 : 0, w[7]);
         if ((m_presents % 600) == 0) {
             std::fflush(trace.file);
         }
