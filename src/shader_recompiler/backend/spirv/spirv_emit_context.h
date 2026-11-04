@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <unordered_map>
 
 #include <sirit/sirit.h>
 #include "common/container/unordered_set.h"
@@ -43,6 +44,10 @@ struct TextureDefinition {
     u32 count;
     bool is_multisample;
     bool is_integer;
+    /// Bindless: `id` is the heap's image array of the texture's type (`pointer_type` points to
+    /// one element), and the element's slot word is push constant word `bindless_word` + index.
+    bool is_bindless{};
+    u32 bindless_word{};
 };
 
 struct TextureBufferDefinition {
@@ -309,6 +314,18 @@ public:
     Id render_area_push_constant{};
     u32 render_are_member_index{};
 
+    /// The set of the stage's own descriptors: BINDLESS_PER_DRAW_SET in a bindless stage.
+    u32 descriptor_set{};
+    /// Bindless textures: the heap's sampler array, its image arrays by image type, and the slot
+    /// words in the stage's one push constant block (bindless_push_constants).
+    Id bindless_samplers{};
+    Id bindless_sampler_type{};
+    Id bindless_sampler_pointer{};
+    std::unordered_map<u32, Id> bindless_image_arrays;
+    Id bindless_push_constants{};
+    u32 bindless_words_member_index{};
+    Id bindless_word_pointer{};
+
     Id local_memory{};
 
     bool uses_explicit_workgroup_layout{};
@@ -417,6 +434,8 @@ private:
     void DefineTextureBuffers(const Info& info, u32& binding);
     void DefineImageBuffers(const Info& info, u32& binding);
     void DefineTextures(const Info& info, u32& binding, u32& scaling_index);
+    void DefineBindlessTextures(const Info& info, u32& scaling_index);
+    void DefineBindlessPushConstants(const Info& info);
     void DefineImages(const Info& info, u32& binding, u32& scaling_index);
     void DefineAttributeMemAccess(const Info& info);
     void DefineWriteStorageCasLoopFunction(const Info& info);

@@ -290,7 +290,7 @@ void DefineConstBuffers(EmitContext& ctx, const Info& info, Id UniformDefinition
     for (const ConstantBufferDescriptor& desc : info.constant_buffer_descriptors) {
         const Id id{ctx.AddGlobalVariable(struct_pointer_type, spv::StorageClass::Uniform)};
         ctx.Decorate(id, spv::Decoration::Binding, binding);
-        ctx.Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        ctx.Decorate(id, spv::Decoration::DescriptorSet, ctx.descriptor_set);
         ctx.Name(id, fmt::format("c{}", desc.index));
         for (size_t i = 0; i < desc.count; ++i) {
             ctx.cbufs[desc.index + i].*member_type = id;
@@ -320,7 +320,7 @@ void DefineSsbos(EmitContext& ctx, StorageTypeDefinition& type_def,
     for (const StorageBufferDescriptor& desc : info.storage_buffers_descriptors) {
         const Id id{ctx.AddGlobalVariable(struct_pointer, spv::StorageClass::StorageBuffer)};
         ctx.Decorate(id, spv::Decoration::Binding, binding);
-        ctx.Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        ctx.Decorate(id, spv::Decoration::DescriptorSet, ctx.descriptor_set);
         ctx.Name(id, fmt::format("ssbo{}", index));
         if (ctx.profile.supported_spirv >= 0x00010400) {
             ctx.interfaces.push_back(id);
@@ -470,6 +470,8 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     : Sirit::Module(profile_.supported_spirv), profile{profile_}, runtime_info{runtime_info_},
       stage{program.stage}, texture_rescaling_index{bindings.texture_scaling_index},
       image_rescaling_index{bindings.image_scaling_index} {
+    // A bindless stage's own descriptors are in the per-draw set, the heap being set 0.
+    descriptor_set = runtime_info.bindless_textures ? BINDLESS_PER_DRAW_SET : 0U;
     const bool is_unified{profile.unified_descriptor_binding};
     u32& uniform_binding{is_unified ? bindings.unified : bindings.uniform_buffer};
     u32& storage_binding{is_unified ? bindings.unified : bindings.storage_buffer};
@@ -493,8 +495,12 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineAttributeMemAccess(program.info);
     DefineWriteStorageCasLoopFunction(program.info);
     DefineGlobalMemoryFunctions(program.info);
-    DefineRescalingInput(program.info);
-    DefineRenderArea(program.info);
+    if (runtime_info.bindless_textures && profile.unified_descriptor_binding) {
+        DefineBindlessPushConstants(program.info);
+    } else {
+        DefineRescalingInput(program.info);
+        DefineRenderArea(program.info);
+    }
 }
 
 EmitContext::~EmitContext() = default;
@@ -1368,7 +1374,7 @@ void EmitContext::DefineTextureBuffers(const Info& info, u32& binding) {
         }
         const Id id{AddGlobalVariable(type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
-        Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        Decorate(id, spv::Decoration::DescriptorSet, descriptor_set);
         Name(id, NameOf(stage, desc, "texbuf"));
         texture_buffers.push_back({
             .id = id,
@@ -1391,7 +1397,7 @@ void EmitContext::DefineImageBuffers(const Info& info, u32& binding) {
         const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, image_type)};
         const Id id{AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
-        Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        Decorate(id, spv::Decoration::DescriptorSet, descriptor_set);
         Name(id, NameOf(stage, desc, "imgbuf"));
         image_buffers.push_back({
             .id = id,
@@ -1408,6 +1414,14 @@ void EmitContext::DefineImageBuffers(const Info& info, u32& binding) {
 }
 
 void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_index) {
+    if (runtime_info.bindless_textures) {
+        // The textures take no binding of the stage's set (the pipeline layout leaves them out).
+        DefineBindlessTextures(info, scaling_index);
+        if (info.uses_atomic_image_u32) {
+            image_u32 = TypePointer(spv::StorageClass::Image, U32[1]);
+        }
+        return;
+    }
     textures.reserve(info.texture_descriptors.size());
     for (const TextureDescriptor& desc : info.texture_descriptors) {
         const Id image_type{ImageType(*this, desc)};
@@ -1416,7 +1430,7 @@ void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_in
         const Id desc_type{DescType(*this, sampled_type, pointer_type, desc.count)};
         const Id id{AddGlobalVariable(desc_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
-        Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        Decorate(id, spv::Decoration::DescriptorSet, descriptor_set);
         Name(id, NameOf(stage, desc, "tex"));
         textures.push_back({
             .id = id,
@@ -1438,6 +1452,134 @@ void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_in
     }
 }
 
+void EmitContext::DefineBindlessTextures(const Info& info, u32& scaling_index) {
+    if (info.texture_descriptors.empty()) {
+        return;
+    }
+    // The heap (set BINDLESS_HEAP_SET): one image array per texture type at the binding of that
+    // type, and the samplers. Float, integer, depth and multisample variables of a type alias its
+    // binding, which holds views of that type.
+    bindless_sampler_type = TypeSampler();
+    bindless_sampler_pointer =
+        TypePointer(spv::StorageClass::UniformConstant, bindless_sampler_type);
+    const Id sampler_array{TypeArray(bindless_sampler_type, Const(BINDLESS_SAMPLER_CAPACITY))};
+    bindless_samplers =
+        AddGlobalVariable(TypePointer(spv::StorageClass::UniformConstant, sampler_array),
+                          spv::StorageClass::UniformConstant);
+    Decorate(bindless_samplers, spv::Decoration::Binding, BINDLESS_SAMPLER_BINDING);
+    Decorate(bindless_samplers, spv::Decoration::DescriptorSet, BINDLESS_HEAP_SET);
+    Name(bindless_samplers, "bindless_samplers");
+    if (profile.supported_spirv >= 0x00010400) {
+        interfaces.push_back(bindless_samplers);
+    }
+    u32 word{runtime_info.bindless_word_base};
+    textures.reserve(info.texture_descriptors.size());
+    for (const TextureDescriptor& desc : info.texture_descriptors) {
+        const Id image_type{ImageType(*this, desc)};
+        const Id sampled_type{TypeSampledImage(image_type)};
+        const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, image_type)};
+        const auto [it, is_new]{bindless_image_arrays.try_emplace(image_type.value)};
+        if (is_new) {
+            const Id array_type{TypeArray(image_type, Const(BINDLESS_IMAGE_CAPACITY))};
+            it->second =
+                AddGlobalVariable(TypePointer(spv::StorageClass::UniformConstant, array_type),
+                                  spv::StorageClass::UniformConstant);
+            Decorate(it->second, spv::Decoration::Binding, static_cast<u32>(desc.type));
+            Decorate(it->second, spv::Decoration::DescriptorSet, BINDLESS_HEAP_SET);
+            Name(it->second, fmt::format("bindless_images_{}_{}", static_cast<u32>(desc.type),
+                                         bindless_image_arrays.size() - 1));
+            if (profile.supported_spirv >= 0x00010400) {
+                interfaces.push_back(it->second);
+            }
+        }
+        textures.push_back({
+            .id = it->second,
+            .sampled_type = sampled_type,
+            .pointer_type = pointer_type,
+            .image_type = image_type,
+            .count = desc.count,
+            .is_multisample = desc.is_multisample,
+            .is_integer = desc.is_integer,
+            .is_bindless = true,
+            .bindless_word = word,
+        });
+        word += desc.count;
+        ++scaling_index;
+    }
+}
+
+void EmitContext::DefineBindlessPushConstants(const Info& info) {
+    // A bindless stage's one push constant block, laid out as every bindless pipeline layout's
+    // range: RescalingLayout at 0, the render area at BINDLESS_RENDER_AREA_OFFSET, the slot words
+    // at BINDLESS_WORDS_OFFSET. Members the stage doesn't use are left out.
+    const bool rescaling{info.uses_rescaling_uniform};
+    const bool render_area{info.uses_render_area};
+    const bool words{!textures.empty()};
+    if (!rescaling && !render_area && !words) {
+        return;
+    }
+    boost::container::static_vector<Id, 5> members{};
+    boost::container::static_vector<u32, 5> offsets{};
+    boost::container::static_vector<const char*, 5> names{};
+    u32 member_index{0};
+    if (rescaling) {
+        rescaling_textures_type = TypeArray(U32[1], Const(NUM_TEXTURE_SCALING_WORDS));
+        Decorate(rescaling_textures_type, spv::Decoration::ArrayStride, 4u);
+        members.push_back(rescaling_textures_type);
+        offsets.push_back(static_cast<u32>(offsetof(RescalingLayout, rescaling_textures)));
+        names.push_back("rescaling_textures");
+        rescaling_textures_member_index = member_index++;
+
+        rescaling_images_type = TypeArray(U32[1], Const(NUM_IMAGE_SCALING_WORDS));
+        Decorate(rescaling_images_type, spv::Decoration::ArrayStride, 4u);
+        members.push_back(rescaling_images_type);
+        offsets.push_back(static_cast<u32>(offsetof(RescalingLayout, rescaling_images)));
+        names.push_back("rescaling_images");
+        rescaling_images_member_index = member_index++;
+
+        members.push_back(F32[1]);
+        offsets.push_back(static_cast<u32>(offsetof(RescalingLayout, down_factor)));
+        names.push_back("down_factor");
+        rescaling_downfactor_member_index = member_index++;
+    }
+    if (render_area) {
+        members.push_back(F32[4]);
+        offsets.push_back(BINDLESS_RENDER_AREA_OFFSET);
+        names.push_back("render_area");
+        render_are_member_index = member_index++;
+    }
+    if (words) {
+        const Id words_type{TypeArray(U32[1], Const(NUM_BINDLESS_WORDS))};
+        Decorate(words_type, spv::Decoration::ArrayStride, 4u);
+        members.push_back(words_type);
+        offsets.push_back(BINDLESS_WORDS_OFFSET);
+        names.push_back("bindless_words");
+        bindless_words_member_index = member_index++;
+        bindless_word_pointer = TypePointer(spv::StorageClass::PushConstant, U32[1]);
+    }
+    const Id block{TypeStruct(std::span(members.data(), members.size()))};
+    Decorate(block, spv::Decoration::Block);
+    Name(block, "BindlessPushConstants");
+    for (u32 index = 0; index < members.size(); ++index) {
+        MemberDecorate(block, index, spv::Decoration::Offset, offsets[index]);
+        MemberName(block, index, names[index]);
+    }
+    const Id variable{AddGlobalVariable(TypePointer(spv::StorageClass::PushConstant, block),
+                                        spv::StorageClass::PushConstant)};
+    Name(variable, "bindless_push_constants");
+    if (profile.supported_spirv >= 0x00010400) {
+        interfaces.push_back(variable);
+    }
+    // The rescaling and render area reads use the same block.
+    if (rescaling) {
+        rescaling_push_constants = variable;
+    }
+    if (render_area) {
+        render_area_push_constant = variable;
+    }
+    bindless_push_constants = variable;
+}
+
 void EmitContext::DefineImages(const Info& info, u32& binding, u32& scaling_index) {
     images.reserve(info.image_descriptors.size());
     for (const ImageDescriptor& desc : info.image_descriptors) {
@@ -1446,7 +1588,7 @@ void EmitContext::DefineImages(const Info& info, u32& binding, u32& scaling_inde
         const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, image_type)};
         const Id id{AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
-        Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        Decorate(id, spv::Decoration::DescriptorSet, descriptor_set);
         Name(id, NameOf(stage, desc, "img"));
         images.push_back({
             .id = id,
