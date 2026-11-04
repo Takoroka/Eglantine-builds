@@ -117,6 +117,13 @@ struct RuntimeInfo {
 
     /// Dual source blending
     bool dual_source_blend{};
+
+    /// Bindless textures (EDEN_NX2_BINDLESS, see Backend::SPIRV::BINDLESS_HEAP_SET): the stage
+    /// samples its textures from the global descriptor heap through push constant slot words; its
+    /// other descriptors are in set BINDLESS_PER_DRAW_SET.
+    bool bindless_textures{};
+    /// The slot word (counted from BINDLESS_WORDS_OFFSET) of the stage's first texture element.
+    u32 bindless_word_base{};
 };
 
 } // namespace Shader
