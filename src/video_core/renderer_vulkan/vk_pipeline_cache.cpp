@@ -1289,14 +1289,18 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         return key.unique_hashes[index] != 0 || is_emulated_stage;
     };
     // Bindless textures when the heap is on and the pipeline's texture elements fit in the push
-    // constant words; the whole pipeline either way.
+    // constant words; the whole pipeline either way. Not task/mesh pipelines: the heap and the
+    // push constant range are for the classic graphics stages.
     u32 texture_words{};
+    bool task_or_mesh{};
     for (size_t index = first_program; index < Maxwell::MaxShaderProgram; ++index) {
         if (index != 0 && is_emitted(index)) {
-            texture_words += Shader::NumDescriptors(programs[index].info.texture_descriptors);
+            const Shader::Info& info{programs[index].info};
+            texture_words += Shader::NumDescriptors(info.texture_descriptors);
+            task_or_mesh |= info.is_task || info.is_mesh;
         }
     }
-    const bool bindless{bindless_heap.Enabled() && texture_words != 0 &&
+    const bool bindless{bindless_heap.Enabled() && !task_or_mesh && texture_words != 0 &&
                         texture_words <= Shader::Backend::SPIRV::NUM_BINDLESS_WORDS};
     u32 bindless_word_base{};
 
