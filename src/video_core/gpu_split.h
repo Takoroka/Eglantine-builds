@@ -169,7 +169,8 @@ public:
         last_writer_position = write_position;
     }
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
-    void WaitForWriters();
+    /// Returns whether any of it was still queued.
+    bool WaitForWriters();
 
     /// On the back, while it runs an entry: whether more work was sent after it (false on any
     /// other thread, or without the split).
@@ -366,15 +367,17 @@ private:
 
     static GpuSplit instance;
 
-    alignas(64) std::atomic<u64> published{};
-    alignas(64) std::atomic<u64> consumed{};
+    // 128 bytes: x86 spatial prefetchers pull 64-byte lines in pairs. back_waiting and wake are
+    // always touched together by both threads, so they share a block.
+    alignas(128) std::atomic<u64> published{};
+    alignas(128) std::atomic<u64> consumed{};
     /// A position the front waits for (WaitForWriters): the back stores `consumed` once past it.
-    alignas(64) std::atomic<u64> wait_target{~u64{0}};
+    alignas(128) std::atomic<u64> wait_target{~u64{0}};
     /// WaitForWriters asks the back to submit what it recorded (submit_hook).
-    alignas(64) std::atomic<bool> submit_requested{};
-    alignas(64) std::atomic<bool> back_waiting{};
+    alignas(128) std::atomic<bool> submit_requested{};
+    alignas(128) std::atomic<bool> back_waiting{};
     /// The front sleeps on `consumed` (SleepForBack): the back wakes it when it stores one.
-    alignas(64) std::atomic<bool> front_sleeping{};
+    alignas(128) std::atomic<bool> front_sleeping{};
     std::atomic<u32> wake{};
     std::jthread back_thread;
 };

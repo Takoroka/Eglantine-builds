@@ -6,8 +6,9 @@
 
 #include <algorithm>
 #include <array>
-#include <chrono>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -708,7 +709,11 @@ void Maxwell3D::ProcessMacroUpload(u32 data) {
 }
 
 void Maxwell3D::ProcessMacroBind(u32 data) {
-    GetNativeMacroPositions()[regs.load_mme.start_address_ptr++] = data;
+    const auto positions = GetNativeMacroPositions();
+    const u32 index = regs.load_mme.start_address_ptr++;
+    if (index < positions.size()) {
+        positions[index] = data;
+    }
 }
 
 void Maxwell3D::ProcessFirmwareCall4() {
@@ -884,27 +889,41 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
     ASSERT(buffer_address != 0);
 
     // Don't allow writing past the end of the buffer.
-    ASSERT(regs.const_buffer.offset <= regs.const_buffer.size);
-
-    const GPUVAddr address{buffer_address + regs.const_buffer.offset};
     const size_t copy_size = amount * sizeof(u32);
-    memory_manager.WriteBlockCached(address, start_base, copy_size);
+    const size_t room = regs.const_buffer.offset < regs.const_buffer.size
+                            ? regs.const_buffer.size - regs.const_buffer.offset
+                            : 0;
+    const size_t write_size = (std::min)(copy_size, room / sizeof(u32) * sizeof(u32));
+    if (write_size != 0) {
+        const GPUVAddr address{buffer_address + regs.const_buffer.offset};
+        memory_manager.WriteBlockCached(address, start_base, write_size);
+        // Uploads usually continue where the last one ended: one range for a whole buffer. With
+        // the list full, the range that grows least takes the write (wider ranges only cost
+        // precision). Only the words written count (see below).
+        auto& changes = cbuf_changes;
+        const GPUVAddr end = address + write_size;
+        if (changes.num_writes != 0 && changes.writes[changes.num_writes - 1].second == address) {
+            changes.writes[changes.num_writes - 1].second = end;
+        } else if (changes.num_writes < changes.writes.size()) {
+            changes.writes[changes.num_writes++] = {address, end};
+        } else {
+            const auto growth = [address, end](const std::pair<GPUVAddr, GPUVAddr>& range) {
+                return ((std::max)(range.second, end) - (std::min)(range.first, address)) -
+                       (range.second - range.first);
+            };
+            auto& range = *std::ranges::min_element(changes.writes, {}, growth);
+            range = {(std::min)(range.first, address), (std::max)(range.second, end)};
+        }
+    }
     ++same_state_serials[SameStateUniforms];
-    // Uploads usually continue where the last one ended: one range for a whole buffer. With the
-    // list full, the range that grows least takes the write (wider ranges only cost precision).
-    auto& changes = cbuf_changes;
-    const GPUVAddr end = address + copy_size;
-    if (changes.num_writes != 0 && changes.writes[changes.num_writes - 1].second == address) {
-        changes.writes[changes.num_writes - 1].second = end;
-    } else if (changes.num_writes < changes.writes.size()) {
-        changes.writes[changes.num_writes++] = {address, end};
-    } else {
-        const auto growth = [address, end](const std::pair<GPUVAddr, GPUVAddr>& range) {
-            return ((std::max)(range.second, end) - (std::min)(range.first, address)) -
-                   (range.second - range.first);
-        };
-        auto& range = *std::ranges::min_element(changes.writes, {}, growth);
-        range = {(std::min)(range.first, address), (std::max)(range.second, end)};
+    if (write_size != copy_size) {
+        static std::atomic<bool> warned{};
+        if (!warned.exchange(true, std::memory_order_relaxed)) {
+            LOG_ERROR(HW_GPU,
+                      "Dropping constant buffer words past the end: offset={:#x}, size={:#x}, "
+                      "bytes={:#x}, written={:#x}",
+                      regs.const_buffer.offset, regs.const_buffer.size, copy_size, write_size);
+        }
     }
 
     // Increment the current buffer position.
@@ -1044,13 +1063,23 @@ GPUVAddr FrontConstBufferAddress(const u32* regs, u32 offset) {
     return ((GPUVAddr{regs[base + 1]} << 32) | regs[base + 2]) + offset;
 }
 
+/// As ProcessCBMultiData: of `bytes` uploaded at `offset`, the bytes the back writes (whole words
+/// past the bound buffer's end are dropped).
+size_t FrontConstBufferWritten(const u32* regs, u32 offset, size_t bytes) {
+    const u32 size = regs[MAXWELL3D_REG_INDEX(const_buffer.size)];
+    const size_t room = offset < size ? size - offset : 0;
+    return (std::min)(bytes, room / sizeof(u32) * sizeof(u32));
+}
+
 /// An executable method's write, `value` with the shadow RAM applied, with `regs` past it.
 void FrontNoteWrite(VideoCommon::GpuSplit& split, const MemoryManager& memory, const u32* regs,
                     FrontUpload& upload, u32 method, u32 value, bool is_last_call) {
     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
     if (method >= cb_data && method < cb_data + 16) {
         const u32 offset = regs[MAXWELL3D_REG_INDEX(const_buffer.offset)] - sizeof(u32);
-        split.NoteWrite(memory, FrontConstBufferAddress(regs, offset), sizeof(u32), &value);
+        if (FrontConstBufferWritten(regs, offset, sizeof(u32)) != 0) {
+            split.NoteWrite(memory, FrontConstBufferAddress(regs, offset), sizeof(u32), &value);
+        }
         return;
     }
     switch (method) {
@@ -1463,8 +1492,12 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         return;
     }
     if (method >= cb_data && method < cb_data + 16) {
-        split.NoteWrite(memory_manager, FrontConstBufferAddress(fs.regs.data(), cb_offset),
-                        size_t{amount} * sizeof(u32), base_start);
+        const size_t bytes =
+            FrontConstBufferWritten(fs.regs.data(), cb_offset, size_t{amount} * sizeof(u32));
+        if (bytes != 0) {
+            split.NoteWrite(memory_manager, FrontConstBufferAddress(fs.regs.data(), cb_offset),
+                            bytes, base_start);
+        }
     } else if (method == MAXWELL3D_REG_INDEX(inline_data)) {
         fs.upload.Words(split, memory_manager, fs.regs.data(), base_start, amount);
     }
