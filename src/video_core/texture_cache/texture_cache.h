@@ -624,6 +624,8 @@ typename P::Sampler& TextureCache<P>::GetSampler(SamplerId id) noexcept {
 template <class P>
 void TextureCache<P>::SynchronizeDescriptors(bool compute) {
     if (compute) {
+        channel_state->compute_sampler_table.ResetPages();
+        channel_state->compute_image_table.ResetPages();
         const bool linked_tsc = kepler_compute->launch_description.linked_tsc;
         const u32 tic_limit = kepler_compute->regs.tic.limit;
         const u32 tsc_limit = linked_tsc ? tic_limit : kepler_compute->regs.tsc.limit;
@@ -636,6 +638,8 @@ void TextureCache<P>::SynchronizeDescriptors(bool compute) {
             ++texture_bindings_serial;
         }
     } else {
+        channel_state->graphics_sampler_table.ResetPages();
+        channel_state->graphics_image_table.ResetPages();
         const bool linked_tsc = maxwell3d->regs.sampler_binding == Tegra::Engines::Maxwell3D::Regs::SamplerBinding::ViaHeaderBinding;
         const u32 tic_limit = maxwell3d->regs.tex_header.limit;
         const u32 tsc_limit = linked_tsc ? tic_limit : maxwell3d->regs.tex_sampler.limit;
