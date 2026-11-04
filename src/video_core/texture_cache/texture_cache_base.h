@@ -244,6 +244,25 @@ public:
     /// Get the sampler id from the graphics/compute descriptor table in the specified index
     SamplerId GetSamplerId(u32 index, bool compute);
 
+    /// Goes up whenever graphics textures resolved earlier could resolve differently or need
+    /// preparing again: a CPU write or unmap of an image, an image registered, unregistered,
+    /// deleted or rescaled, a new image or alias, a modification of an image with aliases, a
+    /// graphics TIC/TSC entry read as new or changed (the tables keep one copy for all draws), a
+    /// change of the graphics tables' address or limit, a channel switch, and once a frame (the
+    /// LRU touch). A draw may reuse the views and samplers it resolved while this is unchanged
+    /// and ImageTableMatches/SamplerTableMatches hold for each of its handles.
+    [[nodiscard]] u64 TextureSetGeneration() const noexcept {
+        return texture_set_generation;
+    }
+
+    /// True when VisitImageView(tic_handle, false) would return the view it returned last time
+    /// for this handle without doing any work: the graphics TIC entry is unchanged in guest
+    /// memory (or out of the table's limit, which resolves to the null view).
+    [[nodiscard]] bool ImageTableMatches(u32 tic_handle);
+
+    /// True when GetSamplerId(tsc_index, false) would return its last sampler, as above.
+    [[nodiscard]] bool SamplerTableMatches(u32 tsc_index);
+
     /// Return a constant reference to the given sampler id
     [[nodiscard]] const Sampler& GetSampler(SamplerId id) const noexcept;
 
@@ -352,6 +371,9 @@ public:
     /// Create channel state.
     void CreateChannel(Tegra::Control::ChannelState& channel) final override;
 
+    /// Bind a channel for execution.
+    void BindToChannel(s32 id) final override;
+
     /// Prepare an image to be used
     void PrepareImage(ImageId image_id, bool is_modification, bool invalidate);
 
@@ -396,6 +418,10 @@ private:
 
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);
+
+    void BumpTextureSetGeneration() noexcept {
+        ++texture_set_generation;
+    }
 
     /// Find or create a framebuffer with the given render target parameters
     FramebufferId GetFramebufferId(const RenderTargets& key);
@@ -639,6 +665,7 @@ private:
 
     u64 modification_tick = 0;
     u64 frame_tick = 0;
+    u64 texture_set_generation = 0;
 
     Common::ThreadWorker texture_decode_worker{1, "TextureDecoder", {},
                                                Common::ThreadPlacement::Efficiency};
