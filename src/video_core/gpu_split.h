@@ -169,8 +169,10 @@ public:
         last_writer_position = write_position;
     }
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
-    /// Returns whether any of it was still queued.
-    bool WaitForWriters();
+    /// Returns whether any of it was still queued. `submit`: the front is about to read what that
+    /// work wrote, so the back submits what it recorded without waiting for more (early submit);
+    /// DmaPusher::Step's check before every entry on unmarked pages passes false.
+    bool WaitForWriters(bool submit);
 
     /// On the back, while it runs an entry: whether more work was sent after it (false on any
     /// other thread, or without the split).

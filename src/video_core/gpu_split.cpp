@@ -256,13 +256,17 @@ void GpuSplit::Drain() {
     }
 }
 
-bool GpuSplit::WaitForWriters() {
+bool GpuSplit::WaitForWriters(bool submit) {
     const u64 target = std::min(last_writer_position, write_position);
-    if (early_submit.load(std::memory_order_relaxed) &&
-        consumed.load(std::memory_order_acquire) < target) {
+    consumed_cache = consumed.load(std::memory_order_acquire);
+    if (consumed_cache >= target) {
+        return false;
+    }
+    if (submit && early_submit.load(std::memory_order_relaxed)) {
         submit_requested.store(true, std::memory_order_relaxed);
     }
     WaitFor(target);
+    return true;
 }
 
 void GpuSplit::RecordWrite(const Tegra::MemoryManager& memory, GPUVAddr address, size_t size,
