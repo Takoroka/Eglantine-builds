@@ -6,10 +6,16 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <cstdlib>
 #include <span>
 #include <vector>
+
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -457,6 +463,76 @@ void BufferCacheRuntime::Wait(u64 tick) {
 }
 
 void BufferCacheRuntime::WaitSubmittedTick(u64 tick) {
+    scheduler.GetMasterSemaphore().Wait(tick);
+}
+
+void BufferCacheRuntime::Nx2WriteCopyMarkers(
+    std::span<const std::pair<VkBuffer, VkDeviceSize>> markers) {
+    if (markers.empty()) {
+        return;
+    }
+    // The copies' writes land before the markers' (transfer to transfer), and both reach the host.
+    static constexpr VkMemoryBarrier COPY_BARRIER{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT,
+    };
+    static constexpr VkMemoryBarrier HOST_BARRIER{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+    };
+    boost::container::small_vector<std::pair<VkBuffer, VkDeviceSize>, 8> list(markers.begin(),
+                                                                               markers.end());
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([list = std::move(list)](vk::CommandBuffer cmdbuf) {
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0,
+                               COPY_BARRIER);
+        for (const auto& [buffer, offset] : list) {
+            cmdbuf.FillBuffer(buffer, offset, sizeof(u32), 1);
+        }
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                               HOST_BARRIER);
+    });
+}
+
+bool BufferCacheRuntime::Nx2ListCopyMarked(const u32* marker) {
+    if (!nx2_list_copy_poll.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    const bool marked = *static_cast<const volatile u32*>(marker) != 0;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    return marked;
+}
+
+void BufferCacheRuntime::Nx2WaitListCopy(const u32* marker, u64 tick) {
+    // The copy is the last work of its submission, but the fence signals after the whole
+    // submission and the wait wakes this thread through the OS: watch the GPU's marker for up to
+    // 2 ms (Mario Kart World's races waited ~0.3 ms per copy), then wait for the fence.
+    if (nx2_list_copy_poll.load(std::memory_order_relaxed)) {
+        const auto start = std::chrono::steady_clock::now();
+        for (u32 spins = 1;; ++spins) {
+            if (Nx2ListCopyMarked(marker)) {
+                return;
+            }
+            if (spins % 256 == 0) {
+                if (scheduler.IsFree(tick) ||
+                    std::chrono::steady_clock::now() - start > std::chrono::milliseconds{2}) {
+                    break;
+                }
+            }
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+            _mm_pause();
+#elif defined(__x86_64__) || defined(__i386__)
+            __builtin_ia32_pause();
+#elif defined(__aarch64__)
+            asm volatile("yield");
+#endif
+        }
+    }
     scheduler.GetMasterSemaphore().Wait(tick);
 }
 

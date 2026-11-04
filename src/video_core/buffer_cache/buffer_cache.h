@@ -1897,6 +1897,12 @@ void BufferCache<P>::Nx2NoteListWrite(BufferId buffer_id, DAddr device_addr, u64
 }
 
 template <class P>
+u32* BufferCache<P>::Nx2CopyMarker(const Nx2Staging& copy) {
+    return reinterpret_cast<u32*>(copy.mapped_span.data() +
+                                  (DAddr{1} << Tegra::Nx2WrittenPageBits));
+}
+
+template <class P>
 bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
     if constexpr (IS_OPENGL) {
         return false;
@@ -1907,6 +1913,8 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
         std::ranges::sort(nx2_list_copy_requests, {}, &std::pair<BufferId, DAddr>::second);
         constexpr DAddr page_size = DAddr{1} << Tegra::Nx2WrittenPageBits;
         bool recorded = false;
+        // The word after each copy's page: the GPU sets it once the copy is done.
+        boost::container::small_vector<std::pair<decltype(Nx2Staging::buffer), u64>, 8> markers;
         for (size_t i = 0; i < nx2_list_copy_requests.size(); ++i) {
             const auto [buffer_id, page] = nx2_list_copy_requests[i];
             if (i + 1 < nx2_list_copy_requests.size() &&
@@ -1920,7 +1928,8 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
             if (begin >= end) {
                 continue;
             }
-            Nx2Staging staging = runtime.DownloadStagingBuffer(page_size, true);
+            Nx2Staging staging = runtime.DownloadStagingBuffer(page_size + sizeof(u32), true);
+            *Nx2CopyMarker(staging) = 0;
             const BufferCopy copy{
                 .src_offset = buffer.Offset(begin),
                 .dst_offset = staging.offset + (begin - page),
@@ -1928,6 +1937,7 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
             };
             buffer.MarkUsage(copy.src_offset, copy.size);
             runtime.CopyBuffer(staging.buffer, buffer, std::span{&copy, 1}, true);
+            markers.emplace_back(staging.buffer, staging.offset + page_size);
             recorded = true;
             std::scoped_lock lock{nx2_list_mutex};
             Nx2ListPage& entry = nx2_list_pages[page];
@@ -1940,6 +1950,7 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
             entry.copy_begin = static_cast<u32>(begin - page);
             entry.copy_end = static_cast<u32>(end - page);
         }
+        runtime.Nx2WriteCopyMarkers(std::span{markers.data(), markers.size()});
         nx2_list_copy_requests.clear();
         std::erase_if(nx2_retired_list_copies, [this](auto& retired) {
             if (!runtime.IsFree(retired.first)) {
@@ -1969,6 +1980,7 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out) -> Nx
         };
         u64 tick{};
         u64 writes{};
+        const u32* marker{};
         {
             std::scoped_lock lock{nx2_list_mutex};
             const auto it = nx2_list_pages.find(page);
@@ -1984,15 +1996,17 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out) -> Nx
                 return Nx2ListRead::Unknown;
             }
             // The lists after the first of a batch find the copy done: read it at once.
-            if (runtime.IsFree(entry.copy_tick)) {
+            marker = Nx2CopyMarker(*entry.copy);
+            if (runtime.IsFree(entry.copy_tick) || runtime.Nx2ListCopyMarked(marker)) {
                 std::memcpy(out.data(), entry.copy->mapped_span.data() + offset, out.size());
                 return Nx2ListRead::Copied;
             }
             tick = entry.copy_tick;
             writes = entry.copy_writes;
         }
-        // Submitted with the work that wrote the page (Nx2CopyListPages's caller flushes).
-        runtime.WaitSubmittedTick(tick);
+        // Submitted with the work that wrote the page (Nx2CopyListPages's caller flushes). The
+        // copy stays mapped if the back replaces it meanwhile; the checks below catch that.
+        runtime.Nx2WaitListCopy(marker, tick);
         std::scoped_lock lock{nx2_list_mutex};
         const auto it = nx2_list_pages.find(page);
         if (it == nx2_list_pages.end() || !current(it->second) || it->second.copy_tick != tick ||

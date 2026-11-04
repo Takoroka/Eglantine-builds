@@ -704,6 +704,8 @@ private:
         bool draw_written{};
         std::optional<Nx2Staging> copy;
     };
+    /// The word after a list copy's page: the GPU sets it once the copy is done.
+    static u32* Nx2CopyMarker(const Nx2Staging& copy);
     std::mutex nx2_list_mutex; ///< nx2_list_pages: the split's front reads the copies
     std::unordered_map<DAddr, Nx2ListPage> nx2_list_pages;
     /// Copies replaced while the GPU may still write them: freed once it is past their tick.

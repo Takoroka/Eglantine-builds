@@ -6,7 +6,11 @@
 
 #pragma once
 
+#include <atomic>
+#include <cstdlib>
 #include <limits>
+#include <span>
+#include <utility>
 
 #include <boost/container/small_vector.hpp>
 
@@ -125,6 +129,23 @@ public:
 
     /// Waits for a submitted tick without flushing: safe on threads other than the GPU thread.
     void WaitSubmittedTick(u64 tick);
+
+    /// Records, after the copies recorded so far, a 1 into each of `markers` (a download staging
+    /// buffer and the offset of a word the host set to 0): the host sees a copy done there before
+    /// the submission's fence signals (Nx2WaitListCopy).
+    void Nx2WriteCopyMarkers(std::span<const std::pair<VkBuffer, VkDeviceSize>> markers);
+
+    /// Any thread: waits until the GPU set `marker` (Nx2WriteCopyMarkers) or reached `tick`.
+    void Nx2WaitListCopy(const u32* marker, u64 tick);
+
+    /// True once the GPU set `marker` (Nx2WriteCopyMarkers); false with polling off.
+    static bool Nx2ListCopyMarked(const u32* marker);
+
+    /// EDEN_NX2_LIST_COPY_POLL=0: Nx2WaitListCopy waits for the fence only (comparisons).
+    static inline std::atomic<bool> nx2_list_copy_poll{[] {
+        const char* value = std::getenv("EDEN_NX2_LIST_COPY_POLL");
+        return value == nullptr || value[0] != '0';
+    }()};
 
     void Finish();
 
