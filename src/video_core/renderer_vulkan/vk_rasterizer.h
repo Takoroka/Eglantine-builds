@@ -323,6 +323,30 @@ private:
         bool valid{};
     } repeat;
     u64 same_state_verify_count{};
+
+    /// Uniform slot keep (uniform_stream_reuse.h): what happened since the last draw that bound
+    /// uniform buffers. Clean when nothing but the guest writes listed here did.
+    struct UniformKeepWindow {
+        std::array<std::pair<u64, u64>, 32> written{}; ///< InnerInvalidation ranges since
+        u32 num_written{};
+        bool overflow{};
+        bool bound{}; ///< A draw bound uniform buffers and nothing ended the window since
+        u64 setup_events{};  ///< At that draw's start (guest threads count once done)
+        u64 foreign_events{};
+        u64 gpu_modified{};
+        u32 epoch{};
+        u64 back_events{};   ///< After the last submitted draw
+        u64 record_serial{};
+        const Tegra::Engines::Maxwell3D* maxwell3d{};
+    } uniform_keep;
+    std::atomic<u64> uniform_keep_foreign{}; ///< InnerInvalidation calls off the back thread
+    struct UniformKeepStats {
+        u64 draws{};
+        std::array<u64, 9> refused{}; ///< First failing check of BeginUniformKeepWindow
+    } uniform_keep_stats;
+    /// Starts a draw's uniform buffer binds (once per draw, before the refresh or full setup).
+    void BeginUniformKeepWindow();
+    void LogUniformKeepStats();
 };
 
 } // namespace Vulkan

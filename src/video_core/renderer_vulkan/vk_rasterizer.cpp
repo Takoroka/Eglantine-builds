@@ -520,17 +520,127 @@ void RasterizerVulkan::RememberDrawSetup(GraphicsPipeline* pipeline, bool is_ind
     }
 }
 
+void RasterizerVulkan::BeginUniformKeepWindow() {
+    // EDEN_NX2_UBOKEEP=0: off. EDEN_NX2_UBOKEEP_VERIFY=1: compare the kept copies with guest memory
+    // and count mismatches (bound normally). EDEN_NX2_UBOKEEP_STATS=1 (or verify): log every 10 s.
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_UBOKEEP");
+        return value == nullptr || value[0] != '0';
+    }();
+    static const bool verify = [] {
+        const char* const value = std::getenv("EDEN_NX2_UBOKEEP_VERIFY");
+        return value != nullptr && value[0] == '1';
+    }();
+    static const bool stats = verify || [] {
+        const char* const value = std::getenv("EDEN_NX2_UBOKEEP_STATS");
+        return value != nullptr && value[0] == '1';
+    }();
+    auto& keep = uniform_keep;
+    const u64 events = setup_events.load(std::memory_order_relaxed);
+    const u64 foreign = uniform_keep_foreign.load(std::memory_order_relaxed);
+    const u64 gpu_modified = buffer_cache.GpuModifiedSerial();
+    const u32 epoch = Common::Nx2Ab::Epoch();
+    // The first failing check (0: clean).
+    u32 refused = 0;
+    if (!enabled || !Common::Nx2Ab::On(Common::Nx2Ab::UniformSlotKeep)) {
+        refused = 1;
+    } else if (!keep.bound || keep.maxwell3d != maxwell3d || !VideoCommon::GpuSplit::OnBackThread()) {
+        refused = 2;
+    } else if (keep.overflow) {
+        refused = 3;
+    } else if (events != keep.setup_events || foreign != keep.foreign_events) {
+        refused = 4;
+    } else if (VideoCommon::GpuSplit::Get().BackEvents() != keep.back_events) {
+        refused = 5;
+    } else if (scheduler.RecordSerial() != keep.record_serial) {
+        refused = 6;
+    } else if (gpu_modified != keep.gpu_modified) {
+        refused = 7;
+    } else if (epoch != keep.epoch) {
+        refused = 8;
+    }
+    buffer_cache.BeginUniformKeep(refused == 0, std::span(keep.written.data(), keep.num_written),
+                                  verify);
+    // Taken before the setup: what happens during it (a guest thread's invalidation, the setup's
+    // own storage buffer writes) ends the next draw's window.
+    keep.setup_events = events;
+    keep.foreign_events = foreign;
+    keep.gpu_modified = gpu_modified;
+    keep.epoch = epoch;
+    keep.maxwell3d = maxwell3d;
+    if (stats) {
+        ++uniform_keep_stats.draws;
+        ++uniform_keep_stats.refused[refused];
+        if ((uniform_keep_stats.draws & 4095) == 0) {
+            LogUniformKeepStats();
+        }
+    }
+}
+
+void RasterizerVulkan::LogUniformKeepStats() {
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point last = Clock::now();
+    static UniformKeepStats last_stats{};
+    static decltype(buffer_cache.UniformKeepCounters()) last_counters{};
+    const Clock::time_point now = Clock::now();
+    const double seconds = std::chrono::duration<double>(now - last).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    const auto counters = buffer_cache.UniformKeepCounters();
+    const auto& s = uniform_keep_stats;
+    const auto rate = [seconds](u64 now_value, u64 last_value) {
+        return static_cast<u64>(static_cast<double>(now_value - last_value) / seconds);
+    };
+    LOG_INFO(HW_GPU,
+             "uniform keep {:.1f} s: draws {}/s, clean {}/s, refused: off {} | unbound {} | overflow {} | "
+             "setup events {} | back events {} | records {} | gpu writes {} | epoch {} || slot binds {}/s, "
+             "kept {}/s, not clean {}/s, other slot {}/s, new tick {}/s, written {}/s, mismatches {}",
+             seconds, rate(s.draws, last_stats.draws), rate(s.refused[0], last_stats.refused[0]),
+             rate(s.refused[1], last_stats.refused[1]),
+             rate(s.refused[2], last_stats.refused[2]), rate(s.refused[3], last_stats.refused[3]),
+             rate(s.refused[4], last_stats.refused[4]), rate(s.refused[5], last_stats.refused[5]),
+             rate(s.refused[6], last_stats.refused[6]), rate(s.refused[7], last_stats.refused[7]),
+             rate(s.refused[8], last_stats.refused[8]), rate(counters.binds, last_counters.binds),
+             rate(counters.kept, last_counters.kept), rate(counters.not_clean, last_counters.not_clean),
+             rate(counters.other_slot, last_counters.other_slot),
+             rate(counters.new_tick, last_counters.new_tick),
+             rate(counters.written, last_counters.written),
+             counters.mismatches - last_counters.mismatches);
+    last = now;
+    last_stats = s;
+    last_counters = counters;
+}
+
 template <typename Func>
 void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     SCOPE_EXIT {
         gpu.TickWork();
     };
     bool submitted = false;
+    bool keep_begun = false;
     SCOPE_EXIT {
         auto& native = maxwell3d->GetNativeMacroEngine();
         if (native.native_turing && !submitted) {
             native.native_execution_failed = true;
             LOG_DEBUG(HW_GPU, "Native graphics draw failed; refusing submission completion");
+        }
+        // Uniform slot keep: a window ends at each draw that binds uniform buffers.
+        if (keep_begun) {
+            buffer_cache.EndUniformKeep();
+            uniform_keep.num_written = 0;
+            uniform_keep.overflow = false;
+            uniform_keep.bound = submitted;
+        }
+        if (submitted) {
+            uniform_keep.back_events = VideoCommon::GpuSplit::Get().BackEvents();
+            uniform_keep.record_serial = scheduler.RecordSerial();
+        }
+    };
+    const auto begin_uniform_keep = [&] {
+        if (!keep_begun) {
+            keep_begun = true;
+            BeginUniformKeepWindow();
         }
     };
     namespace Profile = VideoCommon::Nx2Profile;
@@ -565,6 +675,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
             bool done = refusal == 0;
             if (!done) {
                 Profile::Scope scope{Profile::Zone::Configure};
+                begin_uniform_keep();
                 switch (pipeline->RefreshBuffers(is_indexed)) {
                 case GraphicsPipeline::ConfigureResult::Done:
                     done = true;
@@ -654,6 +765,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
             }
         }
     }
+    begin_uniform_keep();
     if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
         report_failure("configure failed");
         return;
@@ -1602,6 +1714,23 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
     // Constant buffer uploads (and DMA and 2D copies, which come with back events): what
     // they hit is checked through the caches' counters (CanRefreshBuffers).
     ++buffer_events;
+    // Uniform slot keep: the window lists the guest writes (uploads usually continue the last).
+    if (VideoCommon::GpuSplit::OnBackThread()) {
+        auto& keep = uniform_keep;
+        for (const auto& [addr, size] : sequences) {
+            if (keep.num_written != 0 &&
+                keep.written[keep.num_written - 1].first + keep.written[keep.num_written - 1].second ==
+                    addr) {
+                keep.written[keep.num_written - 1].second += size;
+            } else if (keep.num_written < keep.written.size()) {
+                keep.written[keep.num_written++] = {addr, size};
+            } else {
+                keep.overflow = true;
+            }
+        }
+    } else {
+        uniform_keep_foreign.fetch_add(1, std::memory_order_relaxed);
+    }
     if (Settings::values.skip_cpu_inner_invalidation.GetValue()) {
         return;
     }

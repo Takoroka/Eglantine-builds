@@ -34,6 +34,7 @@
 #include "common/settings.h"
 #include "common/slot_vector.h"
 #include "video_core/buffer_cache/buffer_base.h"
+#include "video_core/buffer_cache/uniform_stream_reuse.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/delayed_destruction_ring.h"
@@ -384,6 +385,24 @@ public:
         return channel_state->index_buffer.size;
     }
 
+    /// Uniform slot keep: starts a draw's uniform buffer binds (VideoCommon::BeginUniformKeep).
+    void BeginUniformKeep(bool clean, std::span<const std::pair<u64, u64>> written, bool verify) {
+        VideoCommon::BeginUniformKeep<Runtime>(clean, written, verify);
+    }
+
+    void EndUniformKeep() {
+        VideoCommon::EndUniformKeep<Runtime>();
+    }
+
+    [[nodiscard]] auto UniformKeepCounters() const noexcept {
+        return VideoCommon::UniformKeepCounters<Runtime>();
+    }
+
+    /// Bumped by every range added to the GPU-written ranges.
+    [[nodiscard]] u64 GpuModifiedSerial() const noexcept {
+        return gpu_modified_serial;
+    }
+
     /// UpdateGraphicsBuffers for a draw whose storage and texture buffers are those of the last
     /// setup: resolves the index, vertex and uniform bindings that changed. False when that
     /// deleted buffers (joined into a new one): the full update must run.
@@ -697,6 +716,7 @@ private:
 
     /// Adds to gpu_modified_ranges (only through here: it ends the known gaps it touches)
     void AddGpuModifiedRange(DAddr device_addr, u64 size);
+    u64 gpu_modified_serial = 0;
 
     Common::RangeSet<DAddr> read_trapped_ranges;
     Common::RangeSet<DAddr> gpu_modified_ranges;

@@ -1038,6 +1038,7 @@ bool BufferCache<P>::IsRegionGpuModified(DAddr addr, size_t size) {
 
 template <class P>
 void BufferCache<P>::AddGpuModifiedRange(DAddr device_addr, u64 size) {
+    ++gpu_modified_serial;
     ++buffer_check_stats.adds;
     // Draws and dispatches write the same ranges over and over: one the set covers already changes
     // neither the set nor the known gaps (they lie outside it).
@@ -1334,6 +1335,15 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     const u32 size = (std::min)(binding.size, (*channel_state->uniform_buffer_sizes)[stage][index]);
     Buffer& buffer = slot_buffers[binding.buffer_id];
     TouchBuffer(buffer, binding.buffer_id);
+    if constexpr (!IS_OPENGL && VideoCommon::StreamUniformReusable<Runtime>) {
+        // The same bytes as at the previous draw, which streamed them (uniform_stream_reuse.h).
+        if (binding.buffer_id != NULL_BUFFER_ID &&
+            VideoCommon::KeepSmallUniform(runtime, device_memory, stage, index, device_addr, size)) {
+            channel_state->fast_bound_uniform_buffers[stage] |= 1u << binding_index;
+            channel_state->uniform_buffer_binding_sizes[stage][binding_index] = size;
+            return;
+        }
+    }
     const bool has_host_buffer = binding.buffer_id != NULL_BUFFER_ID;
     const u32 offset = has_host_buffer ? buffer.Offset(device_addr) : 0;
     const bool needs_alignment_stream = [&]() {

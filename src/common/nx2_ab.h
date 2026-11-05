@@ -26,6 +26,8 @@ enum Feature : u64 {
     ZeroDrawSkip = 1ull << 40,
     // vkoff (11-05): draws with none of the dynamic states' dirty flags set skip their updates.
     DynamicStateSkip = 1ull << 41,
+    // samestate (11-05): constant buffers unchanged since the previous draw keep its stream copy.
+    UniformSlotKeep = 1ull << 43,
     // hosttime (11-06): writes of values only dynamic states read leave the next draw the repeat
     // path (Maxwell3D::SameStateDynamic).
     DynamicDeltas = 1ull << 44,
