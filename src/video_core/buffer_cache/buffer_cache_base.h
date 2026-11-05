@@ -92,6 +92,12 @@ struct Binding {
     BufferId buffer_id;
     u32 segment_first{};
     u32 segment_count{};
+    /// Storage buffers: the bytes from device_addr always marked GPU-written when the shader
+    /// writes it (see MarkWrittenComputeStorage for the rest of a native binding)
+    u32 written_size{};
+    /// Past written_size, pages the guest reads back may be learned as GPU output: only when
+    /// the mapping from the pointer is small enough to be the buffer's own
+    bool learn_tail{};
 };
 
 struct MultiRangeSegment {
@@ -239,8 +245,13 @@ public:
     void UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size);
 
     /// `keep_page_gpu_data`: download GPU-written bytes sharing the written pages first (false
-    /// when the memory is going away).
+    /// when the memory is going away). Only on the thread that records GPU commands; other
+    /// threads skip the download.
     void WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data = true);
+
+    /// WriteMemory for guest writes gathered together: all of them leave the GPU-written ranges
+    /// before the GPU-written rest of their pages is downloaded, in one batch.
+    void WriteMemories(std::span<const std::pair<DAddr, std::size_t>> writes);
 
     void CachedWriteMemory(DAddr device_addr, u64 size);
 
@@ -508,10 +519,22 @@ private:
     /// Downloads the GPU-written data of several buffers with one wait for the GPU.
     void DownloadBuffersMemory(std::span<const BufferId> buffer_ids);
 
+    /// Downloads the GPU-written bytes in these ranges with one copy batch and one wait.
+    void DownloadRanges(const Common::RangeSet<DAddr>& ranges);
+
+    /// Marks a written compute binding: its first written_size bytes, and past them (a native
+    /// binding sized from the mapping) the pages known to be GPU output (see native_tail_output).
+    void MarkWrittenComputeStorage(const Binding& binding,
+                                   std::span<const std::pair<DAddr, DAddr>> cpu_written);
+
+    /// GetFlushArea: sorts the pages of native_tail_unknown the guest reads.
+    void LearnNativeTail(DAddr page_begin, DAddr page_end);
+
     void DeleteBuffer(BufferId buffer_id, bool do_not_mark = false);
 
     [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
-                                               bool is_written, bool native_pointer = false) const;
+                                               bool is_written, bool native_pointer = false,
+                                               bool dlss_dispatch = false) const;
 
     [[nodiscard]] TextureBufferBinding GetTextureBufferBinding(GPUVAddr gpu_addr, u32 size,
                                                                PixelFormat format);
@@ -633,6 +656,14 @@ private:
     VirtualRangeCache virtual_ranges;
     std::vector<MultiRangeSegment> graphics_segments;
     std::vector<MultiRangeSegment> compute_segments;
+    /// Pages the CPU wrote past a written native binding's first written_size bytes (per bind).
+    std::vector<std::pair<DAddr, DAddr>> cpu_written_tail;
+    /// Whole pages past a written native binding's first written_size bytes: not sorted yet
+    /// (unmarked, the guest's first read is trapped), GPU output the guest reads back (marked at
+    /// each bind), and the guest's own data (never marked).
+    Common::RangeSet<DAddr> native_tail_unknown;
+    Common::RangeSet<DAddr> native_tail_output;
+    Common::RangeSet<DAddr> native_tail_guest;
     u64 frame_tick = 0;
     u64 total_used_memory = 0;
     u64 buffer_bytes = 0; ///< The buffers' own size (total_used_memory may be the device's)

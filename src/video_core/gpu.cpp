@@ -11,6 +11,7 @@
 #include <list>
 #include <memory>
 #include <utility>
+#include <vector>
 
 #include "common/assert.h"
 #include "common/settings.h"
@@ -113,10 +114,16 @@ struct GPU::Impl {
 
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
-        std::function<void(PAddr, size_t)> callback_writes([this](PAddr address, size_t size) {
-            renderer->ReadRasterizer()->OnCacheInvalidation(address, size);
-        });
+        // All of the collected writes reach the caches together: applying one may download the
+        // GPU-written rest of its pages, which must not overwrite another one not applied yet.
+        thread_local std::vector<std::pair<DAddr, std::size_t>> writes;
+        writes.clear();
+        std::function<void(PAddr, size_t)> callback_writes(
+            [](PAddr address, size_t size) { writes.emplace_back(address, size); });
         system.GatherGPUDirtyMemory(callback_writes);
+        if (!writes.empty()) {
+            renderer->ReadRasterizer()->OnCacheInvalidations(writes);
+        }
     }
 
     /// Signal the ending of command list.

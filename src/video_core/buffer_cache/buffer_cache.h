@@ -180,6 +180,12 @@ void BufferCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size
 
 template <class P>
 void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data) {
+    if (!keep_page_gpu_data) {
+        // The memory is going away: what its pages held says nothing about the next mapping.
+        native_tail_unknown.Subtract(device_addr, size);
+        native_tail_output.Subtract(device_addr, size);
+        native_tail_guest.Subtract(device_addr, size);
+    }
     Nx2NoteListHostWrite(device_addr, size);
     if (IsRegionGpuModified(device_addr, size)) {
         ClearDownload(device_addr, size);
@@ -203,6 +209,45 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
     }
     memory_tracker.MarkRegionAsCpuModified(device_addr, size);
     MarkVertexBuffersStale(device_addr, size);
+}
+
+template <class P>
+void BufferCache<P>::WriteMemories(std::span<const std::pair<DAddr, std::size_t>> writes) {
+    // Guest writes to GPU-written pages arrive here together, in pieces of 64-byte blocks.
+    // WriteMemory one piece at a time downloaded the GPU-written rest of the piece's pages, and
+    // with it the cache's older copy of the pieces still to come on them: those writes were lost
+    // (Splatoon Raiders' characters, where native compute bindings mark the CPU's data
+    // GPU-written). So every piece leaves the GPU-written ranges first, and the pages download
+    // after, in one batch.
+    for (const auto& [device_addr, size] : writes) {
+        if (device_addr == 0 || size == 0) {
+            continue;
+        }
+        Nx2NoteListHostWrite(device_addr, size);
+        if (IsRegionGpuModified(device_addr, size)) {
+            ClearDownload(device_addr, size);
+            gpu_modified_ranges.Subtract(device_addr, size);
+        }
+    }
+    Common::RangeSet<DAddr> pages;
+    for (const auto& [device_addr, size] : writes) {
+        if (device_addr == 0 || size == 0) {
+            continue;
+        }
+        const DAddr page_begin = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
+        const DAddr page_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
+        if (gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
+            pages.Add(page_begin, page_end - page_begin);
+        }
+    }
+    DownloadRanges(pages);
+    for (const auto& [device_addr, size] : writes) {
+        if (device_addr == 0 || size == 0) {
+            continue;
+        }
+        memory_tracker.MarkRegionAsCpuModified(device_addr, size);
+        MarkVertexBuffersStale(device_addr, size);
+    }
 }
 
 template <class P>
@@ -247,6 +292,10 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
     DAddr device_addr_end_aligned = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
     area->start_address = device_addr_start_aligned;
     area->end_address = device_addr_end_aligned;
+    if (native_tail_unknown.Intersects(device_addr_start_aligned,
+                                       device_addr_end_aligned - device_addr_start_aligned)) {
+        LearnNativeTail(device_addr_start_aligned, device_addr_end_aligned);
+    }
     if (memory_tracker.IsRegionPreflushable(device_addr, size)) {
         area->preemtive = true;
         return area;
@@ -657,7 +706,8 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
     const auto& cbufs = launch_desc.const_buffer_config;
     const GPUVAddr ssbo_addr = cbufs[cbuf_index].Address() + cbuf_offset;
     channel_state->compute_storage_buffers[ssbo_index] =
-        StorageBufferBinding(ssbo_addr, cbuf_index, is_written, kepler_compute->IsDlssDispatch());
+        StorageBufferBinding(ssbo_addr, cbuf_index, is_written, kepler_compute->IsNativeMode(),
+                             kepler_compute->IsDlssDispatch());
 }
 
 template <class P>
@@ -1443,13 +1493,22 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         Buffer& buffer = slot_buffers[binding.buffer_id];
         TouchBuffer(buffer, binding.buffer_id);
         const u32 size = binding.size;
+        cpu_written_tail.clear();
+        if (is_written && binding.learn_tail && binding.written_size < size) {
+            // The synchronization below uploads them and forgets which they were.
+            memory_tracker.ForEachCpuModifiedRange(
+                binding.device_addr + binding.written_size, size - binding.written_size,
+                [this](u64 device_addr, u64 range_size) {
+                    cpu_written_tail.emplace_back(device_addr, device_addr + range_size);
+                });
+        }
         SynchronizeBuffer(buffer, binding.device_addr, size);
 
         const u32 offset = buffer.Offset(binding.device_addr);
         buffer.MarkUsage(offset, size);
 
         if (is_written) {
-            MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size, true);
+            MarkWrittenComputeStorage(binding, cpu_written_tail);
         }
 
         if constexpr (NEEDS_BIND_STORAGE_INDEX) {
@@ -1774,6 +1833,84 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
         Tegra::Nx2MarkGpuWritten(device_addr, size);
         Nx2NoteListWrite(buffer_id, device_addr, size);
     }
+}
+
+template <class P>
+void BufferCache<P>::MarkWrittenComputeStorage(
+    const Binding& binding, std::span<const std::pair<DAddr, DAddr>> cpu_written) {
+    if (binding.written_size != 0) {
+        MarkWrittenBuffer(binding.buffer_id, binding.device_addr, binding.written_size, true);
+    }
+    if (!binding.learn_tail) {
+        return;
+    }
+    // Past written_size, a native binding runs on over whatever its mapping holds: GPU output,
+    // but also the guest's own data (Splatoon Raiders binds 48-byte outputs that sit in 7.6 MiB
+    // of it). Marked GPU-written, the guest's writes there are applied late, and until then the
+    // cache uses its older copy (DMA sources, uploads): gray and black squares on Raiders'
+    // characters. So these pages are marked only once the guest has read one back without
+    // writing it (GPU output, such as Raiders' ink); until it's known what a page holds, its
+    // first read is trapped (LearnNativeTail).
+    const DAddr tail_begin =
+        Common::AlignUp(binding.device_addr + binding.written_size, DEVICE_PAGESIZE);
+    const DAddr tail_end = Common::AlignDown(binding.device_addr + binding.size, DEVICE_PAGESIZE);
+    if (tail_begin >= tail_end) {
+        return;
+    }
+    const u64 tail_size = tail_end - tail_begin;
+    // Known pages the guest wrote since the last bind are its own data. (On a page's first bind,
+    // that is just its first upload.)
+    for (const auto& [cpu_begin, cpu_end] : cpu_written) {
+        const DAddr begin = (std::max)(cpu_begin, tail_begin);
+        const DAddr end = (std::min)(cpu_end, tail_end);
+        if (begin >= end) {
+            continue;
+        }
+        Common::RangeSet<DAddr> known;
+        native_tail_unknown.ForEachInRange(begin, end - begin,
+                                           [&](DAddr b, DAddr e) { known.Add(b, e - b); });
+        native_tail_output.ForEachInRange(begin, end - begin,
+                                          [&](DAddr b, DAddr e) { known.Add(b, e - b); });
+        known.ForEach([this](DAddr b, DAddr e) {
+            native_tail_guest.Add(b, e - b);
+            native_tail_unknown.Subtract(b, e - b);
+            native_tail_output.Subtract(b, e - b);
+        });
+    }
+    native_tail_output.ForEachInRange(tail_begin, tail_size, [&](DAddr b, DAddr e) {
+        MarkWrittenBuffer(binding.buffer_id, b, static_cast<u32>(e - b), true);
+    });
+    Common::RangeSet<DAddr> fresh;
+    fresh.Add(tail_begin, tail_size);
+    const auto known = [&](DAddr b, DAddr e) { fresh.Subtract(b, e - b); };
+    native_tail_unknown.ForEachInRange(tail_begin, tail_size, known);
+    native_tail_output.ForEachInRange(tail_begin, tail_size, known);
+    native_tail_guest.ForEachInRange(tail_begin, tail_size, known);
+    fresh.ForEach([this](DAddr b, DAddr e) {
+        native_tail_unknown.Add(b, e - b);
+        ArmReadTraps(b, e - b);
+    });
+}
+
+template <class P>
+void BufferCache<P>::LearnNativeTail(DAddr page_begin, DAddr page_end) {
+    Common::RangeSet<DAddr> pages;
+    native_tail_unknown.ForEachInRange(page_begin, page_end - page_begin,
+                                       [&](DAddr b, DAddr e) { pages.Add(b, e - b); });
+    pages.ForEach([this](DAddr begin, DAddr end) {
+        native_tail_unknown.Subtract(begin, end - begin);
+        for (DAddr page = begin; page < end; page += DEVICE_PAGESIZE) {
+            if (memory_tracker.IsRegionCpuModified(page, DEVICE_PAGESIZE)) {
+                native_tail_guest.Add(page, DEVICE_PAGESIZE);
+                continue;
+            }
+            // Not written by the guest since its last upload: the buffer holds that data plus
+            // what the GPU wrote. Download it now, and at fences from now on.
+            native_tail_output.Add(page, DEVICE_PAGESIZE);
+            memory_tracker.MarkRegionAsGpuModified(page, DEVICE_PAGESIZE);
+            gpu_modified_ranges.Add(page, DEVICE_PAGESIZE);
+        }
+    });
 }
 
 template <class P>
@@ -2393,6 +2530,67 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
 }
 
 template <class P>
+void BufferCache<P>::DownloadRanges(const Common::RangeSet<DAddr>& ranges) {
+    if (ranges.Empty()) {
+        return;
+    }
+    if constexpr (USE_MEMORY_MAPS) {
+        struct Download {
+            BufferId buffer_id;
+            BufferCopy copy;
+        };
+        boost::container::small_vector<Download, 16> downloads;
+        u64 total_size_bytes = 0;
+        ranges.ForEach([&](DAddr range_begin, DAddr range_end) {
+            ForEachBufferInRange(range_begin, range_end - range_begin,
+                                 [&](BufferId buffer_id, Buffer& buffer) {
+                const DAddr buffer_addr = buffer.CpuAddr();
+                const DAddr begin = (std::max)(range_begin, buffer_addr);
+                const DAddr end = (std::min)(range_end, buffer_addr + buffer.SizeBytes());
+                if (begin >= end) {
+                    return;
+                }
+                memory_tracker.ForEachDownloadRangeAndClear(
+                    begin, end - begin, [&](u64 device_addr_out, u64 range_size) {
+                        gpu_modified_ranges.ForEachInRange(
+                            device_addr_out, range_size, [&](DAddr start, DAddr stop) {
+                                downloads.push_back({buffer_id, BufferCopy{
+                                                                    .src_offset = start - buffer_addr,
+                                                                    .dst_offset = total_size_bytes,
+                                                                    .size = stop - start,
+                                                                }});
+                                total_size_bytes += Common::AlignUp(stop - start, 64);
+                            });
+                        ClearDownload(device_addr_out, range_size);
+                        gpu_modified_ranges.Subtract(device_addr_out, range_size);
+                    });
+            });
+        });
+        if (total_size_bytes == 0) {
+            return;
+        }
+        auto download_staging = runtime.DownloadStagingBuffer(total_size_bytes);
+        for (Download& download : downloads) {
+            download.copy.dst_offset += download_staging.offset;
+            Buffer& buffer = slot_buffers[download.buffer_id];
+            buffer.MarkUsage(download.copy.src_offset, download.copy.size);
+            runtime.CopyBuffer(download_staging.buffer, buffer, std::span{&download.copy, 1}, true);
+        }
+        runtime.Finish();
+        const u8* const mapped_memory = download_staging.mapped_span.data();
+        for (const Download& download : downloads) {
+            const DAddr device_addr =
+                slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset;
+            device_memory.WriteBlockUnsafe(
+                device_addr, mapped_memory + (download.copy.dst_offset - download_staging.offset),
+                download.copy.size);
+        }
+    } else {
+        ranges.ForEach([this](DAddr begin, DAddr end) { DownloadMemory(begin, end - begin); });
+    }
+}
+
+template <class P>
 void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64 size) {
     boost::container::small_vector<BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
@@ -2524,34 +2722,36 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
 
 template <class P>
 Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
-                                             bool is_written, bool native_pointer) const {
+                                             bool is_written, bool native_pointer,
+                                             bool dlss_dispatch) const {
     const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
 
     if (gpu_addr == 0) {
         return NULL_BINDING;
     }
 
-    u32 size = [&]() {
-        const u32 memory_layout_size =
-            static_cast<u32>(gpu_memory->GetMemoryLayoutSize(gpu_addr));
-        // A native (Switch 2) compute program's pointer is bare: the word after it is another
-        // parameter (a dimension, stride or texture handle), not an NVN buffer size. Taking it as
-        // one bound Fortune's Weave's DLSS input features to 266 bytes and dropped the rest.
-        // Only DLSS passes size from the mapping: doing it for every native dispatch binds up to
-        // 8 MiB per buffer and slows Hyrule Warriors' fights to a few fps, then hangs them.
-        if (native_pointer) {
-            return (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
-        }
-        const u64 next_qword = gpu_memory->Read<u64>(ssbo_addr + 8);
-        const u32 packed_size = static_cast<u32>(next_qword);
-        const bool next_qword_is_size = static_cast<u32>(next_qword >> 32) == 0 &&
-                                        packed_size != 0 &&
-                                        packed_size <= memory_layout_size;
-        if (next_qword_is_size) {
-            return packed_size;
-        }
-        return (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
-    }();
+    const u32 memory_layout_size = static_cast<u32>(gpu_memory->GetMemoryLayoutSize(gpu_addr));
+    const u32 mapped_size = (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
+    const u64 next_qword = gpu_memory->Read<u64>(ssbo_addr + 8);
+    const u32 packed_size = static_cast<u32>(next_qword);
+    const bool next_qword_is_size = static_cast<u32>(next_qword >> 32) == 0 &&
+                                    packed_size != 0 && packed_size <= memory_layout_size;
+    // A native (Switch 2) compute program's pointer is bare: the word after it may be another
+    // parameter (a dimension, stride or texture handle), not an NVN buffer size. Taking it as one
+    // bound Fortune's Weave's DLSS input features to 266 bytes and dropped the rest, so a DLSS
+    // pass is bound to the mapping (up to 8 MiB). So is a buffer in its own mapping (at most
+    // 2 MiB from the pointer): Splatoon Raiders' ink buffers have their output past the NVN-style
+    // size. One in a large pool keeps the NVN-style size when the word looks like one: past it
+    // is the guest's other data (Raiders' 48-byte outputs, 7.6 MiB of it), and binding all of it
+    // slowed Hyrule Warriors: Age of Imprisonment's fights to a few fps.
+    const bool own_mapping = memory_layout_size <= 2_MiB;
+    const bool bind_mapping = native_pointer && (own_mapping || dlss_dispatch);
+    u32 size = bind_mapping || !next_qword_is_size ? mapped_size : packed_size;
+    // The mapping usually runs on past the buffer, so past the NVN-style size a written binding
+    // in its own mapping marks only pages known to be GPU output (MarkWrittenComputeStorage). A
+    // DLSS pass marks all of it.
+    const u32 written_limit =
+        native_pointer && !dlss_dispatch && next_qword_is_size ? packed_size : size;
     if (native_pointer && size != 0) {
         // Stop where the mapping or its device range does: the binding is one device range, and
         // a written one isn't split into separate ranges without sparse sources.
@@ -2583,6 +2783,9 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         .gpu_addr = aligned_gpu_addr,
         .size = binding_size,
         .buffer_id = BufferId{},
+        .written_size = (std::min)(binding_size, static_cast<u32>(gpu_addr - aligned_gpu_addr) +
+                                                     (std::min)(written_limit, size)),
+        .learn_tail = native_pointer && own_mapping && !dlss_dispatch,
     };
     return binding;
 }
