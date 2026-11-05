@@ -18,6 +18,7 @@
 #include "common/common_types.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/page_occupancy.h"
 #include "video_core/query_cache/query_base.h"
 #include "video_core/query_cache/types.h"
 
@@ -58,6 +59,10 @@ public:
     ~QueryCacheBase();
 
     void InvalidateRegion(VAddr addr, std::size_t size) {
+        // Before nearly every draw (constant buffer writes), mostly where no query was written.
+        if (InvalidationFilterOn() && !page_occupancy.MayHave(addr, size)) {
+            return;
+        }
         IterateCache<true>(addr, size,
                            [this](QueryLocation location) { InvalidateQuery(location); });
     }
@@ -158,7 +163,10 @@ protected:
                 const auto in_range2 = [&](const std::pair<u32, QueryLocation>& pair) {
                     return in_range(pair.first);
                 };
-                erase_if(contents, in_range2);
+                const auto erased = erase_if(contents, in_range2);
+                if (erased != 0) {
+                    page_occupancy.Remove(page, static_cast<s32>(erased));
+                }
             }
         }
     }
@@ -172,6 +180,8 @@ protected:
     void UnregisterPending();
 
     ::Common::unordered_map<u64, ::Common::unordered_map<u32, QueryLocation>> cached_queries;
+    /// Queries per cached_queries page
+    PageOccupancy<Core::DEVICE_PAGEBITS> page_occupancy;
     std::mutex cache_mutex;
 
     struct QueryCacheBaseImpl;

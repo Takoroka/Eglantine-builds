@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <list>
 #include <memory>
 #include <utility>
@@ -132,13 +133,37 @@ struct GPU::Impl {
         Settings::UpdateGPUAccuracy();
     }
 
-    /// Request a host GPU memory flush from the CPU.
+    /// Request a host GPU memory flush from the CPU. cpu_read: a flush for a guest CPU read,
+    /// which the split's back may run before the work queued after it (HasEarlySyncRequests).
     template <typename Func>
-    [[nodiscard]] u64 RequestSyncOperation(Func&& action) {
+    [[nodiscard]] u64 RequestSyncOperation(Func&& action, bool cpu_read = false) {
         std::unique_lock lck{sync_request_mutex};
         const u64 fence = ++last_sync_fence;
+        const bool early = cpu_read && SyncJumpEnabled();
         sync_requests.emplace_back(std::forward<Func>(action));
+        sync_request_early.push_back(early);
+        ++(early ? queued_cpu_reads : queued_other_syncs);
+        early_syncs.store(queued_other_syncs == 0 && queued_cpu_reads != 0,
+                          std::memory_order_release);
         return fence;
+    }
+
+    /// EDEN_NX2_SYNC_JUMP=0: guest CPU read flushes wait for everything queued before them.
+    static bool SyncJumpEnabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("EDEN_NX2_SYNC_JUMP");
+            return value == nullptr || value[0] != '0';
+        }();
+        return enabled;
+    }
+
+    /// Only guest CPU read flushes are queued. With the split such a request used to run only
+    /// after every command list queued before it (it rides the GPU thread's command queue): most
+    /// of the ~1 ms each of title 1's title-load reads waited. The guest saw the work it waited
+    /// for (fast fences signal when the back runs them), and the flush downloads what the back
+    /// ran, so the back runs them at its next entry boundary instead (GpuSplit::BackLoop).
+    bool HasEarlySyncRequests() const {
+        return early_syncs.load(std::memory_order_relaxed);
     }
 
     /// Obtains current flush request fence id.
@@ -163,6 +188,10 @@ struct GPU::Impl {
         while (!sync_requests.empty()) {
             auto request = std::move(sync_requests.front());
             sync_requests.pop_front();
+            --(sync_request_early.front() ? queued_cpu_reads : queued_other_syncs);
+            sync_request_early.pop_front();
+            early_syncs.store(queued_other_syncs == 0 && queued_cpu_reads != 0,
+                              std::memory_order_release);
             sync_request_mutex.unlock();
             request();
             current_sync_fence.fetch_add(1, std::memory_order_release);
@@ -243,7 +272,7 @@ struct GPU::Impl {
             // Apply collected guest writes before downloading GPU data over guest memory.
             InvalidateGPUCache();
             renderer->ReadRasterizer()->FlushRegion(raster_area.start_address, raster_area.end_address - raster_area.start_address);
-        });
+        }, true);
         gpu_thread.TickGPU(is_async);
         WaitForSyncOperation(fence);
         return raster_area;
@@ -363,6 +392,10 @@ struct GPU::Impl {
     std::condition_variable sync_cv;
 
     std::list<std::function<void()>> sync_requests;
+    std::deque<bool> sync_request_early; ///< Per request: a CPU read flush that may run early
+    u32 queued_cpu_reads{};              ///< Queued requests that may run early
+    u32 queued_other_syncs{};            ///< Queued requests that must wait for the queue
+    std::atomic<bool> early_syncs{};     ///< Only CPU read flushes are queued
     std::atomic<u64> current_sync_fence{};
     u64 last_sync_fence{};
     std::mutex sync_request_mutex;
@@ -407,6 +440,10 @@ void GPU::ReleaseChannel(Control::ChannelState& to_release) {
 
 void GPU::InitAddressSpace(Tegra::MemoryManager& memory_manager) {
     impl->InitAddressSpace(memory_manager);
+}
+
+bool GPU::HasEarlySyncRequests() const {
+    return impl->HasEarlySyncRequests();
 }
 
 void GPU::BindRenderer(std::unique_ptr<VideoCore::RendererBase> renderer) {

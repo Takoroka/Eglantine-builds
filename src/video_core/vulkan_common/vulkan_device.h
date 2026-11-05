@@ -556,6 +556,13 @@ FN_MAX_LIMIT_LIST
         return extensions.descriptor_buffer;
     }
 
+    /// Returns true if graphics pipelines sample their textures from the bindless heap
+    /// (EDEN_NX2_BINDLESS, BindlessHeap): the device has the descriptor indexing features and
+    /// limits it needs and the variable doesn't turn it off.
+    bool IsBindlessSupported() const {
+        return bindless_supported;
+    }
+
     /// Returns the descriptor buffer properties of the device.
     const VkPhysicalDeviceDescriptorBufferPropertiesEXT& DescriptorBufferProperties() const {
         return properties.descriptor_buffer;
@@ -1284,6 +1291,7 @@ private:
         VkPhysicalDeviceSubgroupProperties subgroup_properties{};
         VkPhysicalDeviceFloatControlsProperties float_controls{};
         VkPhysicalDevicePushDescriptorPropertiesKHR push_descriptor{};
+        VkPhysicalDeviceDescriptorIndexingProperties descriptor_indexing{};
         VkPhysicalDeviceDescriptorBufferPropertiesEXT descriptor_buffer{};
         VkPhysicalDeviceSubgroupSizeControlProperties subgroup_size_control{};
         VkPhysicalDeviceTransformFeedbackPropertiesEXT transform_feedback{};
@@ -1302,6 +1310,7 @@ private:
     VkPhysicalDeviceProperties2 properties2{};
 
     // Misc features
+    bool bindless_supported{};                 ///< IsBindlessSupported
     bool is_optimal_astc_supported{};          ///< Support for all guest ASTC formats.
     bool is_blit_depth24_stencil8_supported{}; ///< Support for blitting from and to D24S8.
     bool is_blit_depth32_stencil8_supported{}; ///< Support for blitting from and to D32S8.

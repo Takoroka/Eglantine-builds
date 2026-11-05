@@ -16,6 +16,7 @@
 #include "video_core/nx2_profile.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/control/channel_state.h"
+#include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
@@ -179,7 +180,7 @@ bool DmaPusher::Step() {
         bool gpu_written =
             IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
         if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
-            VideoCommon::GpuSplit::Get().WaitForWriters()) {
+            VideoCommon::GpuSplit::Get().WaitForWriters(false)) {
             gpu_written =
                 IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
         }
@@ -420,6 +421,25 @@ void DmaPusher::WatchArgument(u32 method, u32 argument) const {
     }
 }
 
+// A method sent straight to the split's back that may write guest memory where the front can't
+// tell (copies, inline-to-memory uploads, 2D blits; compute and 3D work without their front
+// state): reads ahead of the back wait for it (GpuSplit::NoteUnplacedWrite).
+static bool WritesUnplaced(Engines::EngineTypes type, u32 method) {
+    switch (type) {
+    case Engines::EngineTypes::MaxwellDMA:
+        return method == 0xc0; // LAUNCH_DMA
+    case Engines::EngineTypes::KeplerMemory:
+        return method == 0x6d; // LOAD_INLINE_DATA
+    case Engines::EngineTypes::Fermi2D:
+        return method == FERMI2D_REG_INDEX(pixels_from_memory.src_y0) + 1;
+    case Engines::EngineTypes::KeplerCompute:
+    case Engines::EngineTypes::Maxwell3D:
+        return true;
+    default:
+        return false;
+    }
+}
+
 bool DmaPusher::WantsSegment() const {
     // Only macro parameters and compute uploads read the engine's current_dma_segment.
     const auto engine = subchannel_type[dma_state.subchannel];
@@ -476,6 +496,9 @@ void DmaPusher::CallMethod(u32 argument) {
             }
             split.Method(subchannel, dma_state.method, argument, dma_state.is_last_call,
                          WantsSegment() ? &segment : nullptr);
+            if (WritesUnplaced(engine_type, dma_state.method)) {
+                split.NoteUnplacedWrite();
+            }
             return;
         }
         if (!subchannel->execution_mask[dma_state.method]) {
@@ -535,6 +558,9 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
             }
             split.MultiMethod(subchannel, dma_state.method, base_start, num_methods,
                               dma_state.method_count, WantsSegment() ? &segment : nullptr);
+            if (WritesUnplaced(engine_type, dma_state.method)) {
+                split.NoteUnplacedWrite();
+            }
             return;
         }
         VideoCommon::Nx2Profile::Scope method_scope{VideoCommon::Nx2Profile::Zone::Method};
@@ -595,7 +621,7 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
         return false;
     }
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-        split.WaitForWriters();
+        split.WaitForWriters(true);
     }
     using GpuWrittenList = VideoCore::RasterizerInterface::GpuWrittenList;
     command_headers.resize_destructive(count);

@@ -178,6 +178,9 @@ public:
     std::array<u32, NUM_STAGES> fast_bound_uniform_buffers{};
     std::array<std::array<u32, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
         uniform_buffer_binding_sizes{};
+    /// The GPU page tables' generation each uniform binding was translated with.
+    std::array<std::array<u64, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
+        uniform_buffer_map_generations{};
 };
 
 template <class P>
@@ -252,6 +255,12 @@ public:
     /// WriteMemory for guest writes gathered together: all of them leave the GPU-written ranges
     /// before the GPU-written rest of their pages is downloaded, in one batch.
     void WriteMemories(std::span<const std::pair<DAddr, std::size_t>> writes);
+
+    /// The guest may have written memory the commands that follow read (a command list starts,
+    /// a semaphore acquire is checked): pages left without write protection are read again.
+    void OnGuestSyncPoint() {
+        memory_tracker.ReArmHotPages();
+    }
 
     void CachedWriteMemory(DAddr device_addr, u64 size);
 
@@ -358,6 +367,16 @@ public:
     /// CPU and inline writes: they reach guest memory, so a synced page stays synced, but its copy
     /// no longer holds the page.
     void Nx2NoteListHostWrite(DAddr device_addr, u64 size);
+
+    /// Bytes of the index buffer the last graphics setup bound and synchronized.
+    [[nodiscard]] u32 IndexBindingSize() const noexcept {
+        return channel_state->index_buffer.size;
+    }
+
+    /// UpdateGraphicsBuffers for a draw whose storage and texture buffers are those of the last
+    /// setup: resolves the index, vertex and uniform bindings that changed. False when that
+    /// deleted buffers (joined into a new one): the full update must run.
+    [[nodiscard]] bool RefreshGraphicsBuffers(bool is_indexed);
 
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);
@@ -536,6 +555,12 @@ private:
                                                bool is_written, bool native_pointer = false,
                                                bool dlss_dispatch = false) const;
 
+    /// The binding of a storage buffer whose address and following word (its size, when the
+    /// shader packs one) were read already.
+    [[nodiscard]] Binding StorageBufferBinding(GPUVAddr gpu_addr, u64 next_qword, u32 cbuf_index,
+                                               bool is_written, bool native_pointer = false,
+                                               bool dlss_dispatch = false) const;
+
     [[nodiscard]] TextureBufferBinding GetTextureBufferBinding(GPUVAddr gpu_addr, u32 size,
                                                                PixelFormat format);
 
@@ -628,9 +653,15 @@ private:
         device_memory.ArmReadTraps(begin, end - begin);
     }
 
+    /// Adds to gpu_modified_ranges (only through here: it ends the known gaps it touches)
+    void AddGpuModifiedRange(DAddr device_addr, u64 size);
+
     Common::RangeSet<DAddr> read_trapped_ranges;
     Common::RangeSet<DAddr> gpu_modified_ranges;
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
+    /// Areas known to hold no range of gpu_modified_ranges (IsRegionGpuModified), round robin
+    std::array<std::pair<DAddr, DAddr>, 4> gpu_unmodified_gaps{};
+    size_t next_gpu_unmodified_gap = 0;
 
     // Async Buffers
     std::deque<std::optional<Async_Buffer>> async_buffers;
@@ -664,6 +695,33 @@ private:
     Common::RangeSet<DAddr> native_tail_unknown;
     Common::RangeSet<DAddr> native_tail_output;
     Common::RangeSet<DAddr> native_tail_guest;
+
+    /// The binding each compute storage buffer source gave last: the same two words read from the
+    /// constant buffer under the same page tables give the same binding, without the memory
+    /// layout lookup and address translations (every storage buffer of thousands of dispatches a
+    /// second).
+    struct StorageBindingSource {
+        size_t as_id;
+        GPUVAddr ssbo_addr;
+        std::array<u64, 2> words;
+        u64 map_generation;
+        bool is_written;
+        bool native_pointer;
+        bool dlss_dispatch;
+        bool valid;
+        Binding binding;
+    };
+    std::array<StorageBindingSource, 64> compute_storage_binding_sources{};
+
+    /// Storage buffer ranges the virtual range cache found in one piece, with the page tables
+    /// they were found under (ResolveMultiRangeStorage).
+    struct SingleRange {
+        size_t as_id;
+        GPUVAddr gpu_addr;
+        u32 size;
+        u64 map_generation;
+    };
+    std::array<SingleRange, 256> single_ranges{};
     u64 frame_tick = 0;
     u64 total_used_memory = 0;
     u64 buffer_bytes = 0; ///< The buffers' own size (total_used_memory may be the device's)
@@ -694,6 +752,8 @@ private:
         bool draw_written{};
         std::optional<Nx2Staging> copy;
     };
+    /// The word after a list copy's page: the GPU sets it once the copy is done.
+    static u32* Nx2CopyMarker(const Nx2Staging& copy);
     std::mutex nx2_list_mutex; ///< nx2_list_pages: the split's front reads the copies
     std::unordered_map<DAddr, Nx2ListPage> nx2_list_pages;
     /// Copies replaced while the GPU may still write them: freed once it is past their tick.

@@ -87,6 +87,12 @@ public:
         return pending_acquire.has_value();
     }
     [[nodiscard]] bool CanResumeAcquire(DmaPusher& dma_pusher);
+
+    /// Split GPU thread: whether a semaphore check may wait for the back thread (drain) now.
+    /// The GPU thread clears it while it has command lists to parse: a GEQUAL acquire not met
+    /// yet then parks its channel without waiting, and the front keeps feeding the back from the
+    /// other channels; the waits happen once it has nothing else to do (GPUThread loop).
+    static inline bool may_drain = true;
     /// Clears the pending acquire once it is met; false while the channel has to keep waiting.
     bool ResumeAcquire(DmaPusher& dma_pusher);
 

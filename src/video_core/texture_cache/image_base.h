@@ -128,6 +128,8 @@ struct ImageBase {
 
     u64 modification_tick = 0;
     size_t lru_index = SIZE_MAX;
+    /// Frame the texture cache last touched lru_index in (PrepareImage): the item is current.
+    u64 lru_touch_tick = ~0ULL;
 
     std::array<u32, MAX_MIP_LEVELS> mip_level_offsets{};
 

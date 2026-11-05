@@ -58,6 +58,12 @@ public:
         return t;
     }
 
+    /// Consumer side: whether nothing is queued right now.
+    [[nodiscard]] bool Empty() const noexcept {
+        return consumer.index.load(std::memory_order::relaxed) ==
+               producer.index.load(std::memory_order::acquire);
+    }
+
 private:
     enum class PushMode {
         Try,

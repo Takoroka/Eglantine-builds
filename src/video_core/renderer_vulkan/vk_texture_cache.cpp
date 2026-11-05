@@ -2499,12 +2499,33 @@ bool TextureCacheRuntime::IsFree(u64 tick) const noexcept {
     return scheduler.IsFree(tick);
 }
 
+void TextureCacheRuntime::DestroyImage(Image&& image, u64 bytes) {
+    static const bool deferred = [] {
+        const char* const value = std::getenv("EDEN_NX2_DEFERRED_FREE");
+        return value == nullptr || value[0] != '0';
+    }();
+    image.DetachFromRuntime();
+    if (!deferred) {
+        [[maybe_unused]] Image destroyed_here{std::move(image)};
+        return;
+    }
+    pending_destroy_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    image_deleter.QueueWork([this, dead = std::make_unique<Image>(std::move(image)), bytes]() mutable {
+        dead.reset();
+        pending_destroy_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+    });
+}
+
 u64 TextureCacheRuntime::GetDeviceMemoryBudget() const {
     return device.GetDeviceMemoryBudget();
 }
 
 u64 TextureCacheRuntime::GetDeviceMemorySlack() const {
     return device.GetDeviceMemorySlack();
+}
+
+bool TextureCacheRuntime::IsIntegratedGpu() const {
+    return device.IsIntegrated();
 }
 
 bool TextureCacheRuntime::CanDownloadMsaa(const VideoCommon::ImageInfo& info) const {
@@ -2585,32 +2606,17 @@ void TextureCacheRuntime::ReleaseMsaaScratchImage(VkImage image) {
 
 void TextureCacheRuntime::TickFrame() {
     static constexpr u32 MAX_UNUSED_SCRATCH_FRAMES = 60;
-    // Finished decode images wait for the next texture of their shape, up to this much memory.
-    static constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
-    const auto decode_bytes = [](const PendingTranscode& t) {
-        u64 bytes{};
-        for (u32 level = 0; level < t.levels; ++level) {
-            bytes += u64{(std::max)(t.width >> level, 1U)} * (std::max)(t.height >> level, 1U) * 4;
+    // Decode scratches unused for this long (5 s at 60 fps) go, once the GPU is done with them.
+    static constexpr u32 MaxUnusedTranscodeScratchFrames = 300;
+    std::erase_if(transcode_scratches, [this](TranscodeScratch& scratch) {
+        if (++scratch.unused_frames <= MaxUnusedTranscodeScratchFrames) {
+            return false;
         }
-        return bytes * t.layers;
-    };
-    u64 free_bytes{};
-    for (const PendingTranscode& t : free_transcodes) {
-        free_bytes += decode_bytes(t);
-    }
-    while (!pending_transcodes.empty() && scheduler.IsFree(pending_transcodes.front().tick)) {
-        PendingTranscode& done = pending_transcodes.front();
-        const u64 bytes = decode_bytes(done);
-        if (free_bytes + bytes <= MaxFreeTranscodeBytes) {
-            done.unused_frames = 0;
-            free_bytes += bytes;
-            free_transcodes.push_back(std::move(done));
-        }
-        pending_transcodes.pop_front();
-    }
-    std::erase_if(free_transcodes, [](PendingTranscode& t) {
-        return ++t.unused_frames > MAX_UNUSED_SCRATCH_FRAMES;
+        retired_transcode_scratches.push_back(std::move(scratch));
+        return true;
     });
+    std::erase_if(retired_transcode_scratches,
+                  [this](const TranscodeScratch& scratch) { return scheduler.IsFree(scratch.tick); });
     std::erase_if(msaa_scratch_images, [this](MsaaScratchImage& scratch) {
         if (!scheduler.IsFree(scratch.tick)) {
             scratch.unused_frames = 0;
@@ -2687,6 +2693,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
     if (runtime->device.HasDebuggingToolAttached()) {
         original_image.SetObjectNameEXT(VideoCommon::Name(*this).c_str());
     }
+    memory_block = original_image.GetMemoryBlock();
     current_image = &Image::original_image;
     const s32 host_levels = info.resources.levels - static_cast<s32>(host_level_offset);
     storage_image_views.resize(host_levels);
@@ -2703,6 +2710,10 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
 Image::Image(const VideoCommon::NullImageParams& params) : VideoCommon::ImageBase{params} {}
 
 Image::~Image() {
+    DetachFromRuntime();
+}
+
+void Image::DetachFromRuntime() {
     if (ENABLE_MSAA_RESOLVE_CONSUME && runtime != nullptr) {
         if (original_image) {
             runtime->EraseResolveShadow(*original_image);
@@ -2711,6 +2722,7 @@ Image::~Image() {
             runtime->EraseResolveShadow(*scaled_image);
         }
     }
+    runtime = nullptr;
 }
 
 void Image::AllocateComputeUnswizzleBuffer(u32 max_slices) {
@@ -4384,6 +4396,29 @@ VkSampler Sampler::HandleFor(const ImageView& image_view, bool is_depth) {
     return Emplace(key);
 }
 
+std::pair<VkSampler, u32> Sampler::HandleAndSlotFor(const ImageView& image_view, bool is_depth,
+                                                    BindlessTable& table) {
+    VariantKey key = MakeKey(image_view, is_depth);
+    if (variants.size() >= MAX_VARIANTS) {
+        key.srgb_border = false;
+        key.swizzle = {};
+    }
+    auto it = std::ranges::find(variants, key, &Variant::key);
+    if (it == variants.end()) {
+        const VkSampler handle = Emplace(key);
+        // Emplace may have dropped parts of the key (border color budget): find it by handle.
+        it = std::ranges::find_if(
+            variants, [handle](const Variant& variant) { return *variant.sampler == handle; });
+        if (it == variants.end()) {
+            return {handle, BindlessTable::INVALID_SLOT};
+        }
+    }
+    if (it->bindless_slot == BindlessTable::INVALID_SLOT) [[unlikely]] {
+        it->bindless_slot = table.AllocateSampler(*it->sampler);
+    }
+    return {*it->sampler, it->bindless_slot};
+}
+
 Framebuffer::Framebuffer(TextureCacheRuntime& runtime, std::span<ImageView*, NUM_RT> color_buffers,
                          ImageView* depth_buffer, const VideoCommon::RenderTargets& key)
     : render_area{VkExtent2D{
@@ -4600,36 +4635,68 @@ void TextureCacheRuntime::AccelerateImageUploadLayers(
     astc_decoder_pass->AssembleLayers(image, map, swizzles, layers);
 }
 
-void TextureCacheRuntime::TranscodeAstcToBcn(
-    Image& image, const StagingBufferRef& map,
-    std::span<const VideoCommon::SwizzleParameters> swizzles) {
-    const ImageInfo& info = image.info;
-    const u32 width = info.size.width;
-    const u32 height = info.size.height;
-    const u32 levels = static_cast<u32>(info.resources.levels);
-    const u32 layers = static_cast<u32>(info.resources.layers);
+TextureCacheRuntime::TranscodeScratch& TextureCacheRuntime::TranscodeScratchFor(u32 width,
+                                                                               u32 height,
+                                                                               u32 levels,
+                                                                               u32 layers) {
     constexpr VkFormat DecodeFormat = VK_FORMAT_A8B8G8R8_UNORM_PACK32;
-    // A decode image of the same shape the GPU is done with: title 1's title screen decodes
-    // dozens of textures a frame, mostly of a few shapes. Making one took 263 us; from VMA's
-    // shared blocks 90 us, but freeing them there left ~1 GB of those blocks unused.
-    const auto reusable = std::ranges::find_if(free_transcodes, [&](const PendingTranscode& t) {
-        return t.width == width && t.height == height && t.levels == levels && t.layers == layers;
-    });
-    PendingTranscode pending;
-    if (reusable != free_transcodes.end()) {
-        pending = std::move(*reusable);
-        free_transcodes.erase(reusable);
-    } else {
-        pending = PendingTranscode{
-            .tick = 0,
-            .image = memory_allocator.CreateImage(VkImageCreateInfo{
+    // At most this much is kept. A texture needing more on its own gets a decode image of its
+    // exact shape, freed after it.
+    static constexpr u64 MaxScratchBytes = u64{256} << 20;
+    const auto scratch_bytes = [](u32 w, u32 h, u32 scratch_levels, u32 scratch_layers) {
+        u64 bytes{};
+        for (u32 level = 0; level < scratch_levels; ++level) {
+            bytes += u64{(std::max)(w >> level, 1U)} * (std::max)(h >> level, 1U) * 4;
+        }
+        return bytes * scratch_layers;
+    };
+    // Power-of-two sizes with every level, so that textures of other shapes fit too.
+    const u32 class_width = std::bit_ceil(width);
+    const u32 class_height = std::bit_ceil(height);
+    const u32 class_levels =
+        (std::max)(levels, static_cast<u32>(std::bit_width((std::max)(class_width, class_height))));
+    const u64 class_bytes = scratch_bytes(class_width, class_height, class_levels, layers);
+    TranscodeScratch* best = nullptr;
+    for (TranscodeScratch& scratch : transcode_scratches) {
+        if (scratch.width >= width && scratch.height >= height && scratch.levels >= levels &&
+            scratch.layers >= layers && (best == nullptr || scratch.bytes < best->bytes)) {
+            best = &scratch;
+        }
+    }
+    // One far larger than this texture's own class stays in use only for large textures, so it
+    // can go once they stop coming.
+    if (best != nullptr && best->bytes <= class_bytes * 4) {
+        return *best;
+    }
+    const bool single_use = class_bytes > MaxScratchBytes;
+    const u32 scratch_width = single_use ? width : class_width;
+    const u32 scratch_height = single_use ? height : class_height;
+    const u32 scratch_levels = single_use ? levels : class_levels;
+    const u64 bytes = single_use ? scratch_bytes(width, height, levels, layers) : class_bytes;
+    if (!single_use) {
+        u64 kept_bytes{};
+        for (const TranscodeScratch& scratch : transcode_scratches) {
+            kept_bytes += scratch.bytes;
+        }
+        // Room for it: the least recently used ones go first.
+        while (kept_bytes + bytes > MaxScratchBytes && !transcode_scratches.empty()) {
+            const auto oldest = std::ranges::max_element(
+                transcode_scratches, {}, [](const TranscodeScratch& s) { return s.unused_frames; });
+            kept_bytes -= oldest->bytes;
+            retired_transcode_scratches.push_back(std::move(*oldest));
+            transcode_scratches.erase(oldest);
+        }
+    }
+    TranscodeScratch& scratch = transcode_scratches.emplace_back(TranscodeScratch{
+        .image = memory_allocator.CreateImage(
+            VkImageCreateInfo{
                 .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
                 .pNext = nullptr,
                 .flags = 0,
                 .imageType = VK_IMAGE_TYPE_2D,
                 .format = DecodeFormat,
-                .extent = {width, height, 1},
-                .mipLevels = levels,
+                .extent = {scratch_width, scratch_height, 1},
+                .mipLevels = scratch_levels,
                 .arrayLayers = layers,
                 .samples = VK_SAMPLE_COUNT_1_BIT,
                 .tiling = VK_IMAGE_TILING_OPTIMAL,
@@ -4638,26 +4705,51 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
                 .queueFamilyIndexCount = 0,
                 .pQueueFamilyIndices = nullptr,
                 .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-            }, true),
-            .views = {},
-            .width = width,
-            .height = height,
-            .levels = levels,
-            .layers = layers,
-            .unused_frames = 0,
-        };
-        for (u32 level = 0; level < levels; ++level) {
-            pending.views.push_back(
-                MakeStorageView(device.GetLogical(), level, *pending.image, DecodeFormat));
-        }
+            },
+            true),
+        .views = {},
+        .width = scratch_width,
+        .height = scratch_height,
+        .levels = scratch_levels,
+        .layers = layers,
+        .bytes = bytes,
+        .tick = 0,
+        .unused_frames = 0,
+        .initialized = false,
+        .single_use = single_use,
+    });
+    for (u32 level = 0; level < scratch_levels; ++level) {
+        scratch.views.push_back(
+            MakeStorageView(device.GetLogical(), level, *scratch.image, DecodeFormat));
     }
+    return scratch;
+}
+
+void TextureCacheRuntime::TranscodeAstcToBcn(
+    Image& image, const StagingBufferRef& map,
+    std::span<const VideoCommon::SwizzleParameters> swizzles) {
+    const ImageInfo& info = image.info;
+    const u32 width = info.size.width;
+    const u32 height = info.size.height;
+    const u32 levels = static_cast<u32>(info.resources.levels);
+    const u32 layers = static_cast<u32>(info.resources.layers);
+    // Title 1 transcodes up to ~500 textures a frame while it streams them in, in hundreds of
+    // shapes. With a decode image per shape (dedicated memory, reused only by the same shape a
+    // frame later) it made ~1,300 a minute and making and freeing them took 0.27 ms a transcode;
+    // with a scratch per size class reused texture after texture, 97% of transcodes take a kept
+    // one (~90 made a minute, 0.03 ms a transcode).
+    TranscodeScratch& scratch = TranscodeScratchFor(width, height, levels, layers);
+    // A scratch decoded into before is in the general layout, and the barrier for an initialized
+    // image waits for the compute work before it too: the last encode reading this scratch. The
+    // decode writes and the encode reads only each level's part of the texture's size.
+    const bool initialized = std::exchange(scratch.initialized, true);
     astc_decoder_pass->AssembleInto(
         info, 0, image.guest_size_bytes,
         ASTCDecoderPass::Target{
-            .image = *pending.image,
+            .image = *scratch.image,
             .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .initialized = false,
-            .level_view = [&pending](s32 level) { return *pending.views[level]; },
+            .initialized = initialized,
+            .level_view = [&scratch](s32 level) { return *scratch.views[level]; },
             .wait = true,
         },
         map, swizzles);
@@ -4691,7 +4783,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     }
     const auto output = staging_buffer_pool.Request(total, MemoryUsage::DeviceLocal);
     for (u32 level = 0; level < levels; ++level) {
-        bc_encoder_pass->Encode(*pending.views[level], copies[level].image_extent.width,
+        bc_encoder_pass->Encode(*scratch.views[level], copies[level].image_extent.width,
                                 copies[level].image_extent.height, layers, bc3, output.buffer,
                                 output.offset, total, copies[level].buffer_offset);
     }
@@ -4706,8 +4798,13 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
                                0, barrier);
     });
     image.UploadMemory(output.buffer, output.offset, copies);
-    pending.tick = scheduler.CurrentTick();
-    pending_transcodes.push_back(std::move(pending));
+    scratch.tick = scheduler.CurrentTick();
+    scratch.unused_frames = 0;
+    if (scratch.single_use) {
+        retired_transcode_scratches.push_back(std::move(scratch));
+        transcode_scratches.erase(transcode_scratches.begin() +
+                                  (&scratch - transcode_scratches.data()));
+    }
 }
 
 void TextureCacheRuntime::TransitionImageLayout(Image& image) {

@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <memory>
+#include <shared_mutex>
 #include <type_traits>
 #include "common/container/unordered_map.h"
 #include <vector>
@@ -111,8 +112,9 @@ public:
                            Scheduler& scheduler, DescriptorPool& descriptor_pool,
                            GuestDescriptorQueue& guest_descriptor_queue,
                            DescriptorBufferRing& descriptor_buffer_ring,
-                           RenderPassCache& render_pass_cache, BufferCache& buffer_cache,
-                           TextureCache& texture_cache, VideoCore::ShaderNotify& shader_notify_);
+                           BindlessHeap& bindless_heap, RenderPassCache& render_pass_cache,
+                           BufferCache& buffer_cache, TextureCache& texture_cache,
+                           VideoCore::ShaderNotify& shader_notify_);
     ~PipelineCache();
 
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
@@ -125,10 +127,50 @@ public:
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback);
 
+    /// Waits for the translations running on workers and starts no more: guest GPU memory, which
+    /// they read texture descriptors from, goes away at shutdown.
+    void StopTranslation();
+
 private:
+    /// A graphics pipeline translated and built on a pipeline worker (asynchronous shaders).
+    struct PendingGraphicsPipeline {
+        enum class State : u8 {
+            Queued,
+            Running,
+            Done,
+            Cancelled, ///< Built on the GPU thread instead, before a worker took it
+        };
+        GraphicsPipelineCacheKey key;
+        GraphicsEnvironments environments;
+        std::unique_ptr<GraphicsPipeline> pipeline;
+        /// Translation read engine state the environments did not copy.
+        bool needs_gpu_thread{};
+        std::atomic<State> state{State::Queued};
+    };
+
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
 
     [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) const noexcept;
+
+    /// Whether the current draw may be skipped while its pipeline is built.
+    [[nodiscard]] bool CanSkipDraw() const noexcept;
+
+    /// Queues translation and build of the current graphics pipeline on the workers.
+    void QueueGraphicsPipeline();
+
+    /// Runs on a worker.
+    void BuildPendingPipeline(PendingGraphicsPipeline& job);
+
+    /// The pipeline a worker built, checked on the GPU thread; null when the worker could not
+    /// build it or what it read has changed since.
+    std::unique_ptr<GraphicsPipeline> TakePendingPipeline(PendingGraphicsPipeline& job);
+
+    /// Moves the pipelines workers have finished into the cache.
+    void CollectPendingPipelines();
+
+    /// Writes a new pipeline to the disk cache (and the driver's cache when it is time to).
+    void StorePipeline(const GraphicsPipeline& pipeline, const GraphicsPipelineCacheKey& key,
+                       GraphicsEnvironments& environments);
 
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
 
@@ -159,6 +201,7 @@ private:
     DescriptorPool& descriptor_pool;
     GuestDescriptorQueue& guest_descriptor_queue;
     DescriptorBufferRing& descriptor_buffer_ring;
+    BindlessHeap& bindless_heap;
     RenderPassCache& render_pass_cache;
     BufferCache& buffer_cache;
     TextureCache& texture_cache;
@@ -177,6 +220,11 @@ private:
 
     ::Common::unordered_map<ComputePipelineCacheKey, std::unique_ptr<ComputePipeline>> compute_cache;
     ::Common::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
+    /// Pipelines on the workers; their graphics_cache entries are null meanwhile.
+    ::Common::unordered_map<GraphicsPipelineCacheKey, std::shared_ptr<PendingGraphicsPipeline>>
+        pending_graphics;
+    std::shared_mutex translation_mutex; ///< Held shared by each translation on a worker
+    bool translation_stopped{};
 
     ShaderPools main_pools;
 

@@ -1561,6 +1561,8 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
             Settings::values.disable_macro_hle) {
             maxwell3d.RefreshParameters();
         }
+        // HLE programs write registers directly, past ProcessDirtyRegisters.
+        ++maxwell3d.same_state_serials[Engines::Maxwell3D::SameStateOther];
 
         if (auto program = std::get_if<HLE_DrawArraysIndirect>(&cached))
             return program->Execute(system, maxwell3d, parameters, method);

@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+
 #include "common/assert.h"
 #include "core/hle/kernel/k_event.h"
 #include "core/hle/kernel/k_readable_event.h"
@@ -61,6 +63,13 @@ Result KReadableEvent::Reset(KernelCore& kernel) {
     R_UNLESS(m_is_signaled, ResultInvalidState);
 
     m_is_signaled = false;
+    if (this == traced_event.load(std::memory_order_relaxed)) {
+        traced_clears.fetch_add(1, std::memory_order_relaxed);
+        traced_clear_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now().time_since_epoch())
+                                  .count(),
+                              std::memory_order_relaxed);
+    }
     R_SUCCEED();
 }
 

@@ -595,6 +595,81 @@ TEST_CASE("MemoryTracker: cached writes preserve tracking counts") {
     REQUIRE(rasterizer.Count() == 0);
 }
 
+namespace {
+/// Uploads the page at c and returns how many ranges were uploaded.
+int UploadPage(MemoryTracker& memory_track) {
+    int num = 0;
+    memory_track.ForEachUploadRange(c, PAGE, [&](u64, u64) { ++num; });
+    return num;
+}
+
+/// Uploads the page at c and traps a write right after it, twice: the page becomes hot.
+void MakePageHot(MemoryTracker& memory_track, RasterizerInterface& rasterizer) {
+    for (int i = 0; i < 2; ++i) {
+        REQUIRE(UploadPage(memory_track) == 1);
+        REQUIRE(rasterizer.Count(c) == 1);
+        memory_track.MarkRegionAsCpuModified(c, PAGE);
+        REQUIRE(rasterizer.Count(c) == 0);
+    }
+}
+} // Anonymous namespace
+
+TEST_CASE("MemoryTracker: Hot pages") {
+    RasterizerInterface rasterizer;
+    std::optional<MemoryTracker> memory_track(rasterizer);
+    memory_track->TickFrame(true);
+    MakePageHot(*memory_track, rasterizer);
+    // Uploaded, but not protected again.
+    REQUIRE(UploadPage(*memory_track) == 1);
+    REQUIRE(rasterizer.Count(c) == 0);
+    REQUIRE(!memory_track->IsRegionCpuModified(c, PAGE));
+    // Marked again where the guest may have written it.
+    memory_track->ReArmHotPages();
+    REQUIRE(memory_track->IsRegionCpuModified(c, PAGE));
+    REQUIRE(UploadPage(*memory_track) == 1);
+    REQUIRE(rasterizer.Count(c) == 0);
+    // A GPU write tracks it again, keeping the guest's writes for an upload.
+    memory_track->ReArmHotPages();
+    memory_track->MarkRegionAsGpuModified(c, PAGE);
+    REQUIRE(rasterizer.Count(c) == 1);
+    REQUIRE(memory_track->IsRegionGpuModified(c, PAGE));
+    REQUIRE(memory_track->IsRegionCpuModified(c, PAGE));
+    memory_track->MarkRegionAsCpuModified(c, PAGE);
+    REQUIRE(rasterizer.Count(c) == 0);
+}
+
+TEST_CASE("MemoryTracker: Hot pages off") {
+    RasterizerInterface rasterizer;
+    std::optional<MemoryTracker> memory_track(rasterizer);
+    for (int i = 0; i < 3; ++i) {
+        REQUIRE(UploadPage(*memory_track) == 1);
+        REQUIRE(rasterizer.Count(c) == 1);
+        memory_track->MarkRegionAsCpuModified(c, PAGE);
+        REQUIRE(rasterizer.Count(c) == 0);
+    }
+}
+
+TEST_CASE("MemoryTracker: Hot page uploaded too often") {
+    RasterizerInterface rasterizer;
+    std::optional<MemoryTracker> memory_track(rasterizer);
+    memory_track->TickFrame(true);
+    MakePageHot(*memory_track, rasterizer);
+    REQUIRE(UploadPage(*memory_track) == 1);
+    memory_track->ReArmHotPages();
+    REQUIRE(UploadPage(*memory_track) == 1);
+    REQUIRE(rasterizer.Count(c) == 0);
+    // The third upload in a frame protects it again, and it does not become hot again soon.
+    memory_track->ReArmHotPages();
+    REQUIRE(UploadPage(*memory_track) == 1);
+    REQUIRE(rasterizer.Count(c) == 1);
+    for (int i = 0; i < 3; ++i) {
+        memory_track->MarkRegionAsCpuModified(c, PAGE);
+        REQUIRE(rasterizer.Count(c) == 0);
+        REQUIRE(UploadPage(*memory_track) == 1);
+        REQUIRE(rasterizer.Count(c) == 1);
+    }
+}
+
 TEST_CASE("DeviceMemoryManager: UpdatePagesCachedBatch basic") {
     Core::DeviceMemory device_memory;
     Tegra::MaxwellDeviceMemoryManager manager(device_memory);

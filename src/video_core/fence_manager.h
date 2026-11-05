@@ -23,6 +23,7 @@
 #include "common/thread.h"
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_split.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/nx2_profile.h"
@@ -85,7 +86,19 @@ public:
         if constexpr (!can_async_check) {
             TryReleasePendingFences<false>();
         }
-        auto [should_flush, committed_flushes] = CommitCacheFlushes();
+        // Once the guest CPU has read GPU-written buffers (Preflushable), every later GPU write
+        // there is copied back at the next fence. In Mario Kart World that is ~4,700 fences a
+        // second (compute QMD releases after the dispatches that write them), and each recorded
+        // its copies outside the render pass and submitted, so the render pass and every bound
+        // state started over after each. With fast fences the guest does not wait for them:
+        // while the split's back has more work queued behind this fence, the copies wait for a
+        // fence that submits anyway, at most the batch window (FlushDeferredDownloads), or until
+        // the back runs out of work.
+        const bool may_defer = !delay_fence && !commit_deferred_now && BatchWindowNs() != 0 &&
+                               !query_cache.HasUncommittedFlushes() &&
+                               GpuSplit::Get().BackHasMoreWork();
+        auto [should_flush, committed_flushes] = CommitCacheFlushes(may_defer);
+        last_fence_submitted = false;
         if (!delay_fence && committed_flushes == 0 && SkipEmptyFence()) {
             Nx2Profile::Scope skipped_scope{Nx2Profile::Zone::FenceSkipped};
             func();
@@ -113,7 +126,11 @@ public:
             func();
         }
         fences.push(std::move(new_fence));
-        if (should_flush) {
+        last_fence_submitted = should_flush && Traits::QUEUE_SUBMITS;
+        // Where queueing a fence submits (Vulkan), flushing again only sent an empty command
+        // buffer: a second submit for each of the ~4,700 fences a second that carry downloads in
+        // Mario Kart World.
+        if (should_flush && !Traits::QUEUE_SUBMITS) {
             rasterizer.FlushCommands();
         }
         if constexpr (can_async_check) {
@@ -121,6 +138,22 @@ public:
             cv.notify_all();
         }
         rasterizer.InvalidateGPUCache();
+    }
+
+    /// Commits the buffer downloads fences left for later (SignalFence) once the batch window
+    /// is over, or at once with `force` (a submit comes anyway, the frame ends, the back runs
+    /// out of work). On the thread that records. Returns whether it submitted.
+    bool FlushDeferredDownloads(bool force) {
+        if (deferred_downloads_since == 0) {
+            return false;
+        }
+        if (!force && Nx2Profile::Now() - deferred_downloads_since < BatchWindowNs()) {
+            return false;
+        }
+        commit_deferred_now = true;
+        SignalReference();
+        commit_deferred_now = false;
+        return last_fence_submitted;
     }
 
     void SignalSyncPoint(u32 value) {
@@ -336,8 +369,9 @@ private:
     /// (thousands a second), mostly with nothing or only buffer data to download: each cache's
     /// lock is taken once, alone, and the fencing thread later takes only the lock of the cache
     /// with work, instead of holding both while it copies (the GPU thread's draws and uploads
-    /// waited for it).
-    CacheFlushes CommitCacheFlushes() {
+    /// waited for it). may_defer_buffers: buffer downloads may wait for a later fence when
+    /// nothing else makes this one submit (SignalFence).
+    CacheFlushes CommitCacheFlushes(bool may_defer_buffers) {
         CacheFlushes flushes{};
         {
             std::scoped_lock lock{texture_cache.mutex};
@@ -349,13 +383,37 @@ private:
         }
         {
             std::scoped_lock lock{buffer_cache.mutex};
-            if (buffer_cache.HasUncommittedFlushes()) {
+            if (!buffer_cache.HasUncommittedFlushes()) {
+                deferred_downloads_since = 0;
+            } else if (!may_defer_buffers || flushes.should_flush || !DeferBufferDownloads()) {
                 buffer_cache.CommitAsyncFlushes();
+                deferred_downloads_since = 0;
                 flushes.should_flush = true;
                 flushes.committed |= BufferFlushes;
             }
         }
         return flushes;
+    }
+
+    /// Whether buffer downloads may wait for a later fence: within the batch window from the
+    /// first fence that left them.
+    bool DeferBufferDownloads() {
+        const u64 now = Nx2Profile::Now();
+        if (deferred_downloads_since == 0) {
+            deferred_downloads_since = now;
+            return true;
+        }
+        return now - deferred_downloads_since < BatchWindowNs();
+    }
+
+    /// EDEN_NX2_DOWNLOAD_BATCH_US: how long buffer downloads may wait for a later fence, in
+    /// microseconds (1000; 0 copies them at every fence, as before).
+    static u64 BatchWindowNs() {
+        static const u64 window = [] {
+            const char* value = std::getenv("EDEN_NX2_DOWNLOAD_BATCH_US");
+            return (value != nullptr ? std::strtoull(value, nullptr, 10) : 1000ULL) * 1000ULL;
+        }();
+        return window;
     }
 
     /// Whether a fence with no downloads would do nothing, so need not be made: with fast GPU
@@ -386,6 +444,10 @@ private:
     std::deque<std::deque<std::function<void()>>> pending_operations;
     std::deque<u8> pending_flushes; ///< Per fence: the caches that committed downloads
     u32 skipped_fences{}; ///< Empty fences skipped since the last one made (GPU thread only)
+    /// Since when (Nx2Profile::Now) fences have left buffer downloads uncommitted, 0 if none
+    u64 deferred_downloads_since{};
+    bool commit_deferred_now{};  ///< FlushDeferredDownloads: the fence commits them all
+    bool last_fence_submitted{}; ///< The last SignalFence submitted (QUEUE_SUBMITS backends)
 
     std::mutex guard;
     std::mutex ring_guard;

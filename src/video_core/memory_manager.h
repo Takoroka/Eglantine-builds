@@ -62,6 +62,12 @@ public:
         return unique_identifier;
     }
 
+    /// Changes whenever a page table operation (map, sparse map, unmap) completes: results
+    /// derived from the page tables and kinds hold while it stays the same.
+    [[nodiscard]] u64 MapGeneration() const noexcept {
+        return map_generation.load(std::memory_order_acquire);
+    }
+
     /// Binds a renderer to the memory manager.
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 
@@ -77,6 +83,10 @@ public:
 
     [[nodiscard]] u8* GetPointer(GPUVAddr addr);
     [[nodiscard]] const u8* GetPointer(GPUVAddr addr) const;
+
+    /// Host pointer of the 4 KiB page at `page` for reading words as Read<u32> does: nullptr when
+    /// it has none or the Switch 2 syncpoint shim overlaps it (Read<u32> answers those).
+    [[nodiscard]] const u8* GetWordPage(GPUVAddr page) const;
 
     template <typename T>
     [[nodiscard]] inline T* GetPointer(GPUVAddr addr) noexcept {
@@ -202,6 +212,7 @@ private:
         boost::container::small_vector<std::pair<std::conditional_t<is_gpu_address, GPUVAddr, DAddr>, std::size_t>, 32>& result) const;
 
     std::atomic<GPUVAddr> native_syncpoint_shim{};
+    std::atomic<u64> map_generation{};
     Core::System& system;
     MaxwellDeviceMemoryManager& memory;
 
@@ -239,6 +250,9 @@ private:
     Common::MultiLevelPageTable<u32> page_table;
     Common::RangeMap<GPUVAddr, PTEKind> kind_map;
     Common::SparseLargeVector<u32> big_page_table_dev;
+    /// Bumped whenever page table entries may have changed: GpuToCpuAddress's per-thread cached
+    /// translations hold while it is the same.
+    std::atomic<u64> translation_generation{1};
 
     std::vector<u64> big_page_continuous;
     boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> page_stash{};
@@ -246,6 +260,9 @@ private:
 
     bool native_tiling{};
     mutable std::mutex guard;
+    /// Bumped (under guard) whenever kind_map changes: GetMemoryLayoutSize's cached runs hold
+    /// while it is the same.
+    std::atomic<u64> kind_map_generation{1};
 
     static constexpr size_t continuous_bits = 64;
 

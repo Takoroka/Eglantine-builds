@@ -609,6 +609,11 @@ void RasterizerOpenGL::InvalidateGPUCache() {
     gpu.InvalidateGPUCache();
 }
 
+void RasterizerOpenGL::OnGuestSyncPoint() {
+    std::scoped_lock lock{buffer_cache.mutex};
+    buffer_cache.OnGuestSyncPoint();
+}
+
 void RasterizerOpenGL::UnmapMemory(DAddr addr, u64 size) {
     {
         std::scoped_lock lock{texture_cache.mutex};

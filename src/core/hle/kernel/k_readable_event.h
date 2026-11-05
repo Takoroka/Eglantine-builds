@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "core/hle/kernel/k_auto_object.h"
 #include "core/hle/kernel/k_synchronization_object.h"
 #include "core/hle/kernel/slab_helpers.h"
@@ -34,6 +36,12 @@ public:
     bool IsSignaled(KernelCore& kernel) const override;
     void Destroy(KernelCore& kernel) override;
     Result Reset(KernelCore& kernel);
+
+    /// Present tracing (EDEN_NX2_PRESENT_TRACE): the one event whose clears are counted (the
+    /// Switch 2 vsync event), how often the game cleared it and when (steady clock, ns).
+    static inline std::atomic<const KReadableEvent*> traced_event{};
+    static inline std::atomic<u64> traced_clears{};
+    static inline std::atomic<s64> traced_clear_ns{};
 
 private:
     bool m_is_signaled{};

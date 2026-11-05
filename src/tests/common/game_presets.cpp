@@ -31,9 +31,9 @@ void CheckPreset(const Settings::Values& settings) {
     CHECK(settings.vram_usage_mode.GetValue() == Settings::VramUsageMode::Conservative);
     CHECK_FALSE(settings.use_reactive_flushing.GetValue());
     CHECK(settings.vsync_mode.GetValue() == Settings::VSyncMode::FifoRelaxed);
-    CHECK(settings.use_docked_mode.GetValue() == Settings::ConsoleMode::Handheld);
-    CHECK(settings.scaling_filter.GetValue() == Settings::ScalingFilter::ScaleForce);
-    CHECK(settings.anti_aliasing.GetValue() == Settings::AntiAliasing::Fxaa);
+    CHECK(settings.async_presentation.GetValue());
+    CHECK(settings.use_docked_mode.GetValue() == Settings::ConsoleMode::Docked);
+    CHECK(settings.anti_aliasing.GetValue() == Settings::AntiAliasing::None);
 }
 
 void CheckPreferences(const Settings::Values& settings, bool global = false) {
@@ -51,13 +51,16 @@ void CheckPreferences(const Settings::Values& settings, bool global = false) {
 }
 } // namespace
 
-TEST_CASE("Display filter defaults use ScaleForce and FXAA", "[game_presets]") {
+TEST_CASE("Display defaults are docked without anti-aliasing", "[game_presets]") {
     auto settings = std::make_unique<Settings::Values>();
-    CHECK(settings->scaling_filter.GetDefault() == Settings::ScalingFilter::ScaleForce);
-    CHECK(settings->anti_aliasing.GetDefault() == Settings::AntiAliasing::Fxaa);
+#ifndef __ANDROID__
+    CHECK(settings->use_docked_mode.GetDefault() == Settings::ConsoleMode::Docked);
+#endif
+    CHECK(settings->anti_aliasing.GetDefault() == Settings::AntiAliasing::None);
+    CHECK(settings->scaling_filter.GetDefault() == Settings::ScalingFilter::NearestNeighbor);
 }
 
-TEST_CASE("Accepted MKW settings replace visible global preferences", "[game_presets]") {
+TEST_CASE("Recommended MKW settings can be made global", "[game_presets]") {
     auto settings = std::make_unique<Settings::Values>();
     SetConflictingPreferences(*settings, false);
     Settings::SetMarioKartWorldRecommendedSettings(*settings, true);
@@ -68,44 +71,33 @@ TEST_CASE("Accepted MKW settings replace visible global preferences", "[game_pre
     CHECK(settings->gpu_accuracy.GetValue(true) == Settings::GpuAccuracy::Low);
 }
 
-TEST_CASE("MKW preset overrides saved settings for the session", "[game_presets]") {
+TEST_CASE("MKW preset fills in default settings for the session", "[game_presets]") {
     auto settings = std::make_unique<Settings::Values>();
-    SetConflictingPreferences(*settings, false);
-    SetConflictingPreferences(*settings, true);
-    REQUIRE(
-        Settings::ApplyMarioKartWorldPreset(*settings, Settings::MarioKartWorldProgramId, true));
+    REQUIRE(Settings::ApplyMarioKartWorldPreset(*settings, Settings::MarioKartWorldProgramId));
     CheckPreset(*settings);
-    CheckPreferences(*settings, true);
     for (const auto& restore : settings->linkage.restore_functions) {
         restore();
     }
-    CheckPreferences(*settings);
-    CHECK(settings->renderer_backend.UsingGlobal());
-    CHECK(settings->resolution_setup.UsingGlobal());
-    REQUIRE(
-        Settings::ApplyMarioKartWorldPreset(*settings, Settings::MarioKartWorldProgramId, true));
-    CheckPreset(*settings);
+    CHECK(settings->gpu_accuracy.UsingGlobal());
+    CHECK(settings->gpu_accuracy.GetValue() == settings->gpu_accuracy.GetDefault());
+    CHECK(settings->use_reactive_flushing.GetValue() == settings->use_reactive_flushing.GetDefault());
+}
+
+TEST_CASE("MKW preset keeps the user's own settings", "[game_presets]") {
+    auto settings = std::make_unique<Settings::Values>();
+    for (bool per_game : {false, true}) {
+        SetConflictingPreferences(*settings, per_game);
+        Settings::ApplyMarioKartWorldPreset(*settings, Settings::MarioKartWorldProgramId);
+        CheckPreferences(*settings, !per_game);
+        CHECK(settings->renderer_backend.UsingGlobal() == !per_game);
+        CHECK(settings->resolution_setup.UsingGlobal() == !per_game);
+    }
 }
 
 TEST_CASE("MKW preset does not change unrelated games", "[game_presets]") {
     auto settings = std::make_unique<Settings::Values>();
-    SetConflictingPreferences(*settings, false);
-    CHECK_FALSE(Settings::ApplyMarioKartWorldPreset(*settings, 0, true));
-    CHECK_FALSE(Settings::ApplyMarioKartWorldPreset(*settings,
-                                                    Settings::MarioKartWorldProgramId + 1, true));
-    CheckPreferences(*settings);
+    CHECK_FALSE(Settings::ApplyMarioKartWorldPreset(*settings, 0));
+    CHECK_FALSE(Settings::ApplyMarioKartWorldPreset(*settings, Settings::MarioKartWorldProgramId + 1));
     CHECK(settings->renderer_backend.UsingGlobal());
-    CHECK(settings->resolution_setup.UsingGlobal());
-}
-
-TEST_CASE("Declining the MKW preset preserves global and per-game preferences", "[game_presets]") {
-    auto settings = std::make_unique<Settings::Values>();
-    for (bool per_game : {false, true}) {
-        SetConflictingPreferences(*settings, per_game);
-        CHECK_FALSE(Settings::ApplyMarioKartWorldPreset(*settings,
-                                                        Settings::MarioKartWorldProgramId, false));
-        CheckPreferences(*settings);
-        CHECK(settings->renderer_backend.UsingGlobal() == !per_game);
-        CHECK(settings->resolution_setup.UsingGlobal() == !per_game);
-    }
+    CHECK(settings->gpu_accuracy.GetValue() == settings->gpu_accuracy.GetDefault());
 }

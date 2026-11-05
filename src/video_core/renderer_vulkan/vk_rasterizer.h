@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 
 #include <boost/container/static_vector.hpp>
 
@@ -17,6 +18,7 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/blit_image.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
+#include "video_core/renderer_vulkan/vk_bindless_heap.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_fence_manager.h"
@@ -106,6 +108,7 @@ public:
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
     void InvalidateRegion(DAddr addr, u64 size,
                           VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
+    void OnGuestSyncPoint() override;
     void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) override;
     void OnCacheInvalidation(DAddr addr, u64 size) override;
     void OnCacheInvalidations(std::span<const std::pair<DAddr, std::size_t>> writes) override;
@@ -156,6 +159,9 @@ public:
     void BindChannel(Tegra::Control::ChannelState& channel) override;
 
     void ReleaseChannel(s32 channel_id) override;
+
+    void OnGpuShutdown() override;
+
     std::optional<FramebufferTextureInfo> AccelerateDisplay(const Tegra::FramebufferConfig& config,
                                                             VAddr framebuffer_addr,
                                                             u32 pixel_stride);
@@ -182,7 +188,37 @@ private:
     /// the GPU makes them now (BufferCache::Nx2CopyListPages).
     void SubmitNx2ListCopies();
 
-    void UpdateDynamicStates();
+    void UpdateDynamicStates(GraphicsPipeline* pipeline);
+
+    /// Why the draw at hand can't reuse the previous draw's setup as it is (0: it can). With only
+    /// the buffer bits set, RefreshBuffers may redo just the buffer bindings.
+    enum RepeatRefusalBits : u32 {
+        RefusalRegisters = 1u << 0,
+        RefusalBackEvents = 1u << 1,
+        RefusalSetupEvents = 1u << 2,
+        RefusalRecords = 1u << 3,
+        RefusalExcluded = 1u << 4,
+        RefusalNoPrevious = 1u << 5,
+        RefusalUniforms = 1u << 6,    ///< constant buffer uploads, addresses or binds
+        RefusalGeometry = 1u << 7,    ///< vertex or index buffer addresses
+        RefusalBufferEvents = 1u << 8, ///< uploads' cache invalidations, uniform binds
+        RefusalIndexRange = 1u << 9,  ///< more indices than the setup synchronized
+        RefusalBuffers = RefusalUniforms | RefusalGeometry | RefusalBufferEvents | RefusalIndexRange,
+    };
+    [[nodiscard]] u32 RepeatRefusal(bool is_indexed) const;
+    /// With only buffer refusals: whether the changes left what else the setup read alone (the
+    /// constant buffer words with texture handles and storage buffer addresses, texture
+    /// descriptors, images, shaders).
+    [[nodiscard]] bool CanRefreshBuffers() const;
+    /// After a draw's setup: what the next draw compares against.
+    void RememberDrawSetup(GraphicsPipeline* pipeline, bool is_indexed, u64 setup_events_seen);
+    /// After a draw's buffer refresh.
+    void RememberBufferRefresh(bool is_indexed);
+    /// Something a draw's setup reads may have changed outside the 3D registers (rasterizer calls
+    /// for other work, cache invalidations from guest threads, counted once they are done).
+    void NoteSetupChange() noexcept {
+        setup_events.fetch_add(1, std::memory_order_release);
+    }
 
     void HandleTransformFeedback();
 
@@ -232,6 +268,7 @@ private:
     GuestDescriptorQueue guest_descriptor_queue;
     ComputePassDescriptorQueue compute_pass_descriptor_queue;
     DescriptorBufferRing descriptor_buffer_ring;
+    BindlessHeap bindless_heap;
     BlitImageHelper blit_image;
     RenderPassCache render_pass_cache;
 
@@ -253,6 +290,24 @@ private:
 
     u32 draw_counter = 0;
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
+
+    std::atomic<u64> setup_events{};
+    u64 buffer_events{}; ///< InnerInvalidation and uniform binds (split back thread)
+    /// The last draw whose setup the next draw may reuse (RepeatRefusal).
+    struct RepeatableDraw {
+        GraphicsPipeline* pipeline{};
+        std::array<u64, Tegra::Engines::Maxwell3D::NumSameStateKinds> serials{};
+        u64 back_events{};
+        u64 setup_events{};
+        u64 buffer_events{};
+        u64 record_serial{};
+        u64 written_images{};
+        u64 invalidated_shader_pages{};
+        u64 index_limit{}; ///< bytes of the index buffer the setup synchronized
+        Tegra::Engines::Maxwell3D::Regs::PrimitiveTopology topology{};
+        bool is_indexed{};
+        bool valid{};
+    } repeat;
 };
 
 } // namespace Vulkan

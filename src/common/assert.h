@@ -23,13 +23,13 @@ void AssertFailSoftImpl();
 #define YUZU_NO_INLINE __attribute__((noinline))
 #endif
 
+// The condition is tested in place; only a failure calls out to the (cold) message and handler.
+// With the test inside the lambda too, every passing assert was a call: millions a second on the
+// GPU threads' per-method and per-draw paths.
 #define ASSERT_MSG(_a_, ...)                                                                       \
-    ([&]() YUZU_NO_INLINE {                                                                         \
-        auto&& assert_condition = (_a_);                                                           \
-        if (!(assert_condition)) [[unlikely]] {                                                   \
-            LOG_CRITICAL(Debug, __FILE__ ": assert " __VA_ARGS__);                                \
-            AssertFailSoftImpl();                                                                  \
-        }                                                                                          \
+    ((_a_) ? void(0) : [&]() YUZU_NO_INLINE {                                                      \
+        LOG_CRITICAL(Debug, __FILE__ ": assert " __VA_ARGS__);                                    \
+        AssertFailSoftImpl();                                                                      \
     }())
 #define ASSERT(_a_) ASSERT_MSG(_a_, "{}", #_a_)
 

@@ -6,15 +6,18 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <deque>
 #include <memory>
 #include <optional>
 #include <span>
 
+#include "common/thread_worker.h"
 #include "video_core/texture_cache/texture_cache_base.h"
 
 #include "shader_recompiler/shader_info.h"
+#include "video_core/renderer_vulkan/vk_bindless_table.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_dlss_network_probe.h"
 #include "video_core/renderer_vulkan/vk_fsr3_upscaler.h"
@@ -80,9 +83,22 @@ public:
 
     [[nodiscard]] bool IsFree(u64 tick) const noexcept;
 
+    /// Destroys a deleted image the GPU is done with, on the image deleter thread: returning its
+    /// memory to the driver (vkFreeMemory of dedicated allocations) took ~1.2% of the GPU
+    /// thread's busy time in title 1's races. EDEN_NX2_DEFERRED_FREE=0 destroys it here.
+    void DestroyImage(Image&& image, u64 bytes);
+
+    /// Bytes of the images handed to the deleter thread that it has not freed yet.
+    [[nodiscard]] u64 PendingDestroyBytes() const noexcept {
+        return pending_destroy_bytes.load(std::memory_order_relaxed);
+    }
+
     u64 GetDeviceMemoryBudget() const;
 
     u64 GetDeviceMemorySlack() const;
+
+    /// Device memory is the system's RAM (the collector keeps its fixed cap there).
+    bool IsIntegratedGpu() const;
 
     bool CanReportMemoryUsage() const;
 
@@ -211,6 +227,9 @@ public:
     DescriptorPool& descriptor_pool;
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
 
+    /// Bindless textures: the slots of the image views and samplers the draws use.
+    BindlessTable bindless_table;
+
     /// FSR 3.1 in place of a DLSS evaluation (TemporalUpscale), created on first use.
     bool UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageView& input_color,
                          ImageView& motion_vectors, ImageView& depth,
@@ -250,24 +269,31 @@ public:
     std::optional<BcEncoderPass> bc_encoder_pass;
 
     /// ASTC decoded on the GPU and re-compressed to BC1/BC3 there (accelerate_astc=Gpu with
-    /// astc_recompression=Bc1/Bc3): decode into a temporary RGBA8 image, encode, copy.
+    /// astc_recompression=Bc1/Bc3): decode into an RGBA8 scratch image, encode, copy.
     void TranscodeAstcToBcn(Image& image, const StagingBufferRef& map,
                             std::span<const VideoCommon::SwizzleParameters> swizzles);
 
-    /// Temporary decode images, reusable once the GPU is past `tick`.
-    struct PendingTranscode {
-        u64 tick;
+    /// An RGBA8 decode image kept for every texture that fits in it: power-of-two sizes with
+    /// every level. A decode waits for the previous encode reading it instead of taking an image
+    /// of its own.
+    struct TranscodeScratch {
         vk::Image image;
-        std::vector<vk::ImageView> views;
+        std::vector<vk::ImageView> views; ///< Storage view of each level
         u32 width;
         u32 height;
         u32 levels;
         u32 layers;
+        u64 bytes;
+        u64 tick; ///< Last use on the GPU
         u32 unused_frames;
+        bool initialized; ///< Decoded into before (in the general layout)
+        bool single_use;  ///< Too large to keep: freed once the GPU is done with it
     };
-    std::deque<PendingTranscode> pending_transcodes;
-    /// Decode images the GPU is done with, for the next texture of the same shape.
-    std::vector<PendingTranscode> free_transcodes;
+    /// A scratch that `width`x`height` textures with `levels` and `layers` fit in.
+    TranscodeScratch& TranscodeScratchFor(u32 width, u32 height, u32 levels, u32 layers);
+    std::vector<TranscodeScratch> transcode_scratches;
+    /// Scratches taken out of use, freed once the GPU is past their tick.
+    std::vector<TranscodeScratch> retired_transcode_scratches;
 
     std::optional<BlockLinearUnswizzle3DPass> bl3d_unswizzle_pass;
     const Settings::ResolutionScalingInfo& resolution;
@@ -299,6 +325,10 @@ public:
     std::vector<MsaaScratchImage> msaa_scratch_images;
     ::Common::unordered_map<VkImage, ResolveShadow> resolve_shadows;
     std::vector<std::pair<u64, ResolveShadow>> pending_resolve_shadows;
+
+    std::atomic<u64> pending_destroy_bytes{};
+    /// Last: destroyed (joined) first, while what its work uses is still alive.
+    Common::ThreadWorker image_deleter{1, "ImageDeleter", {}, Common::ThreadPlacement::Background};
 };
 
 class Framebuffer {
@@ -430,6 +460,10 @@ public:
     Image(Image&&) = default;
     Image& operator=(Image&&) = default;
 
+    /// Drops what the runtime keeps for this image (its MSAA resolve shadows). After it, the
+    /// image's destruction only releases its own Vulkan objects and can run on another thread.
+    void DetachFromRuntime();
+
     void UploadMemory(VkBuffer buffer, VkDeviceSize offset,
                       std::span<const VideoCommon::BufferImageCopy> copies);
 
@@ -461,7 +495,7 @@ public:
 
     /// Where the image's memory lies, for the collector (TextureCache::RunGarbageCollector).
     [[nodiscard]] vk::Image::MemoryBlock MemoryBlock() const noexcept {
-        return original_image.GetMemoryBlock();
+        return memory_block;
     }
 
     /// Returns true when the image is already initialized and mark it as initialized
@@ -615,6 +649,9 @@ private:
 
     vk::Image original_image;
     vk::Image scaled_image;
+    /// original_image's memory, which stays where it was put: asked of VMA once rather than for
+    /// every image at each collector pass.
+    vk::Image::MemoryBlock memory_block{};
 
     vk::Buffer compute_unswizzle_buffer;
     VkDeviceSize compute_unswizzle_buffer_size = 0;
@@ -667,6 +704,16 @@ public:
 
     [[nodiscard]] VkImageView Handle(Shader::TextureType texture_type) const noexcept {
         return *image_views[static_cast<size_t>(texture_type)];
+    }
+
+    /// This view's bindless image slot for `texture_type` (allocated on first use); INVALID_SLOT
+    /// when the table is full or the view has no handle of that type.
+    [[nodiscard]] u32 BindlessSlot(BindlessTable& table, Shader::TextureType texture_type) {
+        const VkImageView handle = Handle(texture_type);
+        if (handle == VK_NULL_HANDLE) {
+            return BindlessTable::INVALID_SLOT;
+        }
+        return bindless_slots.Get(table, texture_type, handle);
     }
 
     [[nodiscard]] VkImage ImageHandle() const noexcept {
@@ -739,6 +786,8 @@ private:
     bool requires_border_color_format = false;
     bool supports_minmax_filter = false;
     bool has_identity_swizzle = true;
+
+    BindlessViewSlots bindless_slots;
 };
 
 class ImageAlloc : public VideoCommon::ImageAllocBase {};
@@ -773,6 +822,11 @@ public:
 
     [[nodiscard]] VkSampler HandleFor(const ImageView& image_view, bool is_depth);
 
+    /// HandleFor's variant and its bindless sampler slot (allocated on first use; INVALID_SLOT
+    /// when the table is full).
+    [[nodiscard]] std::pair<VkSampler, u32> HandleAndSlotFor(const ImageView& image_view,
+                                                             bool is_depth, BindlessTable& table);
+
 private:
     struct VariantKey {
         bool reduce_anisotropy;
@@ -792,6 +846,7 @@ private:
     struct Variant {
         VariantKey key;
         vk::Sampler sampler;
+        u32 bindless_slot = BindlessTable::INVALID_SLOT;
     };
 
     static constexpr size_t MAX_VARIANTS = 32;

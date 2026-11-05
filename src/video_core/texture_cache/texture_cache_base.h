@@ -41,6 +41,7 @@
 #include "video_core/surface.h"
 #include "video_core/texture_cache/descriptor_table.h"
 #include "video_core/texture_cache/image_base.h"
+#include "video_core/page_occupancy.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/render_targets.h"
@@ -139,6 +140,11 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 pressure_margin{};        ///< Extra room under the budget after images did not fit
     u64 pressure_quiet_frames{};  ///< Frames since the last such image
     u64 slack_margin{};           ///< Extra room for allocator block space the driver counts as used
+    u64 budget_critical_memory{}; ///< The thresholds by the budget alone, before MaxCriticalMemory
+    u64 budget_expected_memory{};
+    bool thresholds_overridden{}; ///< EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB set
+    u64 gc_expected_memory{};     ///< The thresholds of the collector pass (RunGarbageCollector)
+    u64 gc_critical_memory{};
     u64 astc_opaque_images{};
     u64 astc_alpha_images{};
     std::vector<u8> astc_scan_buffer;
@@ -246,6 +252,25 @@ public:
     /// Get the sampler id from the graphics/compute descriptor table in the specified index
     SamplerId GetSamplerId(u32 index, bool compute);
 
+    /// Goes up whenever graphics textures resolved earlier could resolve differently or need
+    /// preparing again: a CPU write or unmap of an image, an image registered, unregistered,
+    /// deleted or rescaled, a new image or alias, a modification of an image with aliases, a
+    /// graphics TIC/TSC entry read as new or changed (the tables keep one copy for all draws), a
+    /// change of the graphics tables' address or limit, a channel switch, and once a frame (the
+    /// LRU touch). A draw may reuse the views and samplers it resolved while this is unchanged
+    /// and ImageTableMatches/SamplerTableMatches hold for each of its handles.
+    [[nodiscard]] u64 TextureSetGeneration() const noexcept {
+        return texture_set_generation;
+    }
+
+    /// True when VisitImageView(tic_handle, false) would return the view it returned last time
+    /// for this handle without doing any work: the graphics TIC entry is unchanged in guest
+    /// memory (or out of the table's limit, which resolves to the null view).
+    [[nodiscard]] bool ImageTableMatches(u32 tic_handle);
+
+    /// True when GetSamplerId(tsc_index, false) would return its last sampler, as above.
+    [[nodiscard]] bool SamplerTableMatches(u32 tsc_index);
+
     /// Return a constant reference to the given sampler id
     [[nodiscard]] const Sampler& GetSampler(SamplerId id) const noexcept;
 
@@ -269,6 +294,11 @@ public:
 
     /// Mark images in a range as modified from the CPU
     void WriteMemory(DAddr cpu_addr, size_t size);
+
+    /// False when no image is registered in the range (without the lock: callers skip WriteMemory)
+    [[nodiscard]] bool MayHaveImages(DAddr cpu_addr, size_t size) const noexcept {
+        return page_occupancy.MayHave(cpu_addr, size);
+    }
 
     /// Download contents of host images to guest memory in a region
     void DownloadMemory(DAddr cpu_addr, size_t size);
@@ -335,8 +365,22 @@ public:
 
     [[nodiscard]] bool IsRescaling(const ImageViewBase& image_view) const noexcept;
 
+    /// Whether the last draw's CheckFeedbackLoop recorded a barrier (it does so on every draw
+    /// that samples one of its render targets).
+    [[nodiscard]] bool FeedbackLoopBarrier() const noexcept {
+        return last_feedback_loop_result;
+    }
+
+    /// Counts the images WriteMemory found in written ranges.
+    [[nodiscard]] u64 WrittenImages() const noexcept {
+        return written_images;
+    }
+
     /// Create channel state.
     void CreateChannel(Tegra::Control::ChannelState& channel) final override;
+
+    /// Bind a channel for execution.
+    void BindToChannel(s32 id) final override;
 
     /// Prepare an image to be used
     void PrepareImage(ImageId image_id, bool is_modification, bool invalidate);
@@ -382,6 +426,19 @@ private:
 
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);
+
+    /// Erases an image view's slot, counting the erasure for the table entries that point at it
+    void EraseImageView(ImageViewId image_view_id);
+
+    [[nodiscard]] u32 ImageViewErasures(ImageViewId image_view_id) const noexcept {
+        return image_view_id.index < image_view_erasures.size()
+                   ? image_view_erasures[image_view_id.index]
+                   : 0;
+    }
+
+    void BumpTextureSetGeneration() noexcept {
+        ++texture_set_generation;
+    }
 
     /// Find or create a framebuffer with the given render target parameters
     FramebufferId GetFramebufferId(const RenderTargets& key);
@@ -533,17 +590,24 @@ private:
     u64 last_feedback_loop_serial = 0;
     u64 last_feedback_texture_serial = 0;
     bool last_feedback_loop_result = false;
+    u64 written_images = 0; ///< WrittenImages
     FramebufferId last_framebuffer_id{};
     u64 last_framebuffer_serial = 0;
 
     ::Common::unordered_map<RenderTargets, FramebufferId> framebuffers;
     ::Common::unordered_map<u64, std::vector<ImageMapId>, Common::IdentityHash<u64>> page_table;
+    /// Map ids per page_table page
+    PageOccupancy<YUZU_PAGEBITS> page_occupancy;
     ::Common::unordered_map<ImageId, boost::container::small_vector<ImageViewId, 16>> sparse_views;
 
     DAddr virtual_invalid_space{};
 
     /// Applies EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB and logs the thresholds.
     void ApplyThresholdOverrides(bool log = true);
+
+    /// True when the collector follows the driver's budget past MaxCriticalMemory (discrete GPU,
+    /// a budget read, no threshold override).
+    bool UseBudgetThresholds() const;
 
     /// The CPU address an image at gpu_addr is keyed by: its backing, or a fixed stand-in.
     [[nodiscard]] std::optional<DAddr> ImageCpuAddress(GPUVAddr gpu_addr, size_t size) const;
@@ -568,6 +632,8 @@ private:
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageMapView> slot_map_views;
     Common::SlotVector<ImageView> slot_image_views;
+    /// Per image view slot: how often a view was erased from it (EraseImageView)
+    std::vector<u32> image_view_erasures;
     Common::SlotVector<ImageAlloc> slot_image_allocs;
     Common::SlotVector<Sampler> slot_samplers;
     Common::SlotVector<Framebuffer> slot_framebuffers;
@@ -622,6 +688,7 @@ private:
 
     u64 modification_tick = 0;
     u64 frame_tick = 0;
+    u64 texture_set_generation = 0;
 
     Common::ThreadWorker texture_decode_worker{1, "TextureDecoder", {},
                                                Common::ThreadPlacement::Efficiency};

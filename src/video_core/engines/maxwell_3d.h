@@ -3138,6 +3138,38 @@ public:
 
     EngineHint engine_state{EngineHint::None};
 
+    /// Kinds of state a draw's setup reads. Register writes, uploads and HLE macros bump the serial
+    /// of what they change (draw parameters and registers no setup reads bump none):
+    /// RasterizerVulkan reuses the previous draw's setup while none changed, and redoes only its
+    /// buffer bindings while only uniforms and geometry changed.
+    enum SameStateKind : u8 {
+        SameStateNone,
+        SameStateUniforms, ///< constant buffer uploads, addresses and binds
+        SameStateGeometry, ///< vertex and index buffer addresses
+        SameStateOther,    ///< everything else
+        NumSameStateKinds,
+    };
+    std::array<u64, NumSameStateKinds> same_state_serials{};
+
+    /// Constant buffer memory written by uploads and slots bound since the last draw (the
+    /// rasterizer resets them).
+    struct ConstBufferChanges {
+        std::array<std::pair<GPUVAddr, GPUVAddr>, 32> writes{};
+        u32 num_writes{};
+        std::array<u32, Regs::MaxShaderStage> bound_slots{};
+        /// The words the last full draw setup read (texture handles, storage buffer addresses),
+        /// set by the rasterizer and kept across draws: an upload that writes them with the
+        /// words already there changes nothing the setup read, so it is not recorded.
+        std::array<std::pair<GPUVAddr, GPUVAddr>, 16> watched{};
+        u32 num_watched{};
+
+        void Reset() noexcept {
+            num_writes = 0;
+            bound_slots.fill(0);
+        }
+    };
+    ConstBufferChanges cbuf_changes{};
+
     enum class HLEReplacementAttributeType : u32 {
         BaseVertex = 0x0,
         BaseInstance = 0x1,
@@ -3202,6 +3234,12 @@ public:
     /// Write multiple values to the register identified by method.
     void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) override;
 
+    /// State writes the split GPU thread's front collected (FrontWrite), applied in one pass.
+    void ApplyStateRun(Core::System& system, const u64* flags, const u64* writes, u32 count,
+                       u8 tags) override;
+    /// Constant buffer data words the front collected, written to guest memory together.
+    void ApplyDataRun(Core::System& system, const u64* writes, u32 count) override;
+
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod: runs macros and macro uploads against a copy of the
     /// registers and sends the register writes to the back thread.
@@ -3212,6 +3250,18 @@ public:
 
     bool ShouldExecute() const {
         return execute_on;
+    }
+
+    /// For state kept per register outside the dirty flags: the bits a state run carries for each
+    /// write that changes the register (set once, at construction), and what the back does with a
+    /// run's bits instead of each write's ProcessDirtyRegisters: bit k bumps same_state_serials[k].
+    std::array<u8, Regs::NUM_REGS> state_run_tags{};
+    void OnStateRunTags(u8 tags) {
+        for (u32 kind = SameStateNone + 1; kind < NumSameStateKinds; ++kind) {
+            if ((tags >> kind) & 1) {
+                ++same_state_serials[kind];
+            }
+        }
     }
 
     VideoCore::RasterizerInterface& Rasterizer() {
@@ -3269,9 +3319,17 @@ public:
     void ProcessCBData(u32 value);
     void ProcessCBMultiData(const u32* start_base, u32 amount);
 
+    /// Whether an upload of `size` bytes of `words` at `address` (not written yet) covers some of
+    /// the watched words (ConstBufferChanges::watched), all of them with the words already there,
+    /// and none of the texture or sampler descriptor pools.
+    [[nodiscard]] bool RewritesWatchedWords(GPUVAddr address, const u32* words, size_t size) const;
+
     void ProcessInlineIndexMultiData(u32 method, const u32* start_base, u32 amount);
 
 private:
+    /// The kind of state each register is (same_state_serials).
+    std::array<SameStateKind, Regs::NUM_REGS> same_state_kinds{};
+
     void InitializeRegisterDefaults();
 
     void ProcessMacro(Core::System& system, u32 method, const u32* base_start, u32 amount, bool is_last_call);
@@ -3299,12 +3357,13 @@ private:
     void CallMacroMethod(Core::System& system, u32 method, std::span<const u32> parameters);
 
     /// Whether state register writes that keep the register's value are dropped (CallMethod).
+    /// Read on every register write: a plain load (a function-local static checked its guard).
+    static inline const bool skip_same_value_writes = [] {
+        const char* value = std::getenv("EDEN_NX2_SKIP_SAME");
+        return value == nullptr || value[0] != '0';
+    }();
     static bool SkipSameValueWrites() {
-        static const bool skip = [] {
-            const char* value = std::getenv("EDEN_NX2_SKIP_SAME");
-            return value == nullptr || value[0] != '0';
-        }();
-        return skip;
+        return skip_same_value_writes;
     }
 
     /// Handles writes to the macro uploading register.
@@ -3351,7 +3410,8 @@ private:
         u32 amount;
         u32 pending;
     };
-    std::array<RecentWrite, 48> recent_writes{};
+    // A power of two: this runs for every method the engine gets.
+    std::array<RecentWrite, 64> recent_writes{};
     size_t recent_write_index = 0;
     const bool record_write_history{
 #ifdef NDEBUG

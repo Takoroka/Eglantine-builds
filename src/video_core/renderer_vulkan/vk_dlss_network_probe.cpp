@@ -187,12 +187,12 @@ VideoCore::GameDlssProbe DlssNetworkProbe::Read(u32 slot) const {
         const f32 input = blocks[block * 4];
         const f32 output = blocks[block * 4 + 1];
         probe.invalid_samples += static_cast<u32>(blocks[block * 4 + 2]);
-        const f32 difference = std::abs(output - input) / (std::max(input, 0.0f) + DARK_FLOOR);
+        const f32 difference = std::abs(output - input) / ((std::max)(input, 0.0f) + DARK_FLOOR);
         if (!std::isfinite(difference) || difference > MISMATCH) {
             ++probe.mismatched;
         }
         if (std::isfinite(difference)) {
-            probe.worst = std::max(probe.worst, difference);
+            probe.worst = (std::max)(probe.worst, difference);
         }
     }
     return probe;

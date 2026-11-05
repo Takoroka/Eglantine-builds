@@ -41,6 +41,17 @@ void ShaderCache::InvalidateRegions(std::span<const std::pair<DAddr, size_t>> se
     if (sequences.empty()) {
         return;
     }
+    // Before nearly every draw (constant buffer writes): most ranges hold no program, no
+    // rejected program, and no removal waits.
+    if (InvalidationFilterOn() && !removals_pending.load(std::memory_order_acquire) &&
+        std::ranges::none_of(sequences, [this](const std::pair<DAddr, size_t>& sequence) {
+            const auto [addr, size] = sequence;
+            return page_occupancy.MayHave(addr, size) ||
+                   (addr + size > rejected_lowest.load(std::memory_order_relaxed) &&
+                    addr <= rejected_highest.load(std::memory_order_relaxed));
+        })) {
+        return;
+    }
     std::scoped_lock lock{invalidation_mutex};
     for (const auto& [addr, size] : sequences) {
         InvalidatePagesInRegion(addr, size);
@@ -268,6 +279,7 @@ void ShaderCache::Register(std::unique_ptr<ShaderInfo> data, VAddr addr, size_t 
     const u64 page_end = (addr_end + YUZU_PAGESIZE - 1) >> YUZU_PAGEBITS;
     for (u64 page = addr >> YUZU_PAGEBITS; page < page_end; ++page) {
         invalidation_cache[page].push_back(entry);
+        page_occupancy.Add(page);
     }
 
     storage.push_back(std::move(data));
@@ -292,6 +304,7 @@ void ShaderCache::InvalidatePagesInRegion(VAddr addr, size_t size) {
         if (it == invalidation_cache.end()) {
             continue;
         }
+        invalidated_pages.fetch_add(1, std::memory_order_relaxed);
         InvalidatePageEntries(it->second, addr, addr_end);
     }
 }
@@ -300,6 +313,7 @@ void ShaderCache::RemovePendingShaders() {
     if (marked_for_removal.empty()) {
         return;
     }
+    removals_pending.store(false, std::memory_order_release);
     // Remove duplicates
     std::ranges::sort(marked_for_removal);
     marked_for_removal.erase(std::unique(marked_for_removal.begin(), marked_for_removal.end()),
@@ -342,6 +356,7 @@ void ShaderCache::InvalidatePageEntries(std::vector<Entry*>& entries, VAddr addr
         UnmarkMemory(entry);
         RemoveEntryFromInvalidationCache(entry);
         marked_for_removal.push_back(entry);
+        removals_pending.store(true, std::memory_order_release);
     }
 }
 
@@ -355,6 +370,7 @@ void ShaderCache::RemoveEntryFromInvalidationCache(const Entry* entry) {
         const auto entry_it = std::ranges::find(entries, entry);
         ASSERT(entry_it != entries.end());
         entries.erase(entry_it);
+        page_occupancy.Remove(page);
     }
 }
 

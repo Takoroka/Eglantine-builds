@@ -124,6 +124,7 @@ public:
         if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
             VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
         }
+        ++record_serial;
         if (chunk->Record(command)) {
             return;
         }
@@ -150,6 +151,12 @@ public:
             std::this_thread::sleep_for(std::chrono::microseconds{100});
         }
         return true;
+    }
+
+    /// Changes with every command recorded and every loss of command buffer state: unchanged
+    /// means what the last recording bound is still bound.
+    [[nodiscard]] u64 RecordSerial() const noexcept {
+        return record_serial;
     }
 
     /// Returns the current command buffer tick.
@@ -352,6 +359,7 @@ private:
     std::function<void()> on_submit;
 
     State state;
+    u64 record_serial = 0;
 
     u32 num_renderpass_images = 0;
     std::array<VkImage, 9> renderpass_images{};

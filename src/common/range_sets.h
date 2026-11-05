@@ -29,6 +29,11 @@ public:
     /// Whether any range overlaps [base_address, base_address + size): one lookup.
     bool Intersects(AddressType base_address, size_t size) const;
 
+    /// When no range overlaps [base_address, base_address + size), the gap between the ranges
+    /// around it as [gap_begin, gap_end), and true; false when a range overlaps it. One lookup.
+    bool FreeGap(AddressType base_address, size_t size, AddressType& gap_begin,
+                 AddressType& gap_end) const;
+
     template <typename Func>
     void ForEach(Func&& func) const;
 

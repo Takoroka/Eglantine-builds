@@ -31,6 +31,13 @@ enum class Type {
     CachedCPU,
     Untracked,
     Preflushable,
+    Hot,       ///< Rewritten by the guest after every upload: kept untracked (NoteWriteTrap)
+    Recent,    ///< Tracked again by an upload this frame
+    RecentOld, ///< ... last frame
+    Strike,    ///< The last write trap came soon after such an upload
+    Uploaded1, ///< Hot page uploaded this frame
+    Uploaded2, ///< ... twice
+    Cold,      ///< Uploaded too often while hot: not made hot again until the next demotion
     Max
 };
 
@@ -120,7 +127,20 @@ struct WordManager {
         [[maybe_unused]] std::span<u64> untracked_words = Span(Type::Untracked);
         [[maybe_unused]] std::span<u64> cached_words = Span(Type::CachedCPU);
         std::vector<std::pair<VAddr, u64>> ranges;
+        std::vector<std::pair<VAddr, u64>> demoted_ranges;
         IterateWords(dirty_addr - cpu_addr, size, [&](size_t index, u64 mask) {
+            if (type == Type::CPU && enable) {
+                NoteWriteTrap(index, ~untracked_words[index] & mask);
+            } else if (type == Type::GPU && enable && (Span(Type::Hot)[index] & mask) != 0) {
+                // Untracked pages hide their GPU data (IsRegionModified, downloads): a hot page
+                // the GPU writes is tracked again first, and marked for an upload of the guest's
+                // writes since the last one.
+                const u64 demoted = Span(Type::Hot)[index] & mask;
+                Span(Type::Hot)[index] &= ~demoted;
+                Span(Type::CPU)[index] |= demoted;
+                CollectChangedRanges(true, index, untracked_words[index], demoted, demoted_ranges);
+                untracked_words[index] &= ~demoted;
+            }
             if (type == Type::CPU || type == Type::CachedCPU) {
                 CollectChangedRanges(!enable, index, untracked_words[index], mask, ranges);
             }
@@ -131,6 +151,8 @@ struct WordManager {
                 if (type == Type::CPU)
                     cached_words[index] &= ~mask;
             } else {
+                if (type == Type::CPU && (Span(Type::Hot)[index] & state_words[index] & mask) != 0)
+                    rearm_pending = true;
                 if (type == Type::CPU)
                     cached_words[index] &= ~(state_words[index] & mask);
                 state_words[index] &= ~mask;
@@ -141,6 +163,98 @@ struct WordManager {
         if (!ranges.empty()) {
             ApplyCollectedRanges(ranges, (!enable) ? 1 : -1);
         }
+        if (!demoted_ranges.empty()) {
+            ApplyCollectedRanges(demoted_ranges, 1);
+        }
+    }
+
+    /// @brief A write trap lifted the protection of these tracked pages
+    /// Pages trapped soon (this or the last frame) after two uploads in a row become hot: the
+    /// guest rewrites them for every use, and protecting them again only costs a trap (and a
+    /// protect) each time. Uploads leave hot pages untracked; MemoryTrackerBase::ReArmHotPages
+    /// marks them CPU modified again wherever the guest may have written them.
+    void NoteWriteTrap(size_t index, u64 trapped) noexcept {
+        if (trapped == 0) {
+            return;
+        }
+        std::span<u64> strike_words = Span(Type::Strike);
+        const u64 soon = trapped & (Span(Type::Recent)[index] | Span(Type::RecentOld)[index]) &
+                         ~Span(Type::GPU)[index];
+        const u64 late = trapped & ~soon;
+        const u64 promote =
+            hot_pages_enabled ? soon & strike_words[index] & ~Span(Type::Cold)[index] : 0;
+        strike_words[index] = (strike_words[index] | soon) & ~late & ~promote;
+        Span(Type::Recent)[index] &= ~trapped;
+        Span(Type::RecentOld)[index] &= ~trapped;
+        if (promote != 0) {
+            Span(Type::Hot)[index] |= promote;
+            has_hot = true;
+        }
+    }
+
+    /// @brief Counts uploads of hot pages in this frame
+    /// A hot page saves a write trap and a protect per frame, and costs an upload after every sync
+    /// point that comes before a use of it. Uploaded a third time in a frame, it is protected
+    /// again (by the upload in progress) and kept out of the hot set until the next demotion.
+    void CountHotUploads(size_t index, u64 uploaded) noexcept {
+        std::span<u64> once = Span(Type::Uploaded1);
+        std::span<u64> twice = Span(Type::Uploaded2);
+        const u64 too_often = uploaded & twice[index];
+        twice[index] |= uploaded & once[index];
+        once[index] |= uploaded;
+        if (too_often != 0) {
+            Span(Type::Hot)[index] &= ~too_often;
+            Span(Type::Cold)[index] |= too_often;
+        }
+    }
+
+    /// @brief Starts counting hot page uploads for a new frame
+    void ClearHotUploads() noexcept {
+        std::ranges::fill(Span(Type::Uploaded1), u64{0});
+        std::ranges::fill(Span(Type::Uploaded2), u64{0});
+    }
+
+    /// @brief Marks hot pages CPU modified again (they stay untracked)
+    /// @return Whether any page is hot or kept cold
+    bool ReArmHotPages() noexcept {
+        auto const hot_words = Span(Type::Hot);
+        auto const cold_words = Span(Type::Cold);
+        auto const cpu_words = Span(Type::CPU);
+        u64 any = 0;
+        for (size_t index = 0; index < num_words; ++index) {
+            cpu_words[index] |= hot_words[index];
+            // Pages kept cold keep the manager listed until the next demotion clears them.
+            any |= hot_words[index] | cold_words[index];
+        }
+        return any != 0;
+    }
+
+    /// @brief Hot pages become ordinary untracked CPU modified pages: the next upload protects them
+    void DemoteHotPages() noexcept {
+        auto const hot_words = Span(Type::Hot);
+        auto const cpu_words = Span(Type::CPU);
+        for (size_t index = 0; index < num_words; ++index) {
+            cpu_words[index] |= hot_words[index];
+            hot_words[index] = 0;
+        }
+        std::ranges::fill(Span(Type::Strike), u64{0});
+        std::ranges::fill(Span(Type::Cold), u64{0});
+        ClearHotUploads();
+        has_hot = false;
+    }
+
+    /// @brief Ages the uploads remembered for NoteWriteTrap by a frame
+    /// @return Whether any page is still remembered
+    bool AgeRecentUploads() noexcept {
+        auto const recent = Span(Type::Recent);
+        auto const recent_old = Span(Type::RecentOld);
+        u64 any = 0;
+        for (size_t index = 0; index < num_words; ++index) {
+            recent_old[index] = recent[index];
+            recent[index] = 0;
+            any |= recent_old[index];
+        }
+        return any != 0;
     }
 
     /// @brief Loop over each page in the given range.
@@ -170,12 +284,25 @@ struct WordManager {
                 mask &= ~untracked_words[index];
             const u64 word = state_words[index] & mask;
             if (clear) {
+                if (type == Type::CPU && (Span(Type::Hot)[index] & word) != 0) {
+                    CountHotUploads(index, Span(Type::Hot)[index] & word);
+                    rearm_pending = true;
+                }
+                // Hot pages are uploaded but stay untracked (NoteWriteTrap).
+                const u64 track = type == Type::CPU ? mask & ~Span(Type::Hot)[index] : mask;
                 if (type == Type::CPU || type == Type::CachedCPU) {
-                    CollectChangedRanges(true, index, untracked_words[index], mask, ranges);
+                    CollectChangedRanges(true, index, untracked_words[index], track, ranges);
+                }
+                if (type == Type::CPU) {
+                    const u64 newly_tracked = untracked_words[index] & track;
+                    if (newly_tracked != 0) {
+                        Span(Type::Recent)[index] |= newly_tracked;
+                        has_recent = true;
+                    }
                 }
                 state_words[index] &= ~mask;
                 if (type == Type::CPU || type == Type::CachedCPU)
-                    untracked_words[index] &= ~mask;
+                    untracked_words[index] &= ~track;
                 if (type == Type::CPU)
                     cached_words[index] &= ~word;
             }
@@ -217,6 +344,51 @@ struct WordManager {
             return (state_words[index] & mask) != 0 ? (result = true) : false;
         });
         return result;
+    }
+
+    /// @brief Returns true when no page of a region is CPU modified or untracked: an upload of it
+    ///        (ForEachModifiedRange of CPU pages, clearing) would find and change nothing
+    /// @param offset Offset in bytes from the start of the buffer
+    /// @param size   Size in bytes of the region to query
+    [[nodiscard]] bool IsRegionCpuClean(u64 offset, u64 size, bool hot_aware = false) const noexcept {
+        bool clean = true;
+        IterateWords(offset, size, [&](size_t index, u64 mask) {
+            if (!IsWordCpuClean(index, mask, hot_aware)) {
+                clean = false;
+            }
+            return !clean;
+        });
+        return clean;
+    }
+
+    /// @brief IsRegionCpuClean for some pages of one word
+    /// @param hot_aware A hot page is dirty only while CPU modified: an upload leaves it untracked
+    ///                  and changes nothing else (ForEachModifiedRange)
+    [[nodiscard]] bool IsWordCpuClean(size_t index, u64 mask, bool hot_aware) const noexcept {
+        u64 untracked = Span(Type::Untracked)[index];
+        if (hot_aware) {
+            untracked &= ~Span(Type::Hot)[index];
+        }
+        return ((Span(Type::CPU)[index] | untracked) & mask) == 0;
+    }
+
+    /// @brief IsRegionModified for some pages of one word
+    [[nodiscard]] bool IsWordModified(Type type, size_t index, u64 mask) const noexcept {
+        if (type == Type::GPU) {
+            mask &= ~Span(Type::Untracked)[index];
+        }
+        return (Span(type)[index] & mask) != 0;
+    }
+
+    /// @brief Marks some pages of one word CPU modified when that changes nothing but their cached
+    ///        write marks (they are CPU modified and untracked already)
+    /// @return Whether it did (else ChangeRegionState has work to do)
+    bool MarkWordCpuModifiedNoChange(size_t index, u64 mask) noexcept {
+        if ((Span(Type::CPU)[index] & Span(Type::Untracked)[index] & mask) != mask) {
+            return false;
+        }
+        Span(Type::CachedCPU)[index] &= ~mask;
+        return true;
     }
 
     /// @brief Returns a begin end pair with the inclusive modified region
@@ -322,6 +494,13 @@ struct WordManager {
     std::array<u64, size_t(Type::Max) * num_words> heap = {};
     DeviceTracker* tracker = nullptr;
     VAddr cpu_addr = 0;
+    bool hot_pages_enabled = false; ///< Set by the memory tracker
+    bool has_hot = false;           ///< A page became hot since the tracker last looked
+    bool has_recent = false;        ///< A page was remembered as recently uploaded
+    bool rearm_pending = false;     ///< A hot page lost its CPU modified mark (an upload)
+    bool in_hot_list = false;
+    bool in_recent_list = false;
+    bool in_rearm_list = false;
 };
 
 } // namespace VideoCommon

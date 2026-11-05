@@ -239,6 +239,9 @@ public:
     /// Write multiple values to the register identified by method.
     void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) override;
 
+    /// The split front's runs of a macro's inline upload words (FrontRunMacro).
+    void ApplyDataRun(Core::System& system, const u64* writes, u32 count) override;
+
     std::optional<GPUVAddr> GetIndirectComputeAddress() const {
         return indirect_compute;
     }
@@ -265,6 +268,9 @@ private:
     struct FrontState;
     FrontState& Front(VideoCommon::GpuSplit& split);
     void FrontApply(FrontState& state, u32 method, u32 argument);
+    /// The semaphore releases a front write queues, for the front's model (Nx2SemModel).
+    void FrontModelReleases(FrontState& state, u32 method, u32 argument);
+    void FrontShadowQmd(FrontState& state, GPUVAddr qmd_address, u32 argument);
     MacroEngine& FrontMacroEngine(FrontState& state);
     std::span<u32> FrontMacroPositions(FrontState& state);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);

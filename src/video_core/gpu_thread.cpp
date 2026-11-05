@@ -21,6 +21,9 @@
 #include "video_core/nx2_profile.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
+#ifdef _WIN32
+#include "common/windows/timer_resolution.h"
+#endif
 
 namespace VideoCommon::GPUThread {
 
@@ -60,6 +63,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         auto last_progress = std::chrono::steady_clock::now();
         namespace Profile = VideoCommon::Nx2Profile;
         auto& split = VideoCommon::GpuSplit::Get();
+        Tegra::Engines::Puller::may_drain = false;
         while (!stop_token.stop_requested()) {
             Profile::Report();
             split.MaybeStart(system);
@@ -69,16 +73,30 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     Profile::Scope scope{Profile::Zone::ResumePending};
                     scheduler.ResumePending(system.GPU());
                 }
+                if (split.Active() && scheduler.HasPendingChannels() && state.queue.Empty()) {
+                    // Nothing else to parse: the parked channels may now wait for the back
+                    // (Puller::may_drain); while command lists arrive they only look at memory.
+                    Profile::Scope scope{Profile::Zone::ResumePending};
+                    Tegra::Engines::Puller::may_drain = true;
+                    scheduler.ResumePending(system.GPU());
+                    Tegra::Engines::Puller::may_drain = false;
+                }
                 if (!state.queue.TryPop(next)) {
-                    // The CPU usually releases the semaphore soon after: poll for half a
-                    // millisecond before sleeping, or every wait also waits out a host sleep
-                    // (title 1 waits ~25 times a second).
+                    // The CPU usually releases the semaphore soon after: poll for two
+                    // milliseconds before sleeping, then sleep a timer tick at a time. Both GPU
+                    // threads wait meanwhile, so every bit a sleep runs past the release is
+                    // lost (title 1: ~9% of its race time is spent here; a 1 ms sleep_for
+                    // lasts up to ~1.5 ms).
                     Profile::Scope scope{Profile::Zone::PendingSleep};
                     if (std::chrono::steady_clock::now() - last_progress <
-                        std::chrono::microseconds{500}) {
+                        std::chrono::milliseconds{2}) {
                         std::this_thread::yield();
                     } else {
-                        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+#ifdef _WIN32
+                        Common::Windows::SleepForOneTick();
+#else
+                        std::this_thread::sleep_for(std::chrono::microseconds{250});
+#endif
                     }
                     continue;
                 }
@@ -96,6 +114,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 auto* const rasterizer_ptr = renderer.ReadRasterizer();
                 if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
                     Profile::Scope scope{Profile::Zone::Push};
+                    // The guest wrote what the list reads before submitting it.
+                    split.Defer([rasterizer_ptr] { rasterizer_ptr->OnGuestSyncPoint(); });
                     scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
                 } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
                     split.Defer([gpu = &system.GPU()] { gpu->TickWork(); });
@@ -125,6 +145,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             }
             if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
                 Profile::Scope scope{Profile::Zone::Push};
+                // The guest wrote what the list reads before submitting it.
+                renderer.ReadRasterizer()->OnGuestSyncPoint();
                 scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
             } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
                 Profile::Scope scope{Profile::Zone::Tick};
@@ -208,6 +230,9 @@ void ThreadManager::NotifyShutdown() {
         thread.join();
     }
     VideoCommon::GpuSplit::Get().Stop();
+    if (rasterizer) {
+        rasterizer->OnGpuShutdown();
+    }
 }
 
 } // namespace VideoCommon::GPUThread

@@ -21,6 +21,7 @@
 #include "common/polyfill_thread.h"
 #include "common/unique_function.h"
 #include "shader_recompiler/environment.h"
+#include "video_core/engines/const_buffer_info.h"
 #include "video_core/engines/maxwell_3d.h"
 
 namespace Tegra {
@@ -28,6 +29,15 @@ class Memorymanager;
 }
 
 namespace VideoCommon {
+
+/// Thrown when a program translated away from the GPU thread reads engine state that was not
+/// copied for it. The pipeline is then built on the GPU thread.
+class EngineStateMissing : public std::exception {
+public:
+    const char* what() const noexcept override {
+        return "Engine state not copied for translation";
+    }
+};
 
 /// A native (Switch 2) program after capture and lowering to Maxwell code. The shader cache keeps
 /// it so the environments built for the program's pipelines don't capture and lower it again.
@@ -111,7 +121,7 @@ protected:
     std::shared_ptr<const LoweredNativeCode> lowered_native;
 
     Tegra::Texture::TICEntry ReadTextureInfo(GPUVAddr tic_addr, u32 tic_limit,
-                                             bool via_header_index, u32 raw);
+                                             bool via_header_index, u32 raw, bool unsafe = false);
 
     Tegra::MemoryManager* gpu_memory{};
     GPUVAddr program_base{};
@@ -139,6 +149,8 @@ protected:
 
     bool has_unbound_instructions = false;
     bool has_hle_engine_state = false;
+    /// Translated on a pipeline worker: guest memory is only read without flushing.
+    bool detached = false;
 };
 
 class GraphicsEnvironment final : public GenericEnvironment {
@@ -164,9 +176,40 @@ public:
 
     std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32 bank, u32 offset) override;
 
+    /// Copies the engine state translation reads (texture descriptor table, viewport transform,
+    /// macro replacements and the constant buffers it reads values from), so the program can be
+    /// translated on a pipeline worker while the GPU thread goes on. A read outside the copy
+    /// throws EngineStateMissing.
+    void DetachFromEngine();
+
+    /// Frees the copied constant buffers, once the program is translated.
+    void ReleaseEngineCopy() noexcept;
+
+    /// Whether the texture descriptors a detached translation read still give the same types
+    /// and formats (read again, on the GPU thread).
+    [[nodiscard]] bool DescriptorsUnchanged();
+
 private:
+    static constexpr size_t NumConstBuffers = Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers;
+
+    struct EngineCopy {
+        GPUVAddr tic_address{};
+        u32 tic_limit{};
+        bool via_header_index{};
+        u32 copied_buffers{}; ///< Mask of the constant buffers with data below
+        std::array<Tegra::Engines::ConstBufferInfo, NumConstBuffers> const_buffers{};
+        std::array<std::vector<u8>, NumConstBuffers> const_buffer_data;
+        ::Common::unordered_map<u64, Tegra::Engines::Maxwell3D::HLEReplacementAttributeType>
+            replace_table;
+    };
+
+    Tegra::Texture::TICEntry ReadTextureDescriptor(u32 handle);
+
     Tegra::Engines::Maxwell3D* maxwell3d{};
     size_t stage_index{};
+    /// Shared by copies: environments are copied, not moved, and the copy is not changed once
+    /// made (but for ReleaseEngineCopy, after translation).
+    std::shared_ptr<EngineCopy> engine_copy;
 };
 
 class ComputeEnvironment final : public GenericEnvironment {
