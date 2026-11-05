@@ -61,6 +61,12 @@ public:
     /// and change no tracking: no page is CPU modified or untracked. A region not created yet is
     /// not clean (it starts all CPU modified).
     [[nodiscard]] bool IsRegionCpuClean(VAddr query_cpu_addr, u64 query_size) const noexcept {
+        // Hot pages only need an upload while CPU modified (they stay untracked on purpose).
+        size_t index{};
+        u64 mask{};
+        if (const Manager* const manager = SingleWord(query_cpu_addr, query_size, index, mask)) {
+            return manager->IsWordCpuClean(index, mask, true);
+        }
         std::size_t remaining_size{query_size};
         std::size_t page_index{query_cpu_addr >> HIGHER_PAGE_BITS};
         u64 page_offset{query_cpu_addr & HIGHER_PAGE_MASK};
@@ -68,7 +74,8 @@ public:
             const std::size_t copy_amount{
                 std::min<std::size_t>(HIGHER_PAGE_SIZE - page_offset, remaining_size)};
             const Manager* const manager{top_tier[page_index]};
-            if (manager == nullptr || !manager->IsRegionCpuClean(page_offset, copy_amount)) {
+            if (manager == nullptr ||
+                !manager->IsRegionCpuClean(page_offset, copy_amount, true)) {
                 return false;
             }
             page_index++;
@@ -80,6 +87,11 @@ public:
 
     /// Returns true if a region has been modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
+        size_t index{};
+        u64 mask{};
+        if (const Manager* const manager = SingleWord(query_cpu_addr, query_size, index, mask)) {
+            return manager->IsWordModified(Type::GPU, index, mask);
+        }
         return IteratePages<false>(query_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
             return manager->IsRegionModified(Type::GPU, offset, size);
         });
@@ -94,6 +106,14 @@ public:
 
     /// Mark region as CPU modified, notifying the device_tracker about this change
     void MarkRegionAsCpuModified(VAddr dirty_cpu_addr, u64 query_size) {
+        // The GPU thread's own writes (constant buffer data, before nearly every draw) mostly land
+        // on pages that are CPU modified and untracked already: nothing to walk or unprotect.
+        size_t index{};
+        u64 mask{};
+        Manager* const manager = SingleWord(dirty_cpu_addr, query_size, index, mask);
+        if (manager != nullptr && manager->MarkWordCpuModifiedNoChange(index, mask)) {
+            return;
+        }
         IteratePages<true>(dirty_cpu_addr, query_size, [this](Manager* manager, u64 offset, size_t size) {
             manager->hot_pages_enabled = hot_pages_enabled;
             manager->ChangeRegionState(Type::CPU, true, manager->cpu_addr + offset, size);
@@ -103,8 +123,9 @@ public:
 
     /// Unmark region as CPU modified, notifying the device_tracker about this change
     void UnmarkRegionAsCpuModified(VAddr dirty_cpu_addr, u64 query_size) {
-        IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
+        IteratePages<true>(dirty_cpu_addr, query_size, [this](Manager* manager, u64 offset, size_t size) {
             manager->ChangeRegionState(Type::CPU, false, manager->cpu_addr + offset, size);
+            ListManager(manager);
         });
     }
 
@@ -173,10 +194,14 @@ public:
     /// rewrites after every upload, left without write protection) must be uploaded again before
     /// their next use.
     void ReArmHotPages() noexcept {
-        std::erase_if(hot_managers, [](Manager* manager) {
-            manager->in_hot_list = manager->ReArmHotPages();
-            return !manager->in_hot_list;
-        });
+        // Hot pages lose their CPU modified mark only to uploads, which list their manager: the
+        // others have nothing to re-arm (this runs at every list submit and met acquire).
+        for (Manager* const manager : rearm_managers) {
+            manager->rearm_pending = false;
+            manager->in_rearm_list = false;
+            manager->ReArmHotPages();
+        }
+        rearm_managers.clear();
     }
 
     /// Once a frame: ages the uploads that make pages hot. Every DEMOTE_FRAMES frames, and while
@@ -233,6 +258,10 @@ private:
                 manager->in_recent_list = true;
                 recent_managers.push_back(manager);
             }
+        }
+        if (manager->rearm_pending && !manager->in_rearm_list) {
+            manager->in_rearm_list = true;
+            rearm_managers.push_back(manager);
         }
     }
 
@@ -310,6 +339,21 @@ private:
         }
     }
 
+    /// The manager holding all of a range that lies inside one of its words (a draw's ranges and the
+    /// constant buffer writes nearly always do), that word's index and the range's bits in it.
+    /// nullptr when the range spans words or its manager doesn't exist yet.
+    Manager* SingleWord(VAddr address, u64 size, size_t& index, u64& mask) const noexcept {
+        const VAddr last = address + size - 1;
+        if (size == 0 || address / BYTES_PER_WORD != last / BYTES_PER_WORD) {
+            return nullptr;
+        }
+        index = (address & HIGHER_PAGE_MASK) / BYTES_PER_WORD;
+        const u64 first_page = (address % BYTES_PER_WORD) / BYTES_PER_PAGE;
+        const u64 last_page = (last % BYTES_PER_WORD) / BYTES_PER_PAGE;
+        mask = (~u64{0} >> (PAGES_PER_WORD - 1 - last_page)) & (~u64{0} << first_page);
+        return top_tier[address >> HIGHER_PAGE_BITS];
+    }
+
     void CreateRegion(std::size_t page_index) {
         const VAddr base_cpu_addr = page_index << HIGHER_PAGE_BITS;
         top_tier[page_index] = GetNewManager(base_cpu_addr);
@@ -336,6 +380,7 @@ private:
     ::Common::unordered_set<u32> cached_pages;
     std::vector<Manager*> hot_managers;
     std::vector<Manager*> recent_managers;
+    std::vector<Manager*> rearm_managers; ///< Hot pages uploaded since the last ReArmHotPages
     u32 frames_since_demote = 0;
     bool hot_pages_enabled = false; ///< Until TickFrame turns them on
     DeviceTracker* device_tracker = nullptr;

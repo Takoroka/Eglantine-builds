@@ -627,9 +627,15 @@ private:
         device_memory.ArmReadTraps(begin, end - begin);
     }
 
+    /// Adds to gpu_modified_ranges (only through here: it ends the known gaps it touches)
+    void AddGpuModifiedRange(DAddr device_addr, u64 size);
+
     Common::RangeSet<DAddr> read_trapped_ranges;
     Common::RangeSet<DAddr> gpu_modified_ranges;
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
+    /// Areas known to hold no range of gpu_modified_ranges (IsRegionGpuModified), round robin
+    std::array<std::pair<DAddr, DAddr>, 4> gpu_unmodified_gaps{};
+    size_t next_gpu_unmodified_gap = 0;
 
     // Async Buffers
     Common::OverlapRangeSet<DAddr> async_downloads;

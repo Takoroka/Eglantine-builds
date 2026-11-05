@@ -364,7 +364,7 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
     gpu_modified_ranges.Subtract(*cpu_dest_address, amount);
     const bool has_new_downloads = tmp_intervals.size() != 0;
     for (const auto& pair : tmp_intervals) {
-        gpu_modified_ranges.Add(pair.first, pair.second);
+        AddGpuModifiedRange(pair.first, pair.second);
         if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
             Tegra::Nx2MarkGpuWritten(pair.first, pair.second);
             Nx2NoteListWrite(buffer_b, pair.first, pair.second);
@@ -934,7 +934,37 @@ template <class P>
 bool BufferCache<P>::IsRegionGpuModified(DAddr addr, size_t size) {
     // One lookup instead of visiting every range inside (~4% of the GPU thread for title 1's
     // inline uploads once GPU-written ranges are no longer cleared by downloads).
-    return gpu_modified_ranges.Intersects(addr, size);
+    if (size == 0) {
+        return false;
+    }
+    // Even that lookup walks a tree of every GPU-written range, before nearly every draw (the
+    // constant buffer writes FlushCaching invalidates), mostly in the same few areas: an area
+    // known to hold none answers until a GPU-written range is added there.
+    const DAddr end = addr + size;
+    for (const auto& [gap_begin, gap_end] : gpu_unmodified_gaps) {
+        if (gap_begin <= addr && end <= gap_end) {
+            return false;
+        }
+    }
+    DAddr gap_begin{};
+    DAddr gap_end{};
+    if (!gpu_modified_ranges.FreeGap(addr, size, gap_begin, gap_end)) {
+        return true;
+    }
+    gpu_unmodified_gaps[next_gpu_unmodified_gap] = {gap_begin, gap_end};
+    next_gpu_unmodified_gap = (next_gpu_unmodified_gap + 1) % gpu_unmodified_gaps.size();
+    return false;
+}
+
+template <class P>
+void BufferCache<P>::AddGpuModifiedRange(DAddr device_addr, u64 size) {
+    gpu_modified_ranges.Add(device_addr, size);
+    // Ranges only leave the set otherwise: known gaps stay gaps until a range is added in them.
+    for (auto& gap : gpu_unmodified_gaps) {
+        if (device_addr < gap.second && gap.first < device_addr + size) {
+            gap = {};
+        }
+    }
 }
 
 template <class P>
@@ -1860,7 +1890,7 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     }
     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
     MarkVertexBuffersStale(device_addr, size);
-    gpu_modified_ranges.Add(device_addr, size);
+    AddGpuModifiedRange(device_addr, size);
     if (DownloadsAtFence(device_addr, size)) {
         uncommitted_gpu_modified_ranges.Add(device_addr, size);
     } else {

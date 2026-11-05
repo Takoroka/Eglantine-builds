@@ -858,6 +858,20 @@ void MemoryManager::GetSubmappedRangeImpl(GPUVAddr gpu_addr, std::size_t size, b
         }
         return;
     }
+    // The same inside one small page where the big page is mapped with small pages.
+    if (VideoCommon::InvalidationFilterOn() &&
+        size != 0 && ((gpu_addr ^ (gpu_addr + size - 1)) & ~page_mask) == 0 &&
+        IsWithinGPUAddressRange(gpu_addr) && GetEntry(gpu_addr, true) == EntryType::Free &&
+        GetEntry(gpu_addr, false) == EntryType::Mapped) {
+        if constexpr (is_gpu_address) {
+            result.emplace_back(gpu_addr, size);
+        } else {
+            const DAddr dev_addr_base =
+                DAddr(page_table[PageEntryIndex(gpu_addr, false)]) << cpu_page_bits;
+            result.emplace_back(dev_addr_base + (gpu_addr & page_mask), size);
+        }
+        return;
+    }
     std::optional<std::pair<std::conditional_t<is_gpu_address, GPUVAddr, DAddr>, std::size_t>> last_segment{};
     std::optional<DAddr> old_page_addr{};
     const auto split = [&last_segment, &result]([[maybe_unused]] std::size_t page_index,
