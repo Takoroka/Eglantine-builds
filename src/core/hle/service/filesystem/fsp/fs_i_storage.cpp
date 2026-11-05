@@ -9,7 +9,7 @@
 #include <cstdlib>
 #include <thread>
 
-#include "common/settings.h"
+#include "core/core.h"
 #include "core/file_sys/errors.h"
 #include "core/hle/service/cmif_serialization.h"
 #include "core/hle/service/filesystem/fsp/fs_i_storage.h"
@@ -37,14 +37,17 @@ Result IStorage::Read(
     R_UNLESS(length >= 0, FileSys::ResultInvalidSize);
     R_UNLESS(offset >= 0, FileSys::ResultInvalidOffset);
 
-    // The read-speed limit is for Switch 1 titles (Mario Strikers' intro video froze without it).
-    // Switch 2 storage is far faster, and title 1 waited on it at every track change: a 640 ms
-    // frame spent 350 ms asleep here. EDEN_NX2_FS_THROTTLE=1 applies it to Switch 2 titles too.
-    static const bool throttle_switch2 = [] {
+    // The read-speed limit came with Mario Strikers' intro video (it froze without it). Mario Kart
+    // World waited on it at every track change: a 640 ms frame spent 350 ms asleep here, so it
+    // reads without it. Every other title keeps it: Hyrule Warriors: Age of Imprisonment, reading
+    // without it, wrote through a null pointer ~8 s into its boot. EDEN_NX2_FS_THROTTLE=1 applies
+    // it to Mario Kart World too.
+    static const bool throttle_mkw = [] {
         const char* value = std::getenv("EDEN_NX2_FS_THROTTLE");
         return value != nullptr && value[0] == '1';
     }();
-    if (throttle_switch2 || !Settings::CurrentProgramIsSwitch2()) {
+    constexpr u64 MarioKartWorldProgramId = 0x0400C3F00006E000ULL;
+    if (throttle_mkw || system.GetApplicationProcessProgramID() != MarioKartWorldProgramId) {
         const auto now = std::chrono::steady_clock::now();
         if (now < next_read_tick) {
             std::this_thread::sleep_for(next_read_tick - now);
