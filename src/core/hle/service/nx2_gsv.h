@@ -203,6 +203,34 @@ public:
     explicit INx2NvsrvSession(Core::System& system_) : ServiceFramework{system_, "nx2:nvsrv"} {}
 };
 
+// Syncpoints a client has asked nx2:syncpt about (103 or 201), so a service can tell whether the
+// client waits on the fences it hands out (vi2's present release fences).
+inline std::array<std::atomic<u64>, 3> g_nx2_syncpt_touched{};
+
+inline void Nx2NoteSyncptTouched(u32 syncpoint) {
+    if (syncpoint < 192) {
+        g_nx2_syncpt_touched[syncpoint / 64].fetch_or(u64{1} << (syncpoint % 64), std::memory_order_relaxed);
+    }
+}
+
+inline bool Nx2SyncptTouched(u32 syncpoint) {
+    return syncpoint < 192 && (g_nx2_syncpt_touched[syncpoint / 64].load(std::memory_order_relaxed) >>
+                               (syncpoint % 64)) & 1;
+}
+
+inline void Nx2ClearSyncptTouched(u32 syncpoint) {
+    if (syncpoint < 192) {
+        g_nx2_syncpt_touched[syncpoint / 64].fetch_and(~(u64{1} << (syncpoint % 64)), std::memory_order_relaxed);
+    }
+}
+
+// The value of each syncpoint's latest 201 wait request (low 32 bits).
+inline std::array<std::atomic<u32>, 192> g_nx2_syncpt_waited_value{};
+
+inline u32 Nx2SyncptWaitedValue(u32 syncpoint) {
+    return syncpoint < 192 ? g_nx2_syncpt_waited_value[syncpoint].load(std::memory_order_relaxed) : 0;
+}
+
 // Placeholder for the Switch 2 syncpoint server (nn::syncpt), handed out by gsv 202. TIPC 1
 // returns a u32 the SDK requires to be < 0x400 and then passes min(value, 63) to TIPC 21.
 // Everything else is auto-stubbed through the nx2: prefix.
@@ -258,6 +286,7 @@ private:
     // From changes.patch: the counter is the bitwise NOT of the host1x syncpoint id.
     void QueryCounter(HLERequestContext& ctx) {
         const u32 syncpoint = ~ctx.CommandBuffer()[2];
+        Nx2NoteSyncptTouched(syncpoint);
         const u64 value = syncpoint < HostSyncpoints
                               ? system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(syncpoint)
                               : 0;
@@ -299,6 +328,10 @@ private:
         const u32 mode = cmd_buf[6];
         LOG_DEBUG(Service, "nx2:syncpt TIPC 201 slot={:#x} syncpoint={} value={:#x} mode={}", slot,
                   syncpoint, value, mode);
+        Nx2NoteSyncptTouched(syncpoint);
+        if (syncpoint < HostSyncpoints) {
+            g_nx2_syncpt_waited_value[syncpoint].store(static_cast<u32>(value), std::memory_order_relaxed);
+        }
         auto*& event = m_events[slot];
         if (event == nullptr) {
             event = m_context.CreateEvent(fmt::format("nx2:syncpt:Slot{:x}", slot));
@@ -1785,6 +1818,15 @@ public:
     }
 
     ~INx2Vi2Session() override {
+        if (m_release_thread.joinable()) {
+            {
+                std::scoped_lock lk{m_release->mutex};
+                m_release->quit = true;
+            }
+            m_release->cv.notify_all();
+            m_release_thread.join();
+            NvdrvSyncpoints().FreeSyncpoint(m_release_syncpoint);
+        }
         // The vsync callback may be running on the HostTiming thread: empty its event list under
         // its lock first (it holds the state, not this session), then close the events.
         {
@@ -1853,6 +1895,10 @@ private:
                 system.GetApplicationProcessProgramID() == Settings::MarioKartWorldProgramId;
         }
         const auto entered = std::chrono::steady_clock::now();
+        if (UseReleaseFence(frames_ahead)) {
+            PresentWithReleaseFence(ctx, w, entered, frames_ahead == 0);
+            return;
+        }
         if (frames_ahead == 2 || (frames_ahead == -1 && m_previous_frame_only)) {
             WaitForFrame(m_previous_fence_id, m_previous_fence_value);
         } else if (frames_ahead == 1 ||
@@ -1925,12 +1971,283 @@ private:
                              static_cast<u32>(AvailableSlots >> 32), 0, 0, 0, 0});
     }
 
+    // Release fences. On the console a present only queues the frame: the compositor waits for its
+    // GPU fence and the vblank, and the game blocks later, in nvnSyncWait on the release fence of
+    // the buffer it acquires next. Donkey Kong Bananza (1.0.0 main 0x1eace8) picks its swap
+    // interval from its frame time up to and including the present call; its sync waits are left
+    // out on purpose. Held here for this frame's fence and the vblank, that time became CPU + GPU +
+    // the hold (two vblanks at interval 2), and it stayed at 30 fps in every heavy scene while the
+    // GPU thread idled. With release fences the reply comes at once, and a worker waits for the
+    // fence, composites and holds to the vblank, then advances a syncpoint of this session that
+    // the reply's NativeSyncHandle (the four words after the slot mask) waits for. The client keeps
+    // that handle with the image and waits on it when it acquires the image again, cycle - 1
+    // presents later (images come back in present order), so the handle waits for the present just
+    // before that acquire: the game starts no frame before the previous one has finished on the GPU
+    // and been shown, as with the wait here (one present earlier for titles that may run a frame
+    // ahead). EDEN_NX2_PRESENT_RELEASE=0 never uses them, =1 for every title; by default for
+    // titles whose presents wait for their own frame (frames_ahead 0).
+    bool UseReleaseFence(int frames_ahead) const {
+        static const int setting = [] {
+            const char* value = std::getenv("EDEN_NX2_PRESENT_RELEASE");
+            return value == nullptr ? -1 : value[0] == '1' ? 1 : 0;
+        }();
+        return !m_release_off && (setting == 1 || (setting == -1 && frames_ahead == 0));
+    }
+
+    void PresentWithReleaseFence(HLERequestContext& ctx, const u32* w,
+                                 std::chrono::steady_clock::time_point entered, bool this_frame) {
+        StartReleaseWorker();
+        auto& state = *m_release;
+        // Presents since the client last presented this image: its image count, while it presents
+        // them in turn. Unknown the first time (the handle then waits for this present only).
+        u64 cycle = 0;
+        if (const auto it = m_image_presents.find(w[5]); it != m_image_presents.end()) {
+            cycle = m_presents - it->second;
+        }
+        m_image_presents[w[5]] = m_presents;
+        // At most 4 images, so a cycle stretched by a cancel or a new window can't make a handle
+        // wait long for presents that don't come.
+        const u64 behind = this_frame ? 1 : 2;
+        const u32 ahead = static_cast<u32>(cycle > behind ? (std::min<u64>)(cycle, 4) - behind : 0);
+        u32 swap_interval{};
+        const bool paced = Settings::values.use_speed_limit.GetValue() && Settings::SpeedLimit() != 0;
+        const auto interval = paced ? FrameInterval(w[12], swap_interval) : std::chrono::nanoseconds{};
+        u32 value;
+        {
+            std::scoped_lock lk{state.mutex};
+            const u32 sequence = ++state.queued;
+            const u32 wait_for = sequence + ahead;
+            if (static_cast<s32>(wait_for - state.handed) > 0) {
+                state.handed = wait_for;
+            }
+            state.items.push_back({.number = m_presents, .sequence = sequence, .fence_id = ~w[22],
+                                   .fence_value = w[24], .image = w[5], .shown_size = w[7],
+                                   .interval = interval, .entered = entered});
+            value = m_release_base + wait_for;
+        }
+        state.cv.notify_all();
+        m_previous_fence_id = ~w[22];
+        m_previous_fence_value = w[24];
+        TracePresent(w, entered, entered, entered, entered);
+        if (m_stats.last_present != std::chrono::steady_clock::time_point{}) {
+            const long long frame =
+                std::chrono::duration_cast<std::chrono::microseconds>(entered - m_stats.last_present).count();
+            m_stats.frame_us += frame;
+            m_stats.max_frame_us = (std::max)(m_stats.max_frame_us, frame);
+            m_stats.hitches += frame > 100'000 ? 1 : 0;
+        }
+        m_stats.last_present = entered;
+        if (++m_stats.presents == 600) {
+            ReleaseStats totals;
+            {
+                std::scoped_lock lk{state.mutex};
+                totals = std::exchange(state.stats, {});
+            }
+            const long long released = (std::max)(totals.released, 1LL);
+            LOG_INFO(Service,
+                     "nx2:vi2 last 600 presents: frame {} us (max {}, {} over 100 ms); replied at once, "
+                     "then off the game's thread: GPU fence {} us, vblank pacing {} us, shown {} us after "
+                     "the present ({} released)",
+                     m_stats.frame_us / 599, m_stats.max_frame_us, m_stats.hitches,
+                     totals.fence_us / released, totals.pace_us / released,
+                     totals.latency_us / released, totals.released);
+            m_stats = {.last_present = entered};
+        }
+        // The game must wait on the handle for this to keep it behind the GPU. A client that never
+        // asks about the syncpoint gets the wait in the present again, once the queue is shown.
+        if (++m_release_presents == 16 && !Nx2SyncptTouched(m_release_syncpoint)) {
+            LOG_WARNING(Service, "nx2:vi2 the client never waits on present release fences; presents "
+                                 "wait for their frame again");
+            m_release_off = true;
+            std::unique_lock lk{state.mutex};
+            state.complete_all = true; // handles waiting for presents that won't be queued now
+            state.cv.notify_all();
+            state.cv.wait_for(lk, std::chrono::seconds{4}, [&] { return state.items.empty(); });
+        }
+        constexpr u64 AvailableSlots = 0x7fff;
+        TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots), static_cast<u32>(AvailableSlots >> 32),
+                             ~m_release_syncpoint, 0, value, 0});
+    }
+
+    void StartReleaseWorker() {
+        if (m_release_thread.joinable()) {
+            return;
+        }
+        m_release_syncpoint = NvdrvSyncpoints().AllocateSyncpoint(false);
+        m_release_base = static_cast<u32>(
+            system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(m_release_syncpoint));
+        Nx2ClearSyncptTouched(m_release_syncpoint);
+        g_nx2_syncpt_waited_value[m_release_syncpoint % 192].store(m_release_base, std::memory_order_relaxed);
+        LOG_INFO(Service, "nx2:vi2 presents reply at once; syncpoint {} counts shown frames from {}",
+                 m_release_syncpoint, m_release_base);
+        m_release_thread = std::thread([this] { ReleaseLoop(); });
+    }
+
+    // The release worker: one present at a time, in order.
+    void ReleaseLoop() {
+        Common::SetCurrentThreadName("nx2:vi2:Release");
+        auto& state = *m_release;
+        std::chrono::steady_clock::time_point next_vblank{};
+        for (;;) {
+            ReleaseQueue::Item item;
+            {
+                std::unique_lock lk{state.mutex};
+                state.cv.wait_for(lk, std::chrono::milliseconds{100}, [&] {
+                    return state.quit || !state.items.empty() || state.complete_all;
+                });
+                if (state.quit) {
+                    return;
+                }
+                if (state.items.empty()) {
+                    // Nothing queued, yet the client waits for a count past the shown presents: it
+                    // got an image back out of present order (a cancelled buffer, a new window)
+                    // and waits for a present no queued one is. Complete what was handed out
+                    // rather than leave it blocked.
+                    const u32 waited = Nx2SyncptWaitedValue(m_release_syncpoint) - m_release_base;
+                    const bool blocked = static_cast<s32>(waited - state.released) > 0;
+                    const bool complete = (blocked || state.complete_all) &&
+                                          static_cast<s32>(state.handed - state.released) > 0;
+                    state.complete_all = false;
+                    if (complete) {
+                        LOG_INFO(Service, "nx2:vi2 release: completing handed-out fences ({} -> {})",
+                                 state.released, state.handed);
+                        state.released = state.handed;
+                        const u32 target = state.released;
+                        lk.unlock();
+                        AdvanceRelease(target);
+                    }
+                    continue;
+                }
+                item = state.items.front();
+            }
+            const auto started = std::chrono::steady_clock::now();
+            WaitReleaseFence(item.fence_id, item.fence_value);
+            const auto fenced = std::chrono::steady_clock::now();
+            Composite(item.image, item.fence_id, item.fence_value, item.shown_size);
+            // PaceToVblank's rule, here off the game's thread: show at once when late and don't
+            // bank the lost time, else hold until the previous frame has had its interval.
+            if (item.interval.count() > 0) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now > next_vblank + item.interval) {
+                    next_vblank = now;
+                } else if (now < next_vblank) {
+                    std::unique_lock lk{state.mutex};
+                    if (state.cv.wait_until(lk, next_vblank, [&] { return state.quit; })) {
+                        return;
+                    }
+                }
+                next_vblank += item.interval;
+            }
+            const auto shown = std::chrono::steady_clock::now();
+            u32 target;
+            {
+                std::scoped_lock lk{state.mutex};
+                state.items.pop_front();
+                if (static_cast<s32>(item.sequence - state.released) > 0) {
+                    state.released = item.sequence;
+                }
+                target = state.released;
+                const auto us = [](auto d) {
+                    return static_cast<long long>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(d).count());
+                };
+                state.stats.fence_us += us(fenced - started);
+                state.stats.pace_us += us(shown - fenced);
+                state.stats.latency_us += us(shown - item.entered);
+                ++state.stats.released;
+            }
+            AdvanceRelease(target);
+            state.cv.notify_all();
+        }
+    }
+
+    // Like WaitForFrame, on the worker: at most 4 s, and the session's end stops it.
+    void WaitReleaseFence(u32 fence_id, u32 fence_value) {
+        if (fence_id >= 192) {
+            return;
+        }
+        auto& syncpoints = system.Host1x().GetSyncpointManager();
+        if (syncpoints.IsReadyGuest(fence_id, fence_value)) {
+            return;
+        }
+        auto reached = std::make_shared<std::atomic<bool>>(false);
+        // Runs on the GPU thread under the manager's lock, or inline if already reached: not
+        // registered with the queue's lock held.
+        syncpoints.RegisterGuestAction(fence_id, fence_value, [reached, release = m_release] {
+            reached->store(true);
+            {
+                std::scoped_lock lk{release->mutex};
+            }
+            release->cv.notify_all();
+        });
+        bool done;
+        {
+            std::unique_lock lk{m_release->mutex};
+            done = m_release->cv.wait_for(lk, std::chrono::seconds{4}, [&] {
+                return m_release->quit || reached->load();
+            });
+        }
+        if (!done && m_wait_timeouts++ < 64) {
+            LOG_WARNING(Service, "nx2:vi2 release: fence ({}, {}) not reached in 4 s (now {})",
+                        fence_id, fence_value, syncpoints.GetGuestSyncpointValue(fence_id));
+        }
+    }
+
+    // Moves the release syncpoint up to `target` shown presents (only the worker increments it).
+    void AdvanceRelease(u32 target) {
+        auto& syncpoints = system.Host1x().GetSyncpointManager();
+        const u32 goal = m_release_base + target;
+        u32 current = static_cast<u32>(syncpoints.GetGuestSyncpointValue(m_release_syncpoint));
+        while (static_cast<s32>(goal - current) > 0) {
+            syncpoints.IncrementGuest(m_release_syncpoint);
+            ++current;
+        }
+    }
+
+    Nvidia::NvCore::SyncpointManager& NvdrvSyncpoints() {
+        return system.ServiceManager()
+            .GetService<Nvidia::NVDRV>("nvdrv", true)
+            ->GetModule()
+            ->GetContainer()
+            .GetSyncpointManager();
+    }
+
+    struct ReleaseStats {
+        long long fence_us{}, pace_us{}, latency_us{}, released{};
+    };
+    // Shared with the worker and the fence actions it registers (which can outlive a wait).
+    struct ReleaseQueue {
+        struct Item {
+            u64 number{};
+            u32 sequence{};
+            u32 fence_id{}, fence_value{}, image{}, shown_size{};
+            std::chrono::nanoseconds interval{};
+            std::chrono::steady_clock::time_point entered{};
+        };
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::deque<Item> items;
+        u32 queued{};   ///< presents queued so far
+        u32 released{}; ///< presents shown (or given up on), what the syncpoint counts
+        u32 handed{};   ///< the highest count a handed-out handle waits for
+        bool complete_all{}; ///< a buffer was cancelled: complete what was handed out once idle
+        bool quit{};
+        ReleaseStats stats{};
+    };
+    std::shared_ptr<ReleaseQueue> m_release = std::make_shared<ReleaseQueue>();
+    std::thread m_release_thread;
+    u32 m_release_syncpoint{~0U};
+    u32 m_release_base{};
+    u32 m_release_presents{};
+    bool m_release_off{}; ///< the client didn't wait on release fences: presents wait again
+    std::map<u32, u64> m_image_presents; ///< image id -> the present that last showed it
+
     // The console's compositor frees a buffer only once its frame's GPU fence has passed, which
     // is what keeps a game from running ahead of the GPU. This reply always reports every buffer
     // free, so pace the game here instead: wait (bounded, in case the GPU waits on the CPU) until
     // Eden's GPU thread has processed the frame. Otherwise the game laps the GPU thread and
     // rewrites command memory it hasn't read yet.
-    u32 m_wait_timeouts{};
+    std::atomic<u32> m_wait_timeouts{};
     struct PresentStats {
         long long frame_us{}, fence_us{}, composite_us{}, pace_us{}, max_fence_us{};
         long long max_frame_us{}, hitches{};
@@ -2016,19 +2333,23 @@ private:
     // timing: present word 12, (swap interval << 16) | refresh rate. Fire Emblem: Fortune's Weave
     // sends 0x1003c during its boot logos and 0x2003c (two vblanks per frame, 30 fps) after; paced
     // at every vblank it ran at double speed. EDEN_NX2_SWAP_INTERVAL=<n> forces the interval.
-    void PaceToVblank(u32 timing) {
-        if (!Settings::values.use_speed_limit.GetValue() || Settings::SpeedLimit() == 0) {
-            return;
-        }
+    // Returns how long the frame is shown (interval vblanks at the speed limit), on the present's
+    // thread (it reads the current process).
+    static u32 ForcedSwapInterval() {
         static const u32 forced_interval = [] {
             const char* value = std::getenv("EDEN_NX2_SWAP_INTERVAL");
             return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
         }();
+        return forced_interval;
+    }
+
+    std::chrono::nanoseconds FrameInterval(u32 timing, u32& swap_interval) {
+        const u32 forced_interval = ForcedSwapInterval();
         const auto& process = Kernel::GetCurrentProcess(kernel);
         const bool mkw_dynamic =
             process.GetProgramId() == Settings::MarioKartWorldProgramId &&
             process.IsMkwDynamicFpsPatchApplied() && Settings::values.mkw_dynamic_fps.GetValue();
-        u32 swap_interval = std::clamp<u32>(timing >> 16, 1, 4);
+        swap_interval = std::clamp<u32>(timing >> 16, 1, 4);
         if (mkw_dynamic) {
             swap_interval = 1;
         }
@@ -2040,8 +2361,16 @@ private:
             LOG_INFO(Service, "nx2:vi2 present #{} swap interval {} at {} Hz (word 12 = {:#x})",
                      m_presents, swap_interval, refresh_rate, timing);
         }
-        const auto interval = std::chrono::nanoseconds{
+        return std::chrono::nanoseconds{
             100'000'000'000LL * swap_interval / refresh_rate / Settings::SpeedLimit()};
+    }
+
+    void PaceToVblank(u32 timing) {
+        if (!Settings::values.use_speed_limit.GetValue() || Settings::SpeedLimit() == 0) {
+            return;
+        }
+        u32 swap_interval{};
+        const auto interval = FrameInterval(timing, swap_interval);
         const auto now = std::chrono::steady_clock::now();
         m_trace_late_us = std::chrono::duration_cast<std::chrono::microseconds>(now - m_next_vblank).count();
         // An interval above one is a frame rate only while the game keeps up. Mario Kart World
@@ -2061,7 +2390,7 @@ private:
         if (m_previous_release != std::chrono::steady_clock::time_point{}) {
             m_frame_debt = std::clamp(m_frame_debt + m_previous_gap - interval, -4 * vblank, 4 * vblank);
         }
-        const bool catching_up = swap_interval > 1 && forced_interval == 0 && !always_hold_interval &&
+        const bool catching_up = swap_interval > 1 && ForcedSwapInterval() == 0 && !always_hold_interval &&
                                  m_frame_debt >= -vblank;
         const auto hold = catching_up ? vblank : interval;
         if (now > m_next_vblank + hold) {
@@ -2323,6 +2652,16 @@ private:
 
     // 228(u64 token, u32 slot): return a buffer without presenting it.
     void CancelClientBuffer(HLERequestContext& ctx) {
+        // The image goes back out of present order: release handles may now wait for presents
+        // that come later than counted, so complete them, and count image cycles anew.
+        if (m_release_thread.joinable()) {
+            {
+                std::scoped_lock lk{m_release->mutex};
+                m_release->complete_all = true;
+            }
+            m_release->cv.notify_all();
+            m_image_presents.clear();
+        }
         constexpr u64 AvailableSlots = 0x7fff;
         TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots),
                              static_cast<u32>(AvailableSlots >> 32), 0, 0, 0, 0});
