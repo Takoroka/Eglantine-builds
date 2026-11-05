@@ -597,6 +597,9 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 #endif
     }
 
+    // Before the workarounds below turn it off (EDEN_NX2_FLOAT16).
+    const bool driver_float16 = features.shader_float16_int8.shaderFloat16;
+
     if (is_nvidia) {
         const auto arch = GetNvidiaArch();
         if (arch >= NvidiaArchitecture::Arch_AmpereOrNewer) {
@@ -660,6 +663,16 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         // Intel's compiler crashes when using fp16 on Astral Chain, disable it for the time being.
         LOG_WARNING(Render_Vulkan, "Intel has broken float16 math");
         features.shader_float16_int8.shaderFloat16 = false;
+    }
+
+    // EDEN_NX2_FLOAT16=0 lowers all float16 shader math to float32; =1 keeps float16 where a
+    // workaround above turned it off. For comparing a game's float16 results between drivers that
+    // keep it (RADV: Splatoon Raiders' ink on a Steam Deck) and drivers that don't.
+    if (const char* value = std::getenv("EDEN_NX2_FLOAT16")) {
+        const bool float16 = value[0] == '1' && driver_float16;
+        LOG_INFO(Render_Vulkan, "EDEN_NX2_FLOAT16={}: float16 shader math {}", value,
+                 float16 ? "on" : "off");
+        features.shader_float16_int8.shaderFloat16 = float16;
     }
 
     has_broken_compute =
