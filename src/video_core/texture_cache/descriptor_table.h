@@ -260,6 +260,19 @@ public:
     bool invalidated{}; ///< read_descriptors is to be cleared before the next read
 
 private:
+    /// Host pointer of the entry at `gpu_addr` when it lies in one page, else nullptr (Matches).
+    template <class MemoryManager>
+    const u8* EntryPointer(const MemoryManager& gpu_memory, GPUVAddr gpu_addr) {
+        if ((gpu_addr & Core::Memory::YUZU_PAGEMASK) + sizeof(T) > Core::Memory::YUZU_PAGESIZE) {
+            return nullptr;
+        }
+        if (g_descriptor_page_reuse.load(std::memory_order_relaxed)) {
+            return pages.Get(gpu_addr, sizeof(T),
+                             [&](GPUVAddr page) { return gpu_memory.GetPointer(page); });
+        }
+        return gpu_memory.GetPointer(gpu_addr);
+    }
+
     static bool SameWords(const void* lhs, const void* rhs) noexcept {
         static_assert(sizeof(T) % sizeof(u64) == 0);
         u64 diff = 0;
