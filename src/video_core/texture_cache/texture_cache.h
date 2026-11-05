@@ -134,9 +134,18 @@ void TextureCache<P>::RunGarbageCollector() {
     bool evict_old_costly = false;
     u64 ticks_to_destroy = 0;
     size_t num_iterations = 0;
+    // On a discrete GPU, collect near the driver's budget (minus the margins TickFrame keeps)
+    // rather than from MaxCriticalMemory on. Mario Kart World's heavy races need 4.0-5.1 GB here,
+    // so under the 5 GiB cap the collector sat in high-priority and aggressive mode all race:
+    // decoded textures went 10 frames after their last use and were made and decoded again at the
+    // next race start (260-810 images, 54-110 ms frames), and GPU-written images were downloaded
+    // with a wait each before they went. Integrated GPUs keep the cap: their memory is the RAM.
+    const bool budget_thresholds = UseBudgetThresholds();
+    gc_expected_memory = budget_thresholds ? budget_expected_memory : expected_memory;
+    gc_critical_memory = budget_thresholds ? budget_critical_memory : critical_memory;
     const auto Configure = [&](bool allow_aggressive) {
-        high_priority_mode = total_used_memory >= expected_memory;
-        aggressive_mode = allow_aggressive && total_used_memory >= critical_memory;
+        high_priority_mode = total_used_memory >= gc_expected_memory;
+        aggressive_mode = allow_aggressive && total_used_memory >= gc_critical_memory;
         ticks_to_destroy = aggressive_mode ? 10ULL : high_priority_mode ? 25ULL : 50ULL;
         // EDEN_NX2_TC_MIN_AGE=<frames>: never evict images used more recently (thrash tests).
         static const u64 min_age = [] {
@@ -175,10 +184,10 @@ void TextureCache<P>::RunGarbageCollector() {
         ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
         UnregisterImage(image_id);
         DeleteImage(image_id, image.scale_tick > frame_tick + 5);
-        if (aggressive_mode && total_used_memory < critical_memory) {
+        if (aggressive_mode && total_used_memory < gc_critical_memory) {
             num_iterations >>= 2;
             aggressive_mode = false;
-        } else if (high_priority_mode && total_used_memory < expected_memory) {
+        } else if (high_priority_mode && total_used_memory < gc_expected_memory) {
             num_iterations >>= 1;
             high_priority_mode = false;
         }
@@ -251,10 +260,23 @@ void TextureCache<P>::RunGarbageCollector() {
         evict_old_costly = false;
     }
     Collect();
-    if (total_used_memory >= critical_memory) {
+    if (total_used_memory >= gc_critical_memory) {
         Configure(true);
         Collect();
     }
+}
+
+template <class P>
+bool TextureCache<P>::UseBudgetThresholds() const {
+    if (budget_critical_memory == 0 || thresholds_overridden) {
+        return false;
+    }
+    if constexpr (requires { runtime.IsIntegratedGpu(); }) {
+        if (runtime.IsIntegratedGpu()) {
+            return false;
+        }
+    }
+    return true;
 }
 
 template <class P>
@@ -272,6 +294,7 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
                                        std::pair{"EDEN_NX2_TC_CRITICAL_MIB", &critical_memory}}) {
         if (const char* value = std::getenv(name)) {
             *target = std::strtoull(value, nullptr, 10) << 20;
+            thresholds_overridden = true;
         }
     }
     if (log) {
@@ -352,6 +375,8 @@ void TextureCache<P>::TickFrame() {
                     critical_memory =
                         budget - (std::min)(margin + pressure_margin + slack_margin, budget / 2);
                     expected_memory = critical_memory - (std::min)(margin, critical_memory / 2);
+                    budget_critical_memory = critical_memory;
+                    budget_expected_memory = expected_memory;
                     ApplyThresholdOverrides(false);
                     // Log the first values and real changes (the budget moves by a few MiB all
                     // the time). Compared once capped: a budget far over MaxCriticalMemory is
@@ -363,8 +388,10 @@ void TextureCache<P>::TickFrame() {
                     if (budget_check_frames == 1 || change >= 256_MiB) {
                         ApplyThresholdOverrides(true);
                         LOG_INFO(HW_GPU,
-                                 "Memory margins: base {} MiB, out of memory {} MiB, block slack {} MiB",
-                                 margin >> 20, pressure_margin >> 20, slack_margin >> 20);
+                                 "Memory margins: base {} MiB, out of memory {} MiB, block slack {} MiB; "
+                                 "by the budget alone: expected {} MiB, critical {} MiB",
+                                 margin >> 20, pressure_margin >> 20, slack_margin >> 20,
+                                 budget_expected_memory >> 20, budget_critical_memory >> 20);
                     }
                 }
             }

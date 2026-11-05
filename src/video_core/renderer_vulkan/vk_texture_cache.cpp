@@ -2524,6 +2524,10 @@ u64 TextureCacheRuntime::GetDeviceMemorySlack() const {
     return device.GetDeviceMemorySlack();
 }
 
+bool TextureCacheRuntime::IsIntegratedGpu() const {
+    return device.IsIntegrated();
+}
+
 bool TextureCacheRuntime::CanDownloadMsaa(const VideoCommon::ImageInfo& info) const {
     const VkImageAspectFlags aspect_mask = ImageAspectMask(info.format);
     if ((aspect_mask & VK_IMAGE_ASPECT_COLOR_BIT) != 0) {
