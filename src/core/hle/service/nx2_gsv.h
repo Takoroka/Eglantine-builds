@@ -37,6 +37,7 @@
 #include "core/frontend/framebuffer_layout.h"
 #include "core/perf_stats.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_split.h"
 #include "video_core/framebuffer_config.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_client_session.h"
@@ -2161,7 +2162,15 @@ private:
         }
     }
 
-    // Like WaitForFrame, on the worker: at most 4 s, and the session's end stops it.
+    // Waits on the worker until the frame's fence is reached; the session's end stops it. Unlike
+    // WaitForFrame there is no plain timeout: a GPU thread that is only slow (seconds of ASTC
+    // decodes while a level loads, more with another game on the host GPU) must not let the game
+    // go on, or it rewrites command memory the GPU thread still has to read. Donkey Kong Bananza
+    // crashed on garbage commands 2 s after a 4 s timeout here released it (9.5 s of ASTC decodes
+    // in that stretch). The release goes early only when the GPU waits on the game, the case the
+    // timeout is for: after 4 s, and only once for the last 2 s a channel has waited on a
+    // semaphore, the back has had nothing to run and the fence's syncpoint hasn't moved. After
+    // 30 s it goes anyway, so a GPU that never gets there can't hang the game for good.
     void WaitReleaseFence(u32 fence_id, u32 fence_value) {
         if (fence_id >= 192) {
             return;
@@ -2180,16 +2189,44 @@ private:
             }
             release->cv.notify_all();
         });
-        bool done;
-        {
-            std::unique_lock lk{m_release->mutex};
-            done = m_release->cv.wait_for(lk, std::chrono::seconds{4}, [&] {
-                return m_release->quit || reached->load();
-            });
-        }
-        if (!done && m_wait_timeouts++ < 64) {
-            LOG_WARNING(Service, "nx2:vi2 release: fence ({}, {}) not reached in 4 s (now {})",
-                        fence_id, fence_value, syncpoints.GetGuestSyncpointValue(fence_id));
+        using Clock = std::chrono::steady_clock;
+        const auto start = Clock::now();
+        auto value = syncpoints.GetGuestSyncpointValue(fence_id);
+        auto moved = start;   // when the fence's syncpoint last changed
+        auto working = start; // when the GPU last did anything but wait on the game
+        for (;;) {
+            {
+                std::unique_lock lk{m_release->mutex};
+                if (m_release->cv.wait_for(lk, std::chrono::milliseconds{50}, [&] {
+                        return m_release->quit || reached->load();
+                    })) {
+                    return;
+                }
+            }
+            const auto now = Clock::now();
+            if (const auto current = syncpoints.GetGuestSyncpointValue(fence_id); current != value) {
+                value = current;
+                moved = now;
+            }
+            const bool waits_on_game = system.GPU().HasSuspendedChannels() &&
+                                       VideoCommon::GpuSplit::Get().BackIdle();
+            if (!waits_on_game || now - moved < std::chrono::seconds{2}) {
+                working = now;
+            }
+            const auto waited = now - start;
+            const bool deadlock =
+                waited >= std::chrono::seconds{4} && now - working >= std::chrono::seconds{2};
+            if (deadlock || waited >= std::chrono::seconds{30}) {
+                if (m_wait_timeouts++ < 64) {
+                    LOG_WARNING(Service,
+                                "nx2:vi2 release: fence ({}, {}) not reached in {} ms (now {}), {}",
+                                fence_id, fence_value,
+                                std::chrono::duration_cast<std::chrono::milliseconds>(waited).count(),
+                                value, deadlock ? "the GPU waits on the game: releasing it"
+                                                : "releasing it anyway");
+                }
+                return;
+            }
         }
     }
 

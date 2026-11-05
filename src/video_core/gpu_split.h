@@ -71,6 +71,11 @@ public:
     [[nodiscard]] bool BackRunning() const {
         return back_running.load(std::memory_order_acquire);
     }
+    /// Any thread: whether the back has nothing to run right now (it waits for work, or doesn't
+    /// run). A hint for watchdogs: it can change right after the read.
+    [[nodiscard]] bool BackIdle() const {
+        return !BackRunning() || back_waiting.load(std::memory_order_relaxed);
+    }
     /// Any thread: has the back call the idle hook soon, between entries or at once if it sleeps.
     void RequestIdleHook() {
         hook_requested.store(true, std::memory_order_seq_cst);
