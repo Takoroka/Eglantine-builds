@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -1026,19 +1027,52 @@ void PipelineCache::EvictUnusedPipelines() {
         return;
     }
     // Each built pipeline holds ~0.45 MB of driver memory and none was ever destroyed, so it grew
-    // with every place a session went (title 1: 1,500 on its title screen alone). One unused for
-    // this long is destroyed; it takes 2-3 ms to build again from the driver's pipeline cache.
+    // with every place a session went (title 1: 1,500 on its title screen alone). Pipelines are
+    // kept up to a budget, and the least recently used ones beyond it are destroyed. Evicting by
+    // age alone dropped title 1's title-drive pipelines during each race and its race pipelines
+    // during each title drive: building them again on the GPU thread (2-3 ms each, 20-30 at once
+    // at a race start) made the frames there 100-150 ms. EDEN_NX2_PIPELINE_BUDGET sets the budget;
+    // 0 evicts by age as before (unused for 9000 frames).
+    static const size_t budget = [] {
+        const char* const value = std::getenv("EDEN_NX2_PIPELINE_BUDGET");
+        return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 10))
+                                : size_t{4096};
+    }();
     constexpr u64 EvictAfterFrames = 9000;
-    if (frame_count <= EvictAfterFrames) {
-        return;
+    const auto evictable = [this](const GraphicsPipeline* pipeline) {
+        return pipeline != nullptr && pipeline != current_pipeline && pipeline->IsBuilt();
+    };
+    u64 cutoff{};
+    if (budget == 0) {
+        if (frame_count <= EvictAfterFrames) {
+            return;
+        }
+        cutoff = frame_count - EvictAfterFrames;
+    } else {
+        if (graphics_cache.size() <= budget) {
+            return;
+        }
+        // The last use of the oldest pipeline that has to go: all used no later are destroyed
+        // (pipelines last used in the same frame go together).
+        std::vector<u64> last_uses;
+        last_uses.reserve(graphics_cache.size());
+        for (const auto& [key, pipeline] : graphics_cache) {
+            if (evictable(pipeline.get())) {
+                last_uses.push_back(pipeline->LastUse());
+            }
+        }
+        const size_t excess = (std::min)(graphics_cache.size() - budget, last_uses.size());
+        if (excess == 0) {
+            return;
+        }
+        std::nth_element(last_uses.begin(), last_uses.begin() + (excess - 1), last_uses.end());
+        cutoff = last_uses[excess - 1] + 1;
     }
-    const u64 cutoff = frame_count - EvictAfterFrames;
     const u64 tick = scheduler.CurrentTick();
     size_t evicted = 0;
     for (auto it = graphics_cache.begin(); it != graphics_cache.end();) {
         GraphicsPipeline* const pipeline = it->second.get();
-        if (pipeline == nullptr || pipeline == current_pipeline || !pipeline->IsBuilt() ||
-            pipeline->LastUse() >= cutoff) {
+        if (!evictable(pipeline) || pipeline->LastUse() >= cutoff) {
             ++it;
             continue;
         }
@@ -1057,8 +1091,13 @@ void PipelineCache::EvictUnusedPipelines() {
             pipeline->ClearTransitions();
         }
     }
-    LOG_INFO(Render_Vulkan, "Evicted {} graphics pipelines unused for {} frames, {} left", evicted,
-             EvictAfterFrames, graphics_cache.size());
+    if (budget == 0) {
+        LOG_INFO(Render_Vulkan, "Evicted {} graphics pipelines unused for {} frames, {} left",
+                 evicted, EvictAfterFrames, graphics_cache.size());
+    } else {
+        LOG_INFO(Render_Vulkan, "Evicted {} graphics pipelines over the budget of {}, {} left",
+                 evicted, budget, graphics_cache.size());
+    }
 }
 
 GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const noexcept {
