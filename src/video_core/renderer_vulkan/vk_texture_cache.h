@@ -97,6 +97,9 @@ public:
 
     u64 GetDeviceMemorySlack() const;
 
+    /// Device memory is the system's RAM (the collector keeps its fixed cap there).
+    bool IsIntegratedGpu() const;
+
     bool CanReportMemoryUsage() const;
 
     /// Images that did not fit the device memory budget so far (see MemoryAllocator).
