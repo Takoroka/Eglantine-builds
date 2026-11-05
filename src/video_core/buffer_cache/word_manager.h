@@ -151,6 +151,8 @@ struct WordManager {
                 if (type == Type::CPU)
                     cached_words[index] &= ~mask;
             } else {
+                if (type == Type::CPU && (Span(Type::Hot)[index] & state_words[index] & mask) != 0)
+                    rearm_pending = true;
                 if (type == Type::CPU)
                     cached_words[index] &= ~(state_words[index] & mask);
                 state_words[index] &= ~mask;
@@ -284,6 +286,7 @@ struct WordManager {
             if (clear) {
                 if (type == Type::CPU && (Span(Type::Hot)[index] & word) != 0) {
                     CountHotUploads(index, Span(Type::Hot)[index] & word);
+                    rearm_pending = true;
                 }
                 // Hot pages are uploaded but stay untracked (NoteWriteTrap).
                 const u64 track = type == Type::CPU ? mask & ~Span(Type::Hot)[index] : mask;
@@ -347,17 +350,45 @@ struct WordManager {
     ///        (ForEachModifiedRange of CPU pages, clearing) would find and change nothing
     /// @param offset Offset in bytes from the start of the buffer
     /// @param size   Size in bytes of the region to query
-    [[nodiscard]] bool IsRegionCpuClean(u64 offset, u64 size) const noexcept {
-        const std::span<const u64> cpu_words = Span(Type::CPU);
-        const std::span<const u64> untracked_words = Span(Type::Untracked);
+    [[nodiscard]] bool IsRegionCpuClean(u64 offset, u64 size, bool hot_aware = false) const noexcept {
         bool clean = true;
         IterateWords(offset, size, [&](size_t index, u64 mask) {
-            if (((cpu_words[index] | untracked_words[index]) & mask) != 0) {
+            if (!IsWordCpuClean(index, mask, hot_aware)) {
                 clean = false;
             }
             return !clean;
         });
         return clean;
+    }
+
+    /// @brief IsRegionCpuClean for some pages of one word
+    /// @param hot_aware A hot page is dirty only while CPU modified: an upload leaves it untracked
+    ///                  and changes nothing else (ForEachModifiedRange)
+    [[nodiscard]] bool IsWordCpuClean(size_t index, u64 mask, bool hot_aware) const noexcept {
+        u64 untracked = Span(Type::Untracked)[index];
+        if (hot_aware) {
+            untracked &= ~Span(Type::Hot)[index];
+        }
+        return ((Span(Type::CPU)[index] | untracked) & mask) == 0;
+    }
+
+    /// @brief IsRegionModified for some pages of one word
+    [[nodiscard]] bool IsWordModified(Type type, size_t index, u64 mask) const noexcept {
+        if (type == Type::GPU) {
+            mask &= ~Span(Type::Untracked)[index];
+        }
+        return (Span(type)[index] & mask) != 0;
+    }
+
+    /// @brief Marks some pages of one word CPU modified when that changes nothing but their cached
+    ///        write marks (they are CPU modified and untracked already)
+    /// @return Whether it did (else ChangeRegionState has work to do)
+    bool MarkWordCpuModifiedNoChange(size_t index, u64 mask) noexcept {
+        if ((Span(Type::CPU)[index] & Span(Type::Untracked)[index] & mask) != mask) {
+            return false;
+        }
+        Span(Type::CachedCPU)[index] &= ~mask;
+        return true;
     }
 
     /// @brief Returns a begin end pair with the inclusive modified region
@@ -466,8 +497,10 @@ struct WordManager {
     bool hot_pages_enabled = false; ///< Set by the memory tracker
     bool has_hot = false;           ///< A page became hot since the tracker last looked
     bool has_recent = false;        ///< A page was remembered as recently uploaded
+    bool rearm_pending = false;     ///< A hot page lost its CPU modified mark (an upload)
     bool in_hot_list = false;
     bool in_recent_list = false;
+    bool in_rearm_list = false;
 };
 
 } // namespace VideoCommon

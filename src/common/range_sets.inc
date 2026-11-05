@@ -233,6 +233,20 @@ bool RangeSet<AddressType>::Intersects(AddressType base_address, size_t size) co
 }
 
 template <typename AddressType>
+bool RangeSet<AddressType>::FreeGap(AddressType base_address, size_t size, AddressType& gap_begin,
+                                    AddressType& gap_end) const {
+    const auto& set = m_impl->m_ranges_set;
+    const AddressType end_address = base_address + static_cast<AddressType>(size);
+    const auto it = set.lower_bound(typename RangeSetImpl::IntervalType{base_address, end_address});
+    if (it != set.end() && it->lower() < end_address) {
+        return false;
+    }
+    gap_begin = it == set.begin() ? AddressType{0} : std::prev(it)->upper();
+    gap_end = it == set.end() ? (std::numeric_limits<AddressType>::max)() : it->lower();
+    return true;
+}
+
+template <typename AddressType>
 template <typename Func>
 void RangeSet<AddressType>::ForEach(Func&& func) const {
     m_impl->ForEach(std::move(func));
