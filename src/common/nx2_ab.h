@@ -52,6 +52,11 @@ enum Feature : u64 {
     // backperf (11-06): pipelines whose only writes are storage buffers take the buffer refresh
     // path (never a full repeat): RasterizerVulkan::PrepareDraw.
     StorageWriteRefresh = 1ull << 56,
+    // backperf (11-06): a cached write to pages without GPU-written data asks the GPU-modified
+    // sets once (BufferCache::CachedWriteMemory), and a dirty memory gather with nothing
+    // collected returns before the collectors' lock and the swap
+    // (Core::GPUDirtyMemoryManager::Gather). Idea: zortos293/lichii 44bf47d37.
+    CachedWriteOneLookup = 1ull << 59,
 };
 
 inline const u64 g_mask = [] {
