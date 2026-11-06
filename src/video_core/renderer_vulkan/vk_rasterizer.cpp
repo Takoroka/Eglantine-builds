@@ -8,6 +8,8 @@
 #include <array>
 #include <bit>
 #include <chrono>
+#include <functional>
+#include <string>
 #include <memory>
 #include <limits>
 #include <cstdio>
@@ -369,9 +371,14 @@ const bool same_state_enabled = [] {
     const char* const value = std::getenv("EDEN_NX2_SAME_STATE");
     return value == nullptr || value[0] != '0';
 }();
-const bool indirect_repeat_stats = [] {
-    const char* const value = std::getenv("EDEN_NX2_INDIRECT_REPEAT_STATS");
-    return value != nullptr && value[0] == '1';
+const bool repeat_stats_enabled = [] {
+    // EDEN_NX2_INDIRECT_REPEAT_STATS: the first build's name.
+    for (const char* const name : {"EDEN_NX2_REPEAT_STATS", "EDEN_NX2_INDIRECT_REPEAT_STATS"}) {
+        if (const char* const value = std::getenv(name); value != nullptr && value[0] == '1') {
+            return true;
+        }
+    }
+    return false;
 }();
 } // Anonymous namespace
 
@@ -512,7 +519,7 @@ void RasterizerVulkan::RememberDrawSetup(GraphicsPipeline* pipeline, bool is_ind
                    (!is_indexed || draw_state.index_buffer.format != Maxwell::IndexFormat::UnsignedByte ||
                     device.IsExtIndexTypeUint8Supported()) &&
                    VideoCommon::GpuSplit::OnBackThread();
-    if (indirect_repeat_stats && !repeat.valid) {
+    if (repeat_stats_enabled && !repeat.valid) {
         repeat.invalid_reason = !same_state_enabled                    ? 0
                                 : !pipeline->IsBuilt()                 ? 1
                                 : !pipeline->CanRepeatDraws()          ? 2
@@ -712,48 +719,92 @@ void DiagRecordDraw(Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& 
     }
 }
 } // namespace
-void RasterizerVulkan::CountIndirectRepeat(u32 refusal) {
-    auto& s = indirect_stats;
+
+void RasterizerVulkan::CountRepeat(u32 refusal, bool refresh) {
+    using Tegra::Engines::Maxwell3D;
+    auto& s = repeat_stats;
+    if (s.other_methods.empty()) {
+        s.other_methods.resize(Maxwell3D::Regs::NUM_REGS + 2);
+    }
     ++s.draws;
-    // DrawIndirect's own two setup changes since the last indirect draw's setup (after it, before
-    // this one) are what that exclusion adds; any other refuses as for direct draws.
-    if (last_draw_indirect && repeat.valid &&
-        setup_events.load(std::memory_order_relaxed) - repeat.setup_events == 2) {
-        refusal &= ~RefusalSetupEvents;
+    if (indirect_draw) {
+        ++s.indirect;
+        // DrawIndirect's own two setup changes since the last indirect draw's setup (after it,
+        // before this one) are what its exclusion adds; any other refuses as for direct draws.
+        if (last_draw_indirect && repeat.valid &&
+            setup_events.load(std::memory_order_relaxed) - repeat.setup_events == 2) {
+            refusal &= ~RefusalSetupEvents;
+        }
+        refresh = refusal != 0 && (refusal & ~RefusalBuffers) == 0 && CanRefreshBuffers();
     }
     if (refusal == 0) {
         ++s.repeats;
-    } else if ((refusal & ~RefusalBuffers) == 0 && CanRefreshBuffers()) {
+        s.indirect_repeats += indirect_draw ? 1 : 0;
+    } else if (refresh) {
         ++s.refreshes;
+        s.indirect_refreshes += indirect_draw ? 1 : 0;
     } else {
-        ++s.refused[std::countr_zero(refusal)];
+        ++s.refused_first[std::countr_zero(refusal)];
+        for (u32 bits = refusal; bits != 0; bits &= bits - 1) {
+            ++s.refused_any[std::countr_zero(bits)];
+        }
         if ((refusal & RefusalNoPrevious) != 0) {
             ++s.invalid[repeat.invalid_reason];
+        }
+        if ((refusal & RefusalRegisters) != 0) {
+            const u32 method = maxwell3d->last_other_method;
+            ++s.other_methods[(method & 0x80000000u) != 0 ? Maxwell3D::Regs::NUM_REGS + 1
+                                                           : (std::min)(method, u32{Maxwell3D::Regs::NUM_REGS})];
         }
     }
     if ((s.draws & 4095) != 0) {
         return;
     }
     static auto last = std::chrono::steady_clock::now();
-    static IndirectRepeatStats last_stats{};
+    static RepeatStats last_stats{};
     const auto now = std::chrono::steady_clock::now();
     if (now - last < std::chrono::seconds{10}) {
         return;
     }
+    if (last_stats.other_methods.empty()) {
+        last_stats.other_methods.resize(s.other_methods.size());
+    }
     const double seconds = std::chrono::duration<double>(now - last).count();
     const auto rate = [&](u64 a, u64 b) { return static_cast<u64>((a - b) / seconds); };
-    const auto refused = [&](int bit) { return rate(s.refused[bit], last_stats.refused[bit]); };
+    const auto first = [&](int bit) { return rate(s.refused_first[bit], last_stats.refused_first[bit]); };
+    const auto any = [&](int bit) { return rate(s.refused_any[bit], last_stats.refused_any[bit]); };
     const auto invalid = [&](int why) { return rate(s.invalid[why], last_stats.invalid[why]); };
+    // The register methods behind most register refusals in this window.
+    std::vector<std::pair<u64, size_t>> methods;
+    for (size_t i = 0; i < s.other_methods.size(); ++i) {
+        if (const u64 n = s.other_methods[i] - last_stats.other_methods[i]; n != 0) {
+            methods.emplace_back(n, i);
+        }
+    }
+    std::ranges::sort(methods, std::greater<>{});
+    std::string top;
+    for (size_t i = 0; i < (std::min)(methods.size(), size_t{8}); ++i) {
+        const auto [n, method] = methods[i];
+        top += method == Maxwell3D::Regs::NUM_REGS       ? fmt::format(" state-run {}/s", rate(n, 0))
+               : method == Maxwell3D::Regs::NUM_REGS + 1 ? fmt::format(" hle-macro {}/s", rate(n, 0))
+                                                         : fmt::format(" {:#x} {}/s", method, rate(n, 0));
+    }
     LOG_INFO(HW_GPU,
-             "nx2 indirect repeat {:.1f} s: indirect draws {}/s, would repeat {}/s, would refresh {}/s; "
-             "refused (first reason): registers {} | back events {} | setup events {} | records {} | "
-             "excluded {} | no previous {} (storage/image writes {}, not built {}, mesh {}, "
-             "transform feedback {}, feedback loop {}, topology/index format {}, off the back thread {}) | "
-             "uniforms {} | geometry {} | buffer events {} | index range {}",
-             seconds, rate(s.draws, last_stats.draws), rate(s.repeats, last_stats.repeats),
-             rate(s.refreshes, last_stats.refreshes), refused(0), refused(1), refused(2), refused(3),
-             refused(4), refused(5), invalid(2), invalid(1), invalid(3), invalid(4), invalid(5),
-             invalid(6), invalid(7), refused(6), refused(7), refused(8), refused(9));
+             "nx2 repeat stats {:.1f} s: draws {}/s ({} indirect) | repeat {}/s ({} indirect would) | "
+             "refresh {}/s ({} indirect would) | full setup, first reason: registers {} | back events {} | "
+             "setup events {} | records {} | excluded {} | no previous {} | uniforms {} | geometry {} | "
+             "buffer events {} | index range {} || any reason: registers {} | back events {} | setup events {} "
+             "| records {} | excluded {} | no previous {} | uniforms {} | geometry {} | buffer events {} | "
+             "index range {} || no previous: storage/image writes {}, not built {}, mesh {}, transform "
+             "feedback {}, feedback loop {}, topology/index format {}, off the back thread {} || register "
+             "methods:{}",
+             seconds, rate(s.draws, last_stats.draws), rate(s.indirect, last_stats.indirect),
+             rate(s.repeats, last_stats.repeats), rate(s.indirect_repeats, last_stats.indirect_repeats),
+             rate(s.refreshes, last_stats.refreshes),
+             rate(s.indirect_refreshes, last_stats.indirect_refreshes), first(0), first(1), first(2),
+             first(3), first(4), first(5), first(6), first(7), first(8), first(9), any(0), any(1), any(2),
+             any(3), any(4), any(5), any(6), any(7), any(8), any(9), invalid(2), invalid(1), invalid(3),
+             invalid(4), invalid(5), invalid(6), invalid(7), top);
     last = now;
     last_stats = s;
 }
@@ -802,13 +853,13 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     // pipeline, descriptors, buffer bindings and render pass are still what this draw needs and
     // still bound in the command buffer, so only the draw is recorded.
     const u32 refusal = same_state_enabled ? RepeatRefusal(is_indexed) : RefusalNoPrevious;
-    if (indirect_draw && indirect_repeat_stats) {
-        CountIndirectRepeat(refusal);
-    }
     // Only uniform buffers (bindings, uploads) and vertex and index buffer addresses changed, and
     // none of what else the setup read: the pipeline, image views and samplers, storage and
     // texture buffers and render targets stay; the buffer bindings and descriptors are redone.
     const bool refresh = refusal != 0 && (refusal & ~RefusalBuffers) == 0 && CanRefreshBuffers();
+    if (repeat_stats_enabled) {
+        CountRepeat(refusal, refresh);
+    }
     maxwell3d->cbuf_changes.Reset();
     // EDEN_NX2_SAME_STATE_VERIFY=<n>: every n-th draw that could take one of those paths takes
     // the full setup instead, which is then compared with what the fast path would have used.

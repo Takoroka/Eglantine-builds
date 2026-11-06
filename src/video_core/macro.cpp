@@ -1570,6 +1570,7 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
         }
         // HLE programs write registers directly, past ProcessDirtyRegisters.
         ++maxwell3d.same_state_serials[Engines::Maxwell3D::SameStateOther];
+        maxwell3d.last_other_method = 0x80000000u | method;
 
         if (auto program = std::get_if<HLE_DrawArraysIndirect>(&cached))
             return program->Execute(system, maxwell3d, parameters, method);
