@@ -9,6 +9,7 @@
 #include <bit>
 #include <climits>
 #include <optional>
+#include <span>
 
 #include <boost/container/static_vector.hpp>
 
@@ -1053,35 +1054,77 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             access(index, ssbo_addr, cond);
         }
     }};
-    const auto define_load{[&](DefPtr ssbo_member, Id element_pointer, Id type, u32 shift) {
+    // words != 0: the access goes through the word view (element_pointer is its element), that
+    // many words from the one the address lands on.
+    const auto word_pointer{[&](Id element_pointer, Id ssbo, Id word, u32 index) {
+        const Id element{index == 0 ? word : OpIAdd(U32[1], word, Const(index))};
+        return OpAccessChain(element_pointer, ssbo, zero, element);
+    }};
+    const auto define_load{[&](DefPtr ssbo_member, Id element_pointer, Id type, u32 shift,
+                               u32 words) {
         const Id function_type{TypeFunction(type, U64)};
         const Id func_id{OpFunction(type, spv::FunctionControlMask::MaskNone, function_type)};
         const Id addr{OpFunctionParameter(U64)};
         define_body(ssbo_member, addr, element_pointer, shift,
-                    [&](Id ssbo_pointer, Id, Id) { OpReturnValue(OpLoad(type, ssbo_pointer)); });
+                    [&](Id ssbo_pointer, Id ssbo, Id word) {
+                        if (words == 0) {
+                            OpReturnValue(OpLoad(type, ssbo_pointer));
+                            return;
+                        }
+                        std::array<Id, 4> values{};
+                        for (u32 index = 0; index < words; ++index) {
+                            values[index] = OpLoad(
+                                U32[1], word_pointer(element_pointer, ssbo, word, index));
+                        }
+                        OpReturnValue(
+                            OpCompositeConstruct(type, std::span<const Id>(values.data(), words)));
+                    });
         OpReturnValue(ConstantNull(type));
         OpFunctionEnd();
         return func_id;
     }};
-    const auto define_write{[&](DefPtr ssbo_member, Id element_pointer, Id type, u32 shift) {
+    const auto define_write{[&](DefPtr ssbo_member, Id element_pointer, Id type, u32 shift,
+                                u32 words) {
         const Id function_type{TypeFunction(void_id, U64, type)};
         const Id func_id{OpFunction(void_id, spv::FunctionControlMask::MaskNone, function_type)};
         const Id addr{OpFunctionParameter(U64)};
         const Id data{OpFunctionParameter(type)};
-        define_body(ssbo_member, addr, element_pointer, shift, [&](Id ssbo_pointer, Id, Id) {
-            OpStore(ssbo_pointer, data);
-            OpReturn();
-        });
+        define_body(ssbo_member, addr, element_pointer, shift,
+                    [&](Id ssbo_pointer, Id ssbo, Id word) {
+                        if (words == 0) {
+                            OpStore(ssbo_pointer, data);
+                        }
+                        for (u32 index = 0; index < words; ++index) {
+                            OpStore(word_pointer(element_pointer, ssbo, word, index),
+                                    OpCompositeExtract(U32[1], data, index));
+                        }
+                        OpReturn();
+                    });
         OpReturn();
         OpFunctionEnd();
         return func_id;
     }};
     const auto define{
         [&](DefPtr ssbo_member, const StorageTypeDefinition& type_def, Id type, size_t size) {
+            // Bindings start at the host's storage buffer alignment. When it is smaller than the
+            // access (4 bytes on AMD), an aligned 8 or 16 byte address can start at any word of
+            // the binding, so those accesses go word by word; so do they without descriptor
+            // aliasing, where the word view is the only one.
+            if (size > sizeof(u32) && (!profile.support_descriptor_aliasing ||
+                                       profile.min_ssbo_alignment < size)) {
+                const Id word_type{storage_types.U32.element};
+                const u32 shift{static_cast<u32>(std::countr_zero(sizeof(u32)))};
+                const u32 words{static_cast<u32>(size / sizeof(u32))};
+                const Id load_func{
+                    define_load(&StorageDefinitions::U32, word_type, type, shift, words)};
+                const Id write_func{
+                    define_write(&StorageDefinitions::U32, word_type, type, shift, words)};
+                return std::make_pair(load_func, write_func);
+            }
             const Id element_type{type_def.element};
             const u32 shift{static_cast<u32>(std::countr_zero(size))};
-            const Id load_func{define_load(ssbo_member, element_type, type, shift)};
-            const Id write_func{define_write(ssbo_member, element_type, type, shift)};
+            const Id load_func{define_load(ssbo_member, element_type, type, shift, 0)};
+            const Id write_func{define_write(ssbo_member, element_type, type, shift, 0)};
             return std::make_pair(load_func, write_func);
         }};
     std::tie(load_global_func_u32, write_global_func_u32) =
