@@ -80,6 +80,8 @@ public:
         std::chrono::steady_clock::time_point since;
         std::chrono::steady_clock::time_point last_fences; ///< When it last released fences
         bool reported;
+        /// When the back was last drained for it (A/B bit AcquireNoDrain drains every 1 ms).
+        std::chrono::steady_clock::time_point last_drain;
 
         [[nodiscard]] bool Matches(u32 current) const;
     };

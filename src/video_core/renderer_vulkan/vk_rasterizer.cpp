@@ -1298,8 +1298,8 @@ void RasterizerVulkan::DrawIndirect() {
     }
     if (params.after_gpu_writes && Nx2IndirectBarrierNeeded(params)) {
         // The arguments may be shader or copy output recorded since the last such barrier
-        // (Maxwell3D::BackIndirectDrawMacro); a wait for idle orders the work but doesn't make
-        // the writes visible to the indirect read.
+        // (Maxwell3D::BackIndirectDrawMacro). Without A/B bit WaitForIdleBarrier a wait for idle
+        // doesn't make the writes visible to the indirect read, and the game needn't send one.
         nx2_indirect_barrier_serial = buffer_cache.Nx2GpuWriteSerial();
         Tegra::Nx2CountList(Tegra::g_nx2_list_stats.indirect_barriers);
         scheduler.RequestOutsideRenderPassOperationContext();
@@ -1657,6 +1657,21 @@ void RasterizerVulkan::DispatchCompute() {
         return;
     }
 
+    // A/B bit WaitForIdleBarrier: the dispatch's writes also come after earlier ones (write after
+    // write), an indirect one's arguments are visible to its read of them (it had no barrier at
+    // all), and the next render pass waits for it (Scheduler::RequestComputeBarrier).
+    const bool barriers = Common::Nx2Ab::On(Common::Nx2Ab::WaitForIdleBarrier);
+    const auto record_barrier = [this](VkPipelineStageFlags stages) {
+        scheduler.Record([stages](vk::CommandBuffer cmdbuf) {
+            static constexpr VkMemoryBarrier barrier{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            };
+            cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, stages, 0, barrier);
+        });
+    };
     const auto& qmd{kepler_compute->launch_description};
     auto indirect_address = kepler_compute->GetIndirectComputeAddress();
     if (indirect_address) {
@@ -1666,6 +1681,9 @@ void RasterizerVulkan::DispatchCompute() {
         const auto [buffer, offset] =
             buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
         scheduler.RequestOutsideRenderPassOperationContext();
+        if (barriers) {
+            record_barrier(VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        }
         scheduler.Record([pipeline, indirect_buffer = buffer->Handle(),
                           indirect_offset = offset](vk::CommandBuffer cmdbuf) {
             if (!pipeline->IsBound()) {
@@ -1673,6 +1691,9 @@ void RasterizerVulkan::DispatchCompute() {
             }
             cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
         });
+        if (barriers) {
+            scheduler.RequestComputeBarrier();
+        }
         SubmitNx2ListCopies();
         return;
     }
@@ -1682,20 +1703,27 @@ void RasterizerVulkan::DispatchCompute() {
         return;
     }
     scheduler.RequestOutsideRenderPassOperationContext();
-    static constexpr VkMemoryBarrier READ_BARRIER{
-        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .pNext = nullptr,
-        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
-    };
-    scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                               0, READ_BARRIER); });
+    if (barriers) {
+        record_barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    } else {
+        static constexpr VkMemoryBarrier READ_BARRIER{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+        };
+        scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   0, READ_BARRIER); });
+    }
     scheduler.Record([pipeline, dim](vk::CommandBuffer cmdbuf) {
         if (!pipeline->IsBound()) {
             return;
         }
         cmdbuf.Dispatch(dim[0], dim[1], dim[2]);
     });
+    if (barriers) {
+        scheduler.RequestComputeBarrier();
+    }
     SubmitNx2ListCopies();
 
     // Log compute dispatch
@@ -2125,6 +2153,29 @@ void RasterizerVulkan::WaitForIdle() {
     SCOPE_EXIT {
         NoteSetupChange();
     };
+    Tegra::Nx2CountList(Tegra::g_nx2_list_stats.wait_for_idles);
+    if (Common::Nx2Ab::On(Common::Nx2Ab::WaitForIdleBarrier)) {
+        // Everything recorded before it finishes before anything after it starts, and its writes
+        // are visible there. The event below orders nothing: its wait ends at the top of the pipe,
+        // without a memory barrier, and the event is never reset, so it is set from its first use
+        // on. Idea: zortos293/lichii 73bcdc059.
+        query_cache.NotifyWFI();
+        scheduler.RequestOutsideRenderPassOperationContext();
+        scheduler.Record([](vk::CommandBuffer cmdbuf) {
+            static constexpr VkMemoryBarrier barrier{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, barrier);
+        });
+        // It covers the barrier the dispatches before it asked for.
+        scheduler.ClearComputeBarrier();
+        fence_manager.SignalOrdering();
+        return;
+    }
     // Everything but wait pixel operations. This intentionally includes FRAGMENT_SHADER_BIT because
     // fragment shaders can still write storage buffers.
     VkPipelineStageFlags flags =

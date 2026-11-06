@@ -412,8 +412,19 @@ bool GpuSplit::ReadAhead(Tegra::MemoryManager& memory, GPUVAddr address, u32* wo
                                             Settings::IsGPUFenceBehaviorAccurate();
     const u64 size = u64{count} * sizeof(u32);
     const auto device = memory.GpuToCpuAddress(address);
-    if (!read_ahead || delayed_releases || count == 0 || !device ||
-        memory.GpuToCpuAddress(address + size - 1) != *device + size - 1) {
+    // The queued writes are looked up in one device range: every page of the read must map where
+    // that range puts it, not only its first and last byte (idea: zortos293/lichii PR #243,
+    // tibzejoker c303d1085d).
+    const auto contiguous = [&] {
+        for (GPUVAddr page = (address | GPUVAddr{0xfff}) + 1; page < address + size;
+             page += 0x1000) {
+            if (memory.GpuToCpuAddress(page) != *device + (page - address)) {
+                return false;
+            }
+        }
+        return memory.GpuToCpuAddress(address + size - 1) == *device + size - 1;
+    };
+    if (!read_ahead || delayed_releases || count == 0 || !device || !contiguous()) {
         ++read_ahead_stats.fallbacks;
         return false;
     }

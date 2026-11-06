@@ -192,6 +192,18 @@ struct Nx2ListStats {
     std::atomic<u64> extended_fallbacks; ///< The constant buffer isn't the shaders' bank 0 alone:
                                          ///< the back read the arguments and drew as the macro does
     std::atomic<u64> barriers_skipped;   ///< GPU writes since the last barrier, none to its words
+    // Semaphore acquires answered from the split's record of queued writes (A/B bit AcquireNoDrain).
+    std::atomic<u64> acquire_ahead_met;   ///< Met at the acquire, without a drain
+    std::atomic<u64> acquire_ahead_waits; ///< Not met: the channel parked without a drain
+    std::atomic<u64> resume_ahead_met;    ///< Polls of a parked one that resumed it without a drain
+    std::atomic<u64> resume_ahead_waits;  ///< ... that kept it waiting without a drain
+    std::atomic<u64> acquire_not_ahead;   ///< The record couldn't give the word: drained as before
+    std::atomic<u64> acquire_verified;    ///< EDEN_NX2_ACQUIRE_VERIFY: answers compared with a drain's
+    std::atomic<u64> acquire_early;       ///< ... met ahead but not after the drain (logged)
+    std::atomic<u64> acquire_late;        ///< ... met only after the drain
+    // Vulkan (A/B bit WaitForIdleBarrier).
+    std::atomic<u64> wait_for_idles;        ///< RasterizerVulkan::WaitForIdle
+    std::atomic<u64> compute_draw_barriers; ///< Barriers between dispatches and the next render pass
 };
 inline Nx2ListStats g_nx2_list_stats{};
 
