@@ -479,7 +479,14 @@ private:
     void UpdateVertexBuffer(u32 index);
 
     /// Vertex lookup statistics (EDEN_NX2_VB_CACHE_STATS / EDEN_NX2_VB_CACHE_VERIFY).
-    void CountVertexLookup(bool hit, bool mismatch);
+    enum class VertexLookupOutcome {
+        Hit,
+        HitMismatch,   ///< verify: a full lookup gave another binding
+        MissEntry,     ///< the entry held another range (or none)
+        MissMappings,  ///< the address space was remapped since
+        MissBuffers,   ///< buffers were created or deleted since
+    };
+    void CountVertexLookup(VertexLookupOutcome outcome);
 
     void UpdateDrawIndirect();
 
@@ -613,7 +620,8 @@ private:
 
     /// Vertex stream lookups (UpdateVertexBuffer): a GPU address range's binding, valid while the
     /// address space, its mappings and the set of buffers are as when it was stored. Games set
-    /// their streams per mesh, so a frame's meshes come back to the same few ranges.
+    /// their streams per mesh, so a frame's meshes come back to the same ranges; Donkey Kong
+    /// Bananza draws ~5000 times a frame, which thrashed 64 entries (18% hits).
     struct VertexLookup {
         GPUVAddr begin{};
         GPUVAddr end{};
@@ -622,7 +630,8 @@ private:
         u64 buffer_set_serial{};
         Binding binding{};
     };
-    std::array<VertexLookup, 64> vertex_lookups{};
+    static constexpr u32 VertexLookupBits = 10;
+    std::array<VertexLookup, size_t{1} << VertexLookupBits> vertex_lookups{};
     /// Bumped whenever a buffer is created or deleted (lookups made before may name another one).
     u64 buffer_set_serial = 1;
 

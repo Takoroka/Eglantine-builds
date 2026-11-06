@@ -1823,17 +1823,19 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
         array.enable != 0 && gpu_addr_end > gpu_addr_begin &&
                 Common::Nx2Ab::On(Common::Nx2Ab::VertexLookupCache) &&
                 !Settings::IsGPUFenceBehaviorAccurate()
-            ? &vertex_lookups[((gpu_addr_begin >> 8) ^ (gpu_addr_end >> 4)) % vertex_lookups.size()]
+            ? &vertex_lookups[((gpu_addr_begin ^ (gpu_addr_end << 7)) * 0x9E3779B97F4A7C15ULL) >>
+                              (64 - VertexLookupBits)]
             : nullptr;
     const u64 map_generation = gpu_memory->MapGeneration();
-    const bool hit = lookup != nullptr && lookup->begin == gpu_addr_begin &&
-                     lookup->end == gpu_addr_end && lookup->address_space == gpu_memory->GetID() &&
-                     lookup->map_generation == map_generation &&
+    const bool same_entry = lookup != nullptr && lookup->begin == gpu_addr_begin &&
+                            lookup->end == gpu_addr_end &&
+                            lookup->address_space == gpu_memory->GetID();
+    const bool hit = same_entry && lookup->map_generation == map_generation &&
                      lookup->buffer_set_serial == buffer_set_serial;
     if (hit && !verify) {
         channel_state->vertex_buffers[index] = lookup->binding;
         UpdateVertexBufferSlot(index, lookup->binding);
-        CountVertexLookup(true, false);
+        CountVertexLookup(VertexLookupOutcome::Hit);
         return;
     }
     const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
@@ -1854,9 +1856,16 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
         .buffer_id = buffer_id,
     };
     if (lookup != nullptr) {
-        CountVertexLookup(hit, hit && (lookup->binding.device_addr != binding.device_addr ||
-                                       lookup->binding.size != binding.size ||
-                                       lookup->binding.buffer_id != binding.buffer_id));
+        if (hit) {
+            const bool differs = lookup->binding.device_addr != binding.device_addr ||
+                                 lookup->binding.size != binding.size ||
+                                 lookup->binding.buffer_id != binding.buffer_id;
+            CountVertexLookup(differs ? VertexLookupOutcome::HitMismatch : VertexLookupOutcome::Hit);
+        } else {
+            CountVertexLookup(!same_entry                                ? VertexLookupOutcome::MissEntry
+                              : lookup->map_generation != map_generation ? VertexLookupOutcome::MissMappings
+                                                                         : VertexLookupOutcome::MissBuffers);
+        }
         // The buffer set as it is now: FindBuffer may have created the buffer.
         *lookup = {gpu_addr_begin, gpu_addr_end, gpu_memory->GetID(), map_generation,
                    buffer_set_serial, binding};
@@ -1866,21 +1875,23 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
 }
 
 template <class P>
-void BufferCache<P>::CountVertexLookup(bool hit, bool mismatch) {
-    // EDEN_NX2_VB_CACHE_STATS=1 (or the verify): hits, misses and mismatches every 10 s.
+void BufferCache<P>::CountVertexLookup(VertexLookupOutcome outcome) {
+    // EDEN_NX2_VB_CACHE_STATS=1 (or the verify): hits, misses by reason and mismatches every 10 s.
     static const bool enabled = std::getenv("EDEN_NX2_VB_CACHE_STATS") != nullptr ||
                                 std::getenv("EDEN_NX2_VB_CACHE_VERIFY") != nullptr;
     if (!enabled) {
         return;
     }
-    static u64 hits{}, misses{}, mismatches{};
+    static std::array<u64, 5> counts{};
     static auto last_log = std::chrono::steady_clock::now();
-    ++(hit ? hits : misses);
-    mismatches += mismatch ? 1 : 0;
+    ++counts[static_cast<size_t>(outcome)];
     if (const auto now = std::chrono::steady_clock::now(); now - last_log >= std::chrono::seconds{10}) {
-        LOG_INFO(HW_GPU, "nx2 vertex lookups: last {:.0f} s {} hits, {} misses, {} hits differing from a full lookup",
-                 std::chrono::duration<double>(now - last_log).count(), hits, misses, mismatches);
-        hits = misses = mismatches = 0;
+        LOG_INFO(HW_GPU,
+                 "nx2 vertex lookups: last {:.0f} s {} hits ({} differing from a full lookup), misses: "
+                 "{} other range in the entry, {} remapped, {} buffers created or deleted",
+                 std::chrono::duration<double>(now - last_log).count(), counts[0] + counts[1],
+                 counts[1], counts[2], counts[3], counts[4]);
+        counts = {};
         last_log = now;
     }
 }
