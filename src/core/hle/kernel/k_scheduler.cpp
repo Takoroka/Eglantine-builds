@@ -97,6 +97,24 @@ u64 KScheduler::UpdateHighestPriorityThreads(KernelCore& kernel) {
     }
 }
 
+void KScheduler::TakeDummyThreadsToWake(KernelCore& kernel, DummyThreadWakeList& out) {
+    ASSERT(IsSchedulerLockedByCurrentThread(kernel));
+    // Empty unless WakeupWaitingDummyThreads left them (A/B bit 58).
+    auto& woken = kernel.GlobalSchedulerContext().m_woken_dummy_threads;
+    if (!woken.empty()) {
+        out.assign(woken.begin(), woken.end());
+        woken.clear();
+    }
+}
+
+void KScheduler::WakeDummyThreads(const DummyThreadWakeList& threads) {
+    // A host thread on the list can't get past its wait before its runnable flag is set here, so
+    // none of them has ended since the list was taken.
+    for (KThread* const thread : threads) {
+        thread->DummyThreadWakeAfterUnlock();
+    }
+}
+
 void KScheduler::Schedule(KernelCore& kernel) {
     ASSERT(GetCurrentThread(kernel).GetDisableDispatchCount() == 1);
     ASSERT(m_core_id == GetCurrentCoreId(kernel));

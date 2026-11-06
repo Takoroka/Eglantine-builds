@@ -1343,6 +1343,16 @@ namespace Kernel {
         m_dummy_thread_cv.notify_one();
     }
 
+    void KThread::DummyThreadWakeAfterUnlock() {
+        ASSERT(this->IsDummyThread());
+
+        // Notified with the mutex held: the woken thread can't return from its wait, and end,
+        // before this is done with it.
+        std::scoped_lock lock{m_dummy_thread_mutex};
+        m_dummy_thread_runnable = true;
+        m_dummy_thread_cv.notify_one();
+    }
+
     void KThread::BeginWait(KernelCore& kernel, KThreadQueue* queue) {
         // Set our state as waiting.
         this->SetState(kernel, ThreadState::Waiting);
