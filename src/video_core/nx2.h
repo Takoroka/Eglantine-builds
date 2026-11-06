@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -72,22 +73,17 @@ inline void Nx2MarkCommandListPage(u64 device_address) {
     return (g_nx2_command_list_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1;
 }
 
-// Command list pages draws write too (BufferCache::Nx2ListPage::draw_written). A draw's written
-// storage binding is often the whole mapping (up to 8 MiB when the shader's pointer has no size
-// next to it), so it covers the command lists in the same pool though it doesn't write them.
-// With A/B bit ListDrawRanges off, every list on such a page drains the split, as before. On, a
-// list there reads guest memory (no GPU work but draws wrote the page since it was flushed) or
-// the copy made after the dispatch or copy that last wrote it (no other write since) when
-// - exact: the draws' written ranges miss the list's bytes (64-byte pieces), or
-// - verified: the page's drained reads found that guest memory or copy already right
-//   (Nx2ListVerifyAfter times, never wrong), so the draws don't write those bytes in fact. Every
-//   Nx2ListVerifyEvery'th such read (of any page) drains again and compares; once wrong, the
-//   page's lists always drain.
+// Command list pages draws write too (BufferCache::Nx2ListPage::draw_written). With A/B bit
+// ListDrawRanges off, every list on such a page drains the split, as before. On, a list there
+// reads guest memory (no GPU work but draws wrote the page since it was flushed) or the copy made
+// after the dispatch or copy that last wrote it (no other write since) when the draws' written
+// ranges miss the list's bytes (64-byte pieces). Donkey Kong Bananza's draws write its lists
+// themselves (20-byte lists in 64-byte slots, about 4% of them changed at a drain), so its lists
+// still drain. That the drained words came out unchanged says nothing for the next frame: reading
+// past the draws on that basis (11-06 "verified" reads) ran stale lists.
 [[nodiscard]] inline bool Nx2ListDrawRanges() {
     return Common::Nx2Ab::On(Common::Nx2Ab::ListDrawRanges);
 }
-inline constexpr u32 Nx2ListVerifyAfter = 16;
-inline constexpr u32 Nx2ListVerifyEvery = 128;
 
 // Counts for the front's 10 s "command lists" log line (dma_pusher.cpp, ReportListStats).
 struct Nx2ListStats {
@@ -95,7 +91,6 @@ struct Nx2ListStats {
     std::atomic<u64> copied;       ///< Read from a copy, pages draws don't write
     std::atomic<u64> synced;       ///< Read from guest memory, flushed since, pages draws don't write
     std::atomic<u64> exact;        ///< Pages draws write: read past the draws' ranges
-    std::atomic<u64> verified;     ///< Pages draws write: read as the page's drained reads found right
     std::atomic<u64> drains;       ///< Drained the split and flushed (FlushGpuWrittenCommands)
     std::atomic<u64> drain_ns;     ///< Of those: waiting for the back
     std::atomic<u64> flush_ns;     ///< Of those: the flush (the host GPU's work and a download)
@@ -120,12 +115,46 @@ struct Nx2ListStats {
     std::atomic<u64> split_drain_ns;
     std::atomic<u64> split_waits; ///< WaitFor: a position (writers, macro DMA reads, ...)
     std::atomic<u64> split_wait_ns;
+    // Drain calls by caller (also the quick ones, when the back was idle already), and their time.
+    std::atomic<u64> acquire_drains;     ///< Puller: semaphore acquires (SEM_ACQUIRE, trigger)
+    std::atomic<u64> acquire_drain_ns;
+    std::atomic<u64> resume_drains;      ///< Puller: parked acquires resumed (CanResumeAcquire)
+    std::atomic<u64> resume_drain_ns;
+    std::atomic<u64> execute_drains;     ///< Puller: Ampere SEM_EXECUTE acquires
+    std::atomic<u64> execute_drain_ns;
+    std::atomic<u64> execute_on_back;    ///< ... checked on the back instead (SemAcquireOnBack)
+    std::atomic<u64> macro_read_drains;  ///< Maxwell3D front: macro DMA reads not read ahead
+    std::atomic<u64> macro_read_drain_ns;
+    std::atomic<u64> sync_drains;        ///< DmaPusher: entries that ask for a sync
+    std::atomic<u64> sync_drain_ns;
+    std::atomic<u64> run_drains;         ///< GPU thread: functions run before later reads
+    std::atomic<u64> run_drain_ns;
 };
 inline Nx2ListStats g_nx2_list_stats{};
 
 inline void Nx2CountList(std::atomic<u64>& counter, u64 amount = 1) {
     counter.fetch_add(amount, std::memory_order_relaxed);
 }
+
+/// Counts one call and its time into two Nx2ListStats counters.
+class Nx2CountedTime {
+public:
+    Nx2CountedTime(std::atomic<u64>& count_, std::atomic<u64>& ns_)
+        : count{count_}, ns{ns_}, start{std::chrono::steady_clock::now()} {}
+    ~Nx2CountedTime() {
+        Nx2CountList(count);
+        Nx2CountList(ns, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - start)
+                                              .count()));
+    }
+    Nx2CountedTime(const Nx2CountedTime&) = delete;
+    Nx2CountedTime& operator=(const Nx2CountedTime&) = delete;
+
+private:
+    std::atomic<u64>& count;
+    std::atomic<u64>& ns;
+    std::chrono::steady_clock::time_point start;
+};
 
 /// A new emulation session starts: no page has been written by its GPU yet.
 inline void Nx2ClearGpuWrittenPages() {

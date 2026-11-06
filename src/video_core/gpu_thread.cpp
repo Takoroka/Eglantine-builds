@@ -18,6 +18,7 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
@@ -121,7 +122,12 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     split.Defer([gpu = &system.GPU()] { gpu->TickWork(); });
                 } else if (auto* run = std::get_if<RunCommand>(&next.data)) {
                     if (run->before_later_reads) {
-                        split.Drain();
+                        {
+                            const Tegra::Nx2CountedTime counted{
+                                Tegra::g_nx2_list_stats.run_drains,
+                                Tegra::g_nx2_list_stats.run_drain_ns};
+                            split.Drain();
+                        }
                         run->func();
                     } else {
                         split.DeferFunction(std::move(run->func));

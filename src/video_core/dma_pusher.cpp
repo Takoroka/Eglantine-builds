@@ -66,7 +66,6 @@ void ReportListStats() {
     const double copied = rate(stats.copied);
     const double synced = rate(stats.synced);
     const double exact = rate(stats.exact);
-    const double verified = rate(stats.verified);
     const double drains = rate(stats.drains);
     const double drain_ms = ms(stats.drain_ns);
     const double flush_ms = ms(stats.flush_ns);
@@ -89,28 +88,47 @@ void ReportListStats() {
     const double split_drain_ms = ms(stats.split_drain_ns);
     const double split_waits = rate(stats.split_waits);
     const double split_wait_ms = ms(stats.split_wait_ns);
+    const double acquire_drains = rate(stats.acquire_drains);
+    const double acquire_drain_ms = ms(stats.acquire_drain_ns);
+    const double resume_drains = rate(stats.resume_drains);
+    const double resume_drain_ms = ms(stats.resume_drain_ns);
+    const double execute_drains = rate(stats.execute_drains);
+    const double execute_drain_ms = ms(stats.execute_drain_ns);
+    const double execute_on_back = rate(stats.execute_on_back);
+    const double macro_read_drains = rate(stats.macro_read_drains);
+    const double macro_read_drain_ms = ms(stats.macro_read_drain_ns);
+    const double sync_drains = rate(stats.sync_drains);
+    const double sync_drain_ms = ms(stats.sync_drain_ns);
+    const double run_drains = rate(stats.run_drains);
+    const double run_drain_ms = ms(stats.run_drain_ns);
     if (entries == 0 && draw_writes == 0 && entry_waits == 0 && entry_skips == 0 &&
         split_drains == 0 && split_waits == 0) {
         return;
     }
     using Common::Nx2Ab::On;
     LOG_INFO(HW_GPU,
-             "Command lists per second (bit 48 {}, 49 {}): {:.0f} entries on GPU-written pages | "
-             "read from copies {:.0f}, synced {:.0f}, past the draws' ranges {:.0f}, verified "
-             "{:.0f} | list drains {:.0f}: {:.1f} ms for the back, {:.1f} ms flushing; {:.0f} on "
-             "pages draws write ({:.0f} outside their ranges) | waits for writers {:.1f} ms, for "
-             "copies {:.1f} ms | drained words vs guest memory/copy: {:.0f} same, {:.0f} "
-             "different, {:.0f} neither current | draw writes to list pages {:.0f} ({:.0f} KiB) | "
-             "entries on unwritten pages: {:.0f} waits ({:.1f} ms), {:.0f} found GPU-written, "
-             "{:.0f} skipped as CPU list pages, {:.0f} known ones needed the wait, {:.0f} turned "
-             "GPU-written | all front waits for the back: {:.0f} drains ({:.1f} ms), {:.0f} "
-             "position waits ({:.1f} ms)",
+             "Command lists per second (bit 48 {}, 49 {}, 50 {}): {:.0f} entries on GPU-written "
+             "pages | read from copies {:.0f}, synced {:.0f}, past the draws' ranges {:.0f} | list "
+             "drains {:.0f}: {:.1f} ms for the back, {:.1f} ms flushing; {:.0f} on pages draws "
+             "write ({:.0f} outside their ranges) | waits for writers {:.1f} ms, for copies "
+             "{:.1f} ms | drained words vs guest memory/copy: {:.0f} same, {:.0f} different, "
+             "{:.0f} neither current | draw writes to list pages {:.0f} ({:.0f} KiB) | entries on "
+             "unwritten pages: {:.0f} waits ({:.1f} ms), {:.0f} found GPU-written, {:.0f} skipped "
+             "as CPU list pages, {:.0f} known ones needed the wait, {:.0f} turned GPU-written | "
+             "all front waits for the back: {:.0f} drains ({:.1f} ms), {:.0f} position waits "
+             "({:.1f} ms) | drain calls: acquires {:.0f} ({:.1f} ms), resumed acquires {:.0f} "
+             "({:.1f} ms), SEM_EXECUTE {:.0f} ({:.1f} ms) + {:.0f} checked on the back, macro "
+             "reads {:.0f} ({:.1f} ms), syncs {:.0f} ({:.1f} ms), runs {:.0f} ({:.1f} ms)",
              On(Common::Nx2Ab::ListDrawRanges) ? "on" : "off",
-             On(Common::Nx2Ab::ListWriterWaitSkip) ? "on" : "off", entries, copied, synced, exact,
-             verified, drains, drain_ms, flush_ms, draw_page_reads, would_exact, writer_ms,
-             copy_ms, matched, mismatched, no_copy, draw_writes, draw_kib, entry_waits,
-             entry_wait_ms, entry_needed, entry_skips, entry_known_needed, entry_known_turned,
-             split_drains, split_drain_ms, split_waits, split_wait_ms);
+             On(Common::Nx2Ab::ListWriterWaitSkip) ? "on" : "off",
+             On(Common::Nx2Ab::SemAcquireOnBack) ? "on" : "off", entries, copied, synced, exact,
+             drains, drain_ms, flush_ms, draw_page_reads, would_exact, writer_ms, copy_ms,
+             matched, mismatched, no_copy, draw_writes, draw_kib, entry_waits, entry_wait_ms,
+             entry_needed, entry_skips, entry_known_needed, entry_known_turned, split_drains,
+             split_drain_ms, split_waits, split_wait_ms, acquire_drains, acquire_drain_ms,
+             resume_drains, resume_drain_ms, execute_drains, execute_drain_ms, execute_on_back,
+             macro_read_drains, macro_read_drain_ms, sync_drains, sync_drain_ms, run_drains,
+             run_drain_ms);
 }
 
 } // Anonymous namespace
@@ -344,7 +362,11 @@ bool DmaPusher::Step() {
     }
 
     if (signal_sync) {
-        VideoCommon::GpuSplit::Get().Drain();
+        {
+            const Nx2CountedTime counted{g_nx2_list_stats.sync_drains,
+                                         g_nx2_list_stats.sync_drain_ns};
+            VideoCommon::GpuSplit::Get().Drain();
+        }
         rasterizer->SignalFence([this]() {
             std::scoped_lock lk(sync_mutex);
             synced = true;

@@ -24,6 +24,7 @@ namespace Common::Nx2Ab {
 enum Feature : u64 {
     ListDrawRanges = 1ull << 48,     ///< Lists on pages draws write: past the draws' ranges (nx2.h)
     ListWriterWaitSkip = 1ull << 49, ///< Known CPU list pages skip the wait for writers (dma_pusher)
+    SemAcquireOnBack = 1ull << 50,   ///< SEM_EXECUTE acquires checked on the back, no drain (puller)
 };
 
 inline const u64 g_mask = [] {

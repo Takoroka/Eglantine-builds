@@ -2206,17 +2206,12 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out) -> Nx
         }
         // How the list's words are read without draining: as the page's (no draw writes it), or
         // past the draws that do (nx2.h, Nx2ListDrawRanges).
-        enum class Use { None, Page, Exact, Verified };
+        enum class Use { None, Page, Exact };
         const u64 list_chunks = Nx2PageChunks(page, device_addr, out.size());
         const auto past_draws = [&](const Nx2ListPage& entry) {
-            if (!Tegra::Nx2ListDrawRanges()) {
-                return Use::None;
-            }
-            if ((entry.draw_chunks & list_chunks) == 0) {
-                return Use::Exact;
-            }
-            return !entry.mismatched && entry.verified >= Tegra::Nx2ListVerifyAfter ? Use::Verified
-                                                                                    : Use::None;
+            return Tegra::Nx2ListDrawRanges() && (entry.draw_chunks & list_chunks) == 0
+                       ? Use::Exact
+                       : Use::None;
         };
         const auto copy_use = [&](const Nx2ListPage& entry) {
             if (entry.draw_written) {
@@ -2229,9 +2224,9 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out) -> Nx
         };
         const auto count = [](Use use, bool copy) {
             auto& stats = Tegra::g_nx2_list_stats;
-            Tegra::Nx2CountList(use == Use::Page    ? (copy ? stats.copied : stats.synced)
-                                : use == Use::Exact ? stats.exact
-                                                    : stats.verified);
+            Tegra::Nx2CountList(use == Use::Exact ? stats.exact
+                                : copy            ? stats.copied
+                                                  : stats.synced);
         };
         Use use{};
         u64 tick{};
@@ -2254,12 +2249,6 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out) -> Nx
                 use = past_draws(entry);
             } else {
                 use = copy_use(entry);
-            }
-            // Every so often a verified page's list drains again and is compared
-            // (Nx2VerifyListRead).
-            if (use == Use::Verified && ++nx2_list_verify_count >= Tegra::Nx2ListVerifyEvery) {
-                nx2_list_verify_count = 0;
-                use = Use::None;
             }
             if (use == Use::None) {
                 return Nx2ListRead::Unknown;
@@ -2358,23 +2347,33 @@ void BufferCache<P>::Nx2VerifyListRead(DAddr device_addr, std::span<const u8> wo
             return;
         }
         if (read == nullptr) {
-            ++entry.verified;
             Tegra::Nx2CountList(stats.matched);
             return;
         }
         Tegra::Nx2CountList(stats.mismatched);
-        entry.verified = 0;
+        size_t first = 0;
+        while (read[first] == words[first]) {
+            ++first;
+        }
         if (!entry.mismatched) {
             entry.mismatched = true;
-            size_t first = 0;
-            while (read[first] == words[first]) {
-                ++first;
-            }
             LOG_INFO(HW_GPU,
                      "Command list page {:#x}: draws changed list words ({:#x} bytes at +{:#x}, "
-                     "first at +{:#x}, {} was stale, draw pieces {:#018x}): its lists always "
-                     "drain the split",
+                     "first at +{:#x}, {} was stale, draw pieces {:#018x})",
                      page, words.size(), offset, offset + first, what, entry.draw_chunks);
+        }
+        // What the draws write into the lists (the first 32 changes, up to 8 words each).
+        static u32 dumped{};
+        if (dumped < 32) {
+            ++dumped;
+            std::array<u32, 8> was{};
+            std::array<u32, 8> now{};
+            const size_t count = (std::min)(words.size() / sizeof(u32), was.size());
+            std::memcpy(was.data(), read, count * sizeof(u32));
+            std::memcpy(now.data(), words.data(), count * sizeof(u32));
+            LOG_INFO(HW_GPU, "Command list at {:#x} ({:#x} bytes) was {:08x}, now {:08x}",
+                     device_addr, words.size(), fmt::join(was.begin(), was.begin() + count, " "),
+                     fmt::join(now.begin(), now.begin() + count, " "));
         }
     }
 }

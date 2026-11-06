@@ -755,11 +755,9 @@ private:
         /// Written outside a compute dispatch or a DMA copy (a draw's storage writes) at least
         /// once: the front can't tell from what it sent whether such a write is still queued, so
         /// the page's lists drain the split instead of reading guest memory or a copy, unless the
-        /// draws' ranges miss the list or its drained reads found those right (nx2.h,
-        /// Nx2ListDrawRanges).
+        /// draws' ranges miss the list (nx2.h, Nx2ListDrawRanges).
         bool draw_written{};
-        bool mismatched{};       ///< A drained read found guest memory or the copy wrong
-        u32 verified{};          ///< Drained reads that found them right
+        bool mismatched{};       ///< A drained read found guest memory or the copy stale (logged)
         u64 draw_writes{};       ///< Of `writes`: draws' (outside a dispatch or copy)
         u64 copy_draw_writes{};  ///< `draw_writes` when the copy was made
         /// `writes - draw_writes` when the front last flushed the page: guest memory holds what
@@ -784,8 +782,6 @@ private:
     static u32* Nx2CopyMarker(const Nx2Staging& copy);
     std::mutex nx2_list_mutex; ///< nx2_list_pages: the split's front reads the copies
     std::unordered_map<DAddr, Nx2ListPage> nx2_list_pages;
-    /// Verified copy reads (nx2.h, Nx2ListVerifyEvery) since one drained to compare again.
-    u32 nx2_list_verify_count{};
     /// Copies replaced while the GPU may still write them: freed once it is past their tick.
     std::vector<std::pair<u64, Nx2Staging>> nx2_retired_list_copies;
     boost::container::small_vector<std::pair<BufferId, DAddr>, 8> nx2_list_copy_requests;
