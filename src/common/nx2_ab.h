@@ -22,6 +22,10 @@ namespace Common::Nx2Ab {
 
 // The registry of bits in use is C:\dev\nx2work\rounds\AB-BITS.md (bits 32 and up: 1ull << n).
 enum Feature : u64 {
+    // backperf (11-06): a buffer range found CPU clean stays clean without a new check while none of
+    // its tracking regions turned a page dirty (BufferCache::IsRangeCpuClean); written ranges the
+    // GPU-modified sets cover already aren't added again.
+    BufferCheckSkip = 1ull << 46,
 };
 
 inline const u64 g_mask = [] {

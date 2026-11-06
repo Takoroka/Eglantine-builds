@@ -29,6 +29,10 @@ public:
     /// Whether any range overlaps [base_address, base_address + size): one lookup.
     bool Intersects(AddressType base_address, size_t size) const;
 
+    /// Whether one range holds all of [base_address, base_address + size): one lookup (adjacent
+    /// ranges are joined, so a covered query lies in a single range).
+    bool Covers(AddressType base_address, size_t size) const;
+
     /// When no range overlaps [base_address, base_address + size), the gap between the ranges
     /// around it as [gap_begin, gap_end), and true; false when a range overlaps it. One lookup.
     bool FreeGap(AddressType base_address, size_t size, AddressType& gap_begin,

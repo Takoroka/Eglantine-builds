@@ -85,6 +85,22 @@ public:
         return true;
     }
 
+    /// Sum of the dirty generations (WordManager::dirty_generation) of the regions under a range:
+    /// while it is unchanged, no page of the range can have stopped being CPU clean. ~0 when one of
+    /// the regions doesn't exist yet (all its pages start CPU modified).
+    [[nodiscard]] u64 DirtyGeneration(VAddr query_cpu_addr, u64 query_size) const noexcept {
+        const std::size_t last = (query_cpu_addr + query_size - 1) >> HIGHER_PAGE_BITS;
+        u64 sum = 0;
+        for (std::size_t index = query_cpu_addr >> HIGHER_PAGE_BITS; index <= last; ++index) {
+            const Manager* const manager = top_tier[index];
+            if (manager == nullptr) {
+                return ~u64{0};
+            }
+            sum += manager->dirty_generation;
+        }
+        return sum;
+    }
+
     /// Returns true if a region has been modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
         size_t index{};
