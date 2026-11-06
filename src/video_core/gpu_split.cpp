@@ -573,8 +573,10 @@ size_t GpuSplit::Execute(const u64* entry) {
     case Kind::Wrap:
         return 0;
     case Kind::Engine:
+        last_back_event_from = back_engine;
         back_engine = reinterpret_cast<Tegra::Engines::EngineInterface*>(entry[1]);
         ++back_events;
+        last_back_event_engine = back_engine;
         return 2;
     case Kind::Method: {
         const u32 method = static_cast<u32>((head >> 8) & 0xffff);
@@ -613,7 +615,11 @@ size_t GpuSplit::Execute(const u64* entry) {
     case Kind::Call: {
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
         reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
-        back_events += (head & Quiet) == 0 ? 1 : 0;
+        if ((head & Quiet) == 0) {
+            ++back_events;
+            last_back_event_from = nullptr;
+            last_back_event_engine = nullptr;
+        }
         return 2 + payload;
     }
     case Kind::State: {

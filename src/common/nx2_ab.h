@@ -49,6 +49,9 @@ enum Feature : u64 {
                                      ///< drawn from the GPU (Maxwell3D::FrontIndirectDrawMacro)
     IndirectDrawMacroExtended = 1ull << 55, ///< The same for the macro's variant that also writes
                                             ///< base vertex/instance to the constant buffer
+    // backperf (11-06): pipelines whose only writes are storage buffers take the buffer refresh
+    // path (never a full repeat): RasterizerVulkan::PrepareDraw.
+    StorageWriteRefresh = 1ull << 56,
 };
 
 inline const u64 g_mask = [] {

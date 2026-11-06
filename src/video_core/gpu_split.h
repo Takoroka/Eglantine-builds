@@ -203,6 +203,13 @@ public:
     [[nodiscard]] u64 BackEvents() const noexcept {
         return back_events;
     }
+    /// The last back event (repeat stats): the engines switched from and to, or nulls for a
+    /// deferred call.
+    [[nodiscard]] std::pair<const Tegra::Engines::EngineInterface*,
+                            const Tegra::Engines::EngineInterface*>
+    LastBackEventEngines() const noexcept {
+        return {last_back_event_from, last_back_event_engine};
+    }
     /// Whether the calling thread is the back.
     [[nodiscard]] static bool OnBackThread() noexcept {
         return on_back_thread;
@@ -414,6 +421,8 @@ private:
     /// The back thread's read position (BackHasMoreWork); null on other threads.
     static inline thread_local const u64* t_back_read_position{};
     u64 back_events{};
+    const Tegra::Engines::EngineInterface* last_back_event_from{};
+    const Tegra::Engines::EngineInterface* last_back_event_engine{};
     static inline thread_local bool on_back_thread{};
 
     /// Whether the back is done with the Vulkan scheduler until it gets more work: set after its

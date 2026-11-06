@@ -448,6 +448,12 @@ public:
 
     [[nodiscard]] std::pair<Buffer*, u32> GetDrawIndirectBuffer();
 
+    /// Changes whenever a buffer is created or deleted (bindings resolved before may name a
+    /// deleted one).
+    [[nodiscard]] u64 BufferSetSerial() const noexcept {
+        return buffer_set_serial;
+    }
+
     template <typename Func>
     void BufferOperations(Func&& func) {
         do {

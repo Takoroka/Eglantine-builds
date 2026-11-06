@@ -319,6 +319,9 @@ GraphicsPipeline::GraphicsPipeline(
         can_repeat_draws &= !written(info->storage_buffers_descriptors) &&
                             !written(info->image_buffer_descriptors) &&
                             !written(info->image_descriptors) && !info->is_task && !info->is_mesh;
+        // Image writes mark the images modified in the full setup only (FillImageViews).
+        can_refresh_written &= !written(info->image_buffer_descriptors) &&
+                               !written(info->image_descriptors) && !info->is_task && !info->is_mesh;
         // The constant buffer words the setup reads: texture handles and storage buffer
         // addresses (with their sizes), one range per descriptor: uploads often go to the same
         // buffer, between them.

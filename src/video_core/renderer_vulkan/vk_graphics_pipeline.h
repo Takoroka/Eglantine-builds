@@ -126,6 +126,13 @@ public:
         return can_repeat_draws;
     }
 
+    /// Whether the only memory its stages write is storage buffers: a later draw may take the
+    /// buffer refresh path, which binds and synchronizes them and marks the written ranges again
+    /// as the full setup does (never a repeat, which records only the draw).
+    [[nodiscard]] bool WritesStorageOnly() const noexcept {
+        return !can_repeat_draws && can_refresh_written;
+    }
+
     /// Constant buffer bytes the setup reads (texture handles, storage buffer addresses): byte
     /// range [begin, end) of `slot` in `stage`.
     struct SetupCbufRead {
@@ -323,6 +330,7 @@ private:
     u32 num_textures{};
     bool fragment_has_color0_output{};
     bool can_repeat_draws{true};
+    bool can_refresh_written{true}; ///< No image or image buffer writes, not task/mesh
     bool can_refresh_buffers{true};
     std::vector<SetupCbufRead> setup_cbuf_reads;
     std::array<u32, NUM_STAGES> setup_cbuf_slots{};
