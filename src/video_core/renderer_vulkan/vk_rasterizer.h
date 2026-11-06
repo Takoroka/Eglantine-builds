@@ -218,6 +218,9 @@ private:
     void RememberDrawSetup(GraphicsPipeline* pipeline, bool is_indexed, u64 setup_events_seen);
     /// After a draw's buffer refresh.
     void RememberBufferRefresh(bool is_indexed);
+    /// EDEN_NX2_INDIRECT_REPEAT_STATS=1 (counters only): what the repeat and refresh paths would
+    /// do with the indirect draws, which never take them (DrawIndirect); logged every 10 s.
+    void CountIndirectRepeat(u32 refusal);
     /// Same-state verify (EDEN_NX2_SAME_STATE_VERIFY): what the fast path would have reused.
     struct SameStateExpectation {
         const GraphicsPipeline* pipeline{};
@@ -327,8 +330,18 @@ private:
         Tegra::Engines::Maxwell3D::Regs::PrimitiveTopology topology{};
         bool is_indexed{};
         bool valid{};
+        u8 invalid_reason{}; ///< Why not valid (indirect repeat stats only)
     } repeat;
     u64 same_state_verify_count{};
+    bool indirect_draw{};      ///< DrawIndirect's PrepareDraw is running
+    bool last_draw_indirect{}; ///< The draw prepared before this one was indirect
+    struct IndirectRepeatStats {
+        u64 draws{};
+        u64 repeats{};
+        u64 refreshes{};
+        std::array<u64, 10> refused{}; ///< By the lowest RepeatRefusalBits bit set
+        std::array<u64, 8> invalid{};  ///< RefusalNoPrevious: why the last setup wasn't repeatable
+    } indirect_stats;
 
     /// Uniform slot keep (uniform_stream_reuse.h): what happened since the last draw that bound
     /// uniform buffers. Clean when nothing but the guest writes listed here did.

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <memory>
 #include <limits>
@@ -368,6 +369,10 @@ const bool same_state_enabled = [] {
     const char* const value = std::getenv("EDEN_NX2_SAME_STATE");
     return value == nullptr || value[0] != '0';
 }();
+const bool indirect_repeat_stats = [] {
+    const char* const value = std::getenv("EDEN_NX2_INDIRECT_REPEAT_STATS");
+    return value != nullptr && value[0] == '1';
+}();
 } // Anonymous namespace
 
 u32 RasterizerVulkan::RepeatRefusal(bool is_indexed) const {
@@ -507,6 +512,16 @@ void RasterizerVulkan::RememberDrawSetup(GraphicsPipeline* pipeline, bool is_ind
                    (!is_indexed || draw_state.index_buffer.format != Maxwell::IndexFormat::UnsignedByte ||
                     device.IsExtIndexTypeUint8Supported()) &&
                    VideoCommon::GpuSplit::OnBackThread();
+    if (indirect_repeat_stats && !repeat.valid) {
+        repeat.invalid_reason = !same_state_enabled                    ? 0
+                                : !pipeline->IsBuilt()                 ? 1
+                                : !pipeline->CanRepeatDraws()          ? 2
+                                : mesh_draw                            ? 3
+                                : regs.transform_feedback_enabled != 0 ? 4
+                                : texture_cache.FeedbackLoopBarrier()  ? 5
+                                : !VideoCommon::GpuSplit::OnBackThread() ? 7
+                                                                       : 6;
+    }
     repeat.pipeline = pipeline;
     repeat.serials = maxwell3d->same_state_serials;
     repeat.back_events = VideoCommon::GpuSplit::Get().BackEvents();
@@ -697,11 +712,57 @@ void DiagRecordDraw(Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& 
     }
 }
 } // namespace
+void RasterizerVulkan::CountIndirectRepeat(u32 refusal) {
+    auto& s = indirect_stats;
+    ++s.draws;
+    // DrawIndirect's own two setup changes since the last indirect draw's setup (after it, before
+    // this one) are what that exclusion adds; any other refuses as for direct draws.
+    if (last_draw_indirect && repeat.valid &&
+        setup_events.load(std::memory_order_relaxed) - repeat.setup_events == 2) {
+        refusal &= ~RefusalSetupEvents;
+    }
+    if (refusal == 0) {
+        ++s.repeats;
+    } else if ((refusal & ~RefusalBuffers) == 0 && CanRefreshBuffers()) {
+        ++s.refreshes;
+    } else {
+        ++s.refused[std::countr_zero(refusal)];
+        if ((refusal & RefusalNoPrevious) != 0) {
+            ++s.invalid[repeat.invalid_reason];
+        }
+    }
+    if ((s.draws & 4095) != 0) {
+        return;
+    }
+    static auto last = std::chrono::steady_clock::now();
+    static IndirectRepeatStats last_stats{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds{10}) {
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - last).count();
+    const auto rate = [&](u64 a, u64 b) { return static_cast<u64>((a - b) / seconds); };
+    const auto refused = [&](int bit) { return rate(s.refused[bit], last_stats.refused[bit]); };
+    const auto invalid = [&](int why) { return rate(s.invalid[why], last_stats.invalid[why]); };
+    LOG_INFO(HW_GPU,
+             "nx2 indirect repeat {:.1f} s: indirect draws {}/s, would repeat {}/s, would refresh {}/s; "
+             "refused (first reason): registers {} | back events {} | setup events {} | records {} | "
+             "excluded {} | no previous {} (storage/image writes {}, not built {}, mesh {}, "
+             "transform feedback {}, feedback loop {}, topology/index format {}, off the back thread {}) | "
+             "uniforms {} | geometry {} | buffer events {} | index range {}",
+             seconds, rate(s.draws, last_stats.draws), rate(s.repeats, last_stats.repeats),
+             rate(s.refreshes, last_stats.refreshes), refused(0), refused(1), refused(2), refused(3),
+             refused(4), refused(5), invalid(2), invalid(1), invalid(3), invalid(4), invalid(5),
+             invalid(6), invalid(7), refused(6), refused(7), refused(8), refused(9));
+    last = now;
+    last_stats = s;
+}
 
 template <typename Func>
 void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     SCOPE_EXIT {
         gpu.TickWork();
+        last_draw_indirect = indirect_draw;
     };
     bool submitted = false;
     bool keep_begun = false;
@@ -741,6 +802,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     // pipeline, descriptors, buffer bindings and render pass are still what this draw needs and
     // still bound in the command buffer, so only the draw is recorded.
     const u32 refusal = same_state_enabled ? RepeatRefusal(is_indexed) : RefusalNoPrevious;
+    if (indirect_draw && indirect_repeat_stats) {
+        CountIndirectRepeat(refusal);
+    }
     // Only uniform buffers (bindings, uploads) and vertex and index buffer addresses changed, and
     // none of what else the setup read: the pipeline, image views and samplers, storage and
     // texture buffers and render targets stay; the buffer bindings and descriptors are redone.
@@ -1315,6 +1379,10 @@ void RasterizerVulkan::DrawIndirect() {
         });
     }
     buffer_cache.SetDrawIndirect(&params);
+    indirect_draw = true;
+    SCOPE_EXIT {
+        indirect_draw = false;
+    };
     PrepareDraw(params.is_indexed, [this, &params] {
         if (mesh_draw) {
             // Indirect task/mesh draws would need vkCmdDrawMeshTasksIndirectEXT's layout.
