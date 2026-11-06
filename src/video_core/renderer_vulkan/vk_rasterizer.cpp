@@ -1362,6 +1362,12 @@ void RasterizerVulkan::NoteGpuWrittenCommandListSynced(DAddr page) {
     buffer_cache.Nx2NoteListSynced(page);
 }
 
+void RasterizerVulkan::VerifyGpuWrittenCommandList(DAddr addr, std::span<const u8> words,
+                                                   std::span<const u8> before) {
+    // No cache lock, as in ReadGpuWrittenCommandList.
+    buffer_cache.Nx2VerifyListRead(addr, words, before);
+}
+
 void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
     SCOPE_EXIT {
         NoteSetupChange();

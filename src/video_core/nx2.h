@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "common/nx2_ab.h"
 
 namespace Tegra {
 
@@ -69,6 +70,61 @@ inline void Nx2MarkCommandListPage(u64 device_address) {
         return false;
     }
     return (g_nx2_command_list_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1;
+}
+
+// Command list pages draws write too (BufferCache::Nx2ListPage::draw_written). A draw's written
+// storage binding is often the whole mapping (up to 8 MiB when the shader's pointer has no size
+// next to it), so it covers the command lists in the same pool though it doesn't write them.
+// With A/B bit ListDrawRanges off, every list on such a page drains the split, as before. On, a
+// list there reads guest memory (no GPU work but draws wrote the page since it was flushed) or
+// the copy made after the dispatch or copy that last wrote it (no other write since) when
+// - exact: the draws' written ranges miss the list's bytes (64-byte pieces), or
+// - verified: the page's drained reads found that guest memory or copy already right
+//   (Nx2ListVerifyAfter times, never wrong), so the draws don't write those bytes in fact. Every
+//   Nx2ListVerifyEvery'th such read (of any page) drains again and compares; once wrong, the
+//   page's lists always drain.
+[[nodiscard]] inline bool Nx2ListDrawRanges() {
+    return Common::Nx2Ab::On(Common::Nx2Ab::ListDrawRanges);
+}
+inline constexpr u32 Nx2ListVerifyAfter = 16;
+inline constexpr u32 Nx2ListVerifyEvery = 128;
+
+// Counts for the front's 10 s "command lists" log line (dma_pusher.cpp, ReportListStats).
+struct Nx2ListStats {
+    std::atomic<u64> entries;      ///< GP entries on GPU-written pages
+    std::atomic<u64> copied;       ///< Read from a copy, pages draws don't write
+    std::atomic<u64> synced;       ///< Read from guest memory, flushed since, pages draws don't write
+    std::atomic<u64> exact;        ///< Pages draws write: read past the draws' ranges
+    std::atomic<u64> verified;     ///< Pages draws write: read as the page's drained reads found right
+    std::atomic<u64> drains;       ///< Drained the split and flushed (FlushGpuWrittenCommands)
+    std::atomic<u64> drain_ns;     ///< Of those: waiting for the back
+    std::atomic<u64> flush_ns;     ///< Of those: the flush (the host GPU's work and a download)
+    std::atomic<u64> writer_ns;    ///< ReadGpuWrittenCommands waiting for the last dispatch or copy
+    std::atomic<u64> copy_ns;      ///< Waiting for the host GPU to finish a copy
+    std::atomic<u64> draw_page_reads; ///< Of the drains: lists on pages draws write
+    std::atomic<u64> would_exact;  ///< Of those: the draws' ranges miss the list
+    std::atomic<u64> matched;      ///< ... guest memory or the copy already held the list's words
+    std::atomic<u64> mismatched;   ///< ... it didn't (draws changed them)
+    std::atomic<u64> no_copy;      ///< ... neither was current (not flushed, no copy)
+    std::atomic<u64> draw_writes;  ///< Draw writes to command list pages
+    std::atomic<u64> draw_bytes;   ///< Their bytes on those pages
+    // GP entries on pages no GPU work wrote, with dispatches or copies queued (DmaPusher::Step).
+    std::atomic<u64> entry_waits;  ///< Waited for those (WaitForWriters)
+    std::atomic<u64> entry_wait_ns;
+    std::atomic<u64> entry_needed; ///< ... and the entry was GPU-written after all
+    std::atomic<u64> entry_skips;  ///< Didn't wait: known CPU list pages (ListWriterWaitSkip)
+    std::atomic<u64> entry_known_needed; ///< Waited on known CPU list pages, and it was needed
+    std::atomic<u64> entry_known_turned; ///< Known CPU list pages found GPU-written later
+    // Every wait of the front for the back (gpu_split.cpp), whatever the cause.
+    std::atomic<u64> split_drains;
+    std::atomic<u64> split_drain_ns;
+    std::atomic<u64> split_waits; ///< WaitFor: a position (writers, macro DMA reads, ...)
+    std::atomic<u64> split_wait_ns;
+};
+inline Nx2ListStats g_nx2_list_stats{};
+
+inline void Nx2CountList(std::atomic<u64>& counter, u64 amount = 1) {
+    counter.fetch_add(amount, std::memory_order_relaxed);
 }
 
 /// A new emulation session starts: no page has been written by its GPU yet.

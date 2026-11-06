@@ -112,6 +112,14 @@ public:
     /// Switch 2: the front flushed this command list page with the split drained.
     virtual void NoteGpuWrittenCommandListSynced([[maybe_unused]] DAddr page) {}
 
+    /// Switch 2, the front, drained and flushed (before NoteGpuWrittenCommandListSynced): a
+    /// command list's words (within one 4 KiB page) as guest memory holds them now and held them
+    /// before the drain, to compare with what a read without the drain finds where draws write
+    /// the page too.
+    virtual void VerifyGpuWrittenCommandList([[maybe_unused]] DAddr addr,
+                                             [[maybe_unused]] std::span<const u8> words,
+                                             [[maybe_unused]] std::span<const u8> before) {}
+
     /// Check if the the specified memory area requires flushing to CPU Memory.
     virtual bool MustFlushRegion(DAddr addr, u64 size,
                                  VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;

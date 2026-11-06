@@ -103,6 +103,8 @@ public:
                      VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     GpuWrittenList ReadGpuWrittenCommandList(DAddr addr, std::span<u8> out) override;
     void NoteGpuWrittenCommandListSynced(DAddr page) override;
+    void VerifyGpuWrittenCommandList(DAddr addr, std::span<const u8> words,
+                                     std::span<const u8> before) override;
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;

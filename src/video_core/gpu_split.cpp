@@ -48,6 +48,26 @@ void Pause() {
 [[maybe_unused]] std::atomic<u32> g_back_thread_id{};
 std::atomic<bool> g_back_busy{};
 
+/// Counts one wait of the front for the back and its time (nx2.h, Nx2ListStats).
+class CountedWait {
+public:
+    CountedWait(std::atomic<u64>& count_, std::atomic<u64>& ns_)
+        : count{count_}, ns{ns_}, start{std::chrono::steady_clock::now()} {}
+    ~CountedWait() {
+        Tegra::Nx2CountList(count);
+        Tegra::Nx2CountList(ns, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                     std::chrono::steady_clock::now() - start)
+                                                     .count()));
+    }
+    CountedWait(const CountedWait&) = delete;
+    CountedWait& operator=(const CountedWait&) = delete;
+
+private:
+    std::atomic<u64>& count;
+    std::atomic<u64>& ns;
+    std::chrono::steady_clock::time_point start;
+};
+
 } // Anonymous namespace
 
 void GpuSplit::CheckOwner(const char* where) {
@@ -240,6 +260,8 @@ void GpuSplit::Drain() {
     }
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+    const CountedWait counted{Tegra::g_nx2_list_stats.split_drains,
+                              Tegra::g_nx2_list_stats.split_drain_ns};
     // Everything consumed is not enough: the back submits deferred work (Scheduler::DeferFlush)
     // from its idle hook afterwards, and the caller may use the scheduler once this returns.
     bool hook_asked = false;
@@ -456,6 +478,8 @@ void GpuSplit::WaitFor(u64 target) {
     }
     wait_target.store(target, std::memory_order_seq_cst);
     Publish();
+    const CountedWait counted{Tegra::g_nx2_list_stats.split_waits,
+                              Tegra::g_nx2_list_stats.split_wait_ns};
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache >= target) {

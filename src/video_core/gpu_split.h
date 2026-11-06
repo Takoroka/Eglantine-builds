@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdlib>
@@ -203,6 +204,11 @@ public:
     /// work wrote, so the back submits what it recorded without waiting for more (early submit);
     /// DmaPusher::Step's check before every entry on unmarked pages passes false.
     bool WaitForWriters(bool submit);
+    /// Whether WaitForWriters would wait.
+    [[nodiscard]] bool WritersQueued() const {
+        return consumed.load(std::memory_order_acquire) <
+               std::min(last_writer_position, write_position);
+    }
 
     /// On the back, while it runs an entry: whether more work was sent after it (false on any
     /// other thread, or without the split).
