@@ -831,6 +831,21 @@ void CountDirectDraw(bool no_vertices, bool no_instances, bool skipped) {
     last_log = now;
     draws = zero_vertices = zero_instances = skips = 0;
 }
+
+// EDEN_NX2_DYNSKIP_VERIFY=1: every 10 s, how many draws would have skipped the dynamic state
+// updates and how many of those recorded something there (what the skip would have lost).
+void CountDynamicStateSkip(bool recorded) {
+    static u64 draws{}, lost{};
+    static auto last_log = std::chrono::steady_clock::now();
+    ++draws;
+    lost += recorded ? 1 : 0;
+    if (const auto now = std::chrono::steady_clock::now(); now - last_log >= std::chrono::seconds{10}) {
+        LOG_INFO(HW_GPU, "nx2 dynamic state skip verify: last {:.0f} s {} draws would skip, {} of them recorded state",
+                 std::chrono::duration<double>(now - last_log).count(), draws, lost);
+        draws = lost = 0;
+        last_log = now;
+    }
+}
 } // Anonymous namespace
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
@@ -2104,6 +2119,69 @@ void RasterizerVulkan::UpdateDynamicStates(GraphicsPipeline* pipeline) {
         flags[Dirty::PrimitiveRestartEnable] = true;
     }
 
+    // Each update below does nothing while its dirty flags are clear, so a draw that left all of
+    // them clear (most draws) skips the ~25 checks. The mask holds only flags an update this
+    // device runs consumes: one nothing consumes would stay set and the skip would never happen.
+    // Registers that set a flag under StencilProperties, StateEnable or Blending set that flag too.
+    // AMD's logic op workaround below rewrites a register every draw, so it always runs there.
+    // (vkoff's 0b24604e8c on round 10.) EDEN_NX2_DYNSKIP_VERIFY=1 runs the updates of draws that
+    // would skip them anyway and counts the ones that recorded something.
+    static const auto dynamic_state_flags = [this] {
+        Tegra::Engines::Maxwell3D::DirtyState::Flags mask;
+        const auto add = [&mask](std::initializer_list<size_t> indices) {
+            for (const size_t index : indices) {
+                mask[index] = true;
+            }
+        };
+        add({Dirty::Viewports, VideoCommon::Dirty::RescaleViewports, Dirty::Scissors,
+             VideoCommon::Dirty::RescaleScissors, Dirty::DepthBias,
+             VideoCommon::Dirty::DepthBiasGlobal, Dirty::BlendConstants, Dirty::DepthBounds,
+             Dirty::StencilProperties, Dirty::LineWidth});
+        if (device.IsExtExtendedDynamicStateSupported()) {
+            add({Dirty::CullMode, Dirty::DepthCompareOp, Dirty::FrontFace, Dirty::StencilOp,
+                 Dirty::StateEnable});
+        }
+        if (device.IsExtExtendedDynamicState2Supported()) {
+            add({Dirty::PrimitiveRestartEnable, Dirty::RasterizerDiscardEnable,
+                 Dirty::DepthBiasEnable});
+        }
+        if (device.IsExtExtendedDynamicState2ExtrasSupported()) {
+            add({Dirty::LogicOp});
+        }
+        if (device.IsExtExtendedDynamicState3EnablesSupported()) {
+            add({Dirty::LogicOpEnable, Dirty::DepthClampEnable, Dirty::LineRasterizationMode,
+                 Dirty::LineStippleEnable, Dirty::ConservativeRasterizationMode,
+                 Dirty::AlphaToCoverageEnable, Dirty::AlphaToOneEnable});
+        }
+        if (device.IsExtExtendedDynamicState3BlendingSupported()) {
+            add({Dirty::Blending});
+        } else if (device.IsExtColorWriteEnableSupported()) {
+            add({Dirty::ColorMask});
+        }
+        if (device.IsExtVertexInputDynamicStateSupported()) {
+            add({Dirty::VertexInput, VideoCommon::Dirty::VertexBuffers});
+        }
+        return mask;
+    }();
+    static const bool always_update = [this] {
+        const VkDriverIdKHR driver = device.GetDriverID();
+        return device.IsExtExtendedDynamicState3EnablesSupported() &&
+               (driver == VK_DRIVER_ID_AMD_OPEN_SOURCE || driver == VK_DRIVER_ID_AMD_PROPRIETARY);
+    }();
+    static const bool verify_skip = std::getenv("EDEN_NX2_DYNSKIP_VERIFY") != nullptr;
+    const bool can_skip = !topology_changed && !always_update &&
+                          (flags & dynamic_state_flags).none() &&
+                          Common::Nx2Ab::On(Common::Nx2Ab::DynamicStateSkip);
+    if (can_skip && !verify_skip) {
+        return;
+    }
+    const u64 records_before = scheduler.RecordSerial();
+    SCOPE_EXIT {
+        if (can_skip) {
+            CountDynamicStateSkip(scheduler.RecordSerial() != records_before);
+        }
+    };
+
     UpdateViewportsState(regs);
     UpdateScissorsState(regs);
     UpdateDepthBias(regs);
@@ -2161,8 +2239,8 @@ void RasterizerVulkan::UpdateDynamicStates(GraphicsPipeline* pipeline) {
         UpdateLineRasterizationMode(regs);
         UpdateLineStippleEnable(regs);
         UpdateConservativeRasterizationMode(regs);
-        UpdateAlphaToCoverageEnable(regs);
-        UpdateAlphaToOneEnable(regs);
+        UpdateAlphaToCoverageEnable(regs, pipeline);
+        UpdateAlphaToOneEnable(regs, pipeline);
     }
 
     if (device.IsExtExtendedDynamicState3BlendingSupported()) {
@@ -2701,14 +2779,15 @@ void RasterizerVulkan::UpdateDepthClampEnable(Tegra::Engines::Maxwell3D::Regs& r
         [is_enabled](vk::CommandBuffer cmdbuf) { cmdbuf.SetDepthClampEnableEXT(is_enabled); });
 }
 
-void RasterizerVulkan::UpdateAlphaToCoverageEnable(Tegra::Engines::Maxwell3D::Regs& regs) {
+void RasterizerVulkan::UpdateAlphaToCoverageEnable(Tegra::Engines::Maxwell3D::Regs& regs,
+                                                   const GraphicsPipeline* pipeline) {
     if (!state_tracker.TouchAlphaToCoverageEnable()) {
         return;
     }
     if (!device.SupportsDynamicState3AlphaToCoverageEnable()) {
         return;
     }
-    GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
+    // The draw's pipeline (looking it up again cost a second key refresh).
     const bool enable = pipeline != nullptr && pipeline->SupportsAlphaToCoverage() &&
                         regs.anti_alias_alpha_control.alpha_to_coverage != 0;
     scheduler.Record([enable](vk::CommandBuffer cmdbuf) {
@@ -2716,7 +2795,8 @@ void RasterizerVulkan::UpdateAlphaToCoverageEnable(Tegra::Engines::Maxwell3D::Re
     });
 }
 
-void RasterizerVulkan::UpdateAlphaToOneEnable(Tegra::Engines::Maxwell3D::Regs& regs) {
+void RasterizerVulkan::UpdateAlphaToOneEnable(Tegra::Engines::Maxwell3D::Regs& regs,
+                                              const GraphicsPipeline* pipeline) {
     if (!state_tracker.TouchAlphaToOneEnable()) {
         return;
     }
@@ -2728,7 +2808,6 @@ void RasterizerVulkan::UpdateAlphaToOneEnable(Tegra::Engines::Maxwell3D::Regs& r
         });
         return;
     }
-    GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
     const bool enable = pipeline != nullptr && pipeline->SupportsAlphaToOne() &&
                         regs.anti_alias_alpha_control.alpha_to_one != 0;
     scheduler.Record([enable](vk::CommandBuffer cmdbuf) {
