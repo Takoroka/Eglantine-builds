@@ -36,6 +36,9 @@ enum Feature : u64 {
     // its tracking regions turned a page dirty (BufferCache::IsRangeCpuClean); written ranges the
     // GPU-modified sets cover already aren't added again.
     BufferCheckSkip = 1ull << 46,
+    // texlookup (11-06): alias walks return at once when no alias was modified after the image
+    // (ImageBase::alias_tick_bound).
+    AliasWalkSkip = 1ull << 47,
     ListDrawRanges = 1ull << 48,     ///< Lists on pages draws write: past the draws' ranges (nx2.h)
     ListWriterWaitSkip = 1ull << 49, ///< Known CPU list pages skip the wait for writers (dma_pusher)
     SemAcquireOnBack = 1ull << 50,   ///< SEM_EXECUTE acquires checked on the back, no drain (puller)
