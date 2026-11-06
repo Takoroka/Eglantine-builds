@@ -121,17 +121,6 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
             std::chrono::steady_clock::now() - pending_acquire->since < std::chrono::microseconds{200}) {
             return false;
         }
-    } else if (LazyAcquires() && Common::Nx2Ab::On(Common::Nx2Ab::AcquireParkEarly)) {
-        // EQUAL and MASK (ProcessSemaphoreTriggerMethod): the back's release meeting it, or the
-        // same wait for the back.
-        if (Nx2SemaphoreWaiters::Get().Latched(this)) {
-            GuestSyncPoint(dma_pusher);
-            return true;
-        }
-        if (!may_drain &&
-            std::chrono::steady_clock::now() - pending_acquire->since < std::chrono::microseconds{200}) {
-            return false;
-        }
     }
     // The release may still be queued for the split GPU thread's back half (and the caches
     // ReadSemaphoreWord asks are its state).
@@ -397,22 +386,6 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                 VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
                 return;
             }
-        }
-        // A/B bit AcquireParkEarly: with other command lists to parse, an EQUAL or MASK acquire
-        // parks as a GEQUAL one does instead of draining first. Its value can't be taken from
-        // guest memory (it needn't grow), so CanResumeAcquire drains for it, once the front has
-        // nothing else to parse or a while has passed. Donkey Kong Bananza drained for 4 such
-        // acquires a frame, ~1 ms each, and none was met by the back's releases.
-        if (LazyAcquires() && op != GpuSemaphoreOperation::AcquireGequal && !may_drain &&
-            Common::Nx2Ab::On(Common::Nx2Ab::AcquireParkEarly)) {
-            if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
-                Nx2SemaphoreWaiters::Get().Add(this, *device, acquire.value, acquire.operation);
-            }
-            pending_acquire = acquire;
-            dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
-            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
-            Nx2CountList(g_nx2_list_stats.acquire_parked);
-            return;
         }
         // What these wait for (nx2.h, Nx2ListStats): the op, whether the front had anything else
         // to parse, and whether the back's releases met the value.

@@ -28,7 +28,6 @@ enum Feature : u64 {
     ListFlushBatch = 1ull << 51,     ///< List drains download all draw-written list pages at once
     IndirectDrawMacro = 1ull << 52,  ///< GPU-written draw arguments of NVN2's indirect draw macro
                                      ///< drawn from the GPU (Maxwell3D::FrontIndirectDrawMacro)
-    AcquireParkEarly = 1ull << 53,   ///< EQUAL/MASK acquires park before draining (puller)
 };
 
 inline const u64 g_mask = [] {
