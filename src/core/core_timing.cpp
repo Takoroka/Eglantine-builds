@@ -10,6 +10,7 @@
 #include <tuple>
 #include "common/cpu_features.h"
 #include "common/cpu_features.h"
+#include "common/nx2_ab.h"
 
 #ifdef _WIN32
 #include "common/windows/timer_resolution.h"
@@ -149,31 +150,48 @@ bool CoreTiming::HasPendingEvents() const {
 
 void CoreTiming::ScheduleEvent(std::chrono::nanoseconds ns_into_future,
                                const std::shared_ptr<EventType>& event_type, bool absolute_time) {
+    bool earliest{};
     {
         std::scoped_lock scope{basic_lock};
         const auto next_time{absolute_time ? ns_into_future : GetGlobalTimeNs() + ns_into_future};
 
-        auto h{event_queue.emplace(Event{next_time.count(), event_fifo_id++, event_type, 0})};
+        const u64 fifo_order = event_fifo_id++;
+        auto h{event_queue.emplace(Event{next_time.count(), fifo_order, event_type, 0})};
         (*h).handle = h;
+        earliest = event_queue.top().fifo_order == fifo_order;
     }
 
-    event.Set();
+    WakeTimerThread(earliest);
 }
 
 void CoreTiming::ScheduleLoopingEvent(std::chrono::nanoseconds start_time,
                                       std::chrono::nanoseconds resched_time,
                                       const std::shared_ptr<EventType>& event_type,
                                       bool absolute_time) {
+    bool earliest{};
     {
         std::scoped_lock scope{basic_lock};
         const auto next_time{absolute_time ? start_time : GetGlobalTimeNs() + start_time};
 
+        const u64 fifo_order = event_fifo_id++;
         auto h{event_queue.emplace(
-            Event{next_time.count(), event_fifo_id++, event_type, resched_time.count()})};
+            Event{next_time.count(), fifo_order, event_type, resched_time.count()})};
         (*h).handle = h;
+        earliest = event_queue.top().fifo_order == fifo_order;
     }
 
-    event.Set();
+    WakeTimerThread(earliest);
+}
+
+void CoreTiming::WakeTimerThread(bool earliest) {
+    // The timing thread reads the earliest event again whenever it wakes (Advance), and a wake
+    // set while it isn't waiting yet ends its next wait at once. So it only needs waking for an
+    // event that became the earliest; every timed guest wait schedules one, from inside the
+    // scheduler lock. Off (A/B bit 57): a wake for every event, as before.
+    // Idea: MythosOfs/Orchid 6e14af2079.
+    if (earliest || !Common::Nx2Ab::On(Common::Nx2Ab::TimingWakeEarliest)) {
+        event.Set();
+    }
 }
 
 void CoreTiming::UnscheduleEvent(const std::shared_ptr<EventType>& event_type,

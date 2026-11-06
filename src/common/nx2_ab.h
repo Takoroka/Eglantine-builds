@@ -52,6 +52,9 @@ enum Feature : u64 {
     // backperf (11-06): pipelines whose only writes are storage buffers take the buffer refresh
     // path (never a full repeat): RasterizerVulkan::PrepareDraw.
     StorageWriteRefresh = 1ull << 56,
+    // codegen (11-06): the host timing thread is woken only for an event that became the earliest
+    // (CoreTiming::WakeTimerThread). Idea: MythosOfs/Orchid 6e14af2079.
+    TimingWakeEarliest = 1ull << 57,
     // backperf (11-06): a cached write to pages without GPU-written data asks the GPU-modified
     // sets once (BufferCache::CachedWriteMemory), and a dirty memory gather with nothing
     // collected returns before the collectors' lock and the swap
