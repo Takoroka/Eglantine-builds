@@ -115,6 +115,8 @@ add_executable(yuzu
     configuration/configure_per_game_addons.cpp
     configuration/configure_per_game_addons.h
     configuration/configure_per_game_addons.ui
+    configuration/mod_list_dialog.cpp
+    configuration/mod_list_dialog.h
     configuration/configure_profile_manager.cpp
     configuration/configure_profile_manager.h
     configuration/configure_profile_manager.ui

@@ -946,6 +946,10 @@ struct Values {
                                      Category::WebService};
     Setting<std::string> eden_username{linkage, "Eden", "eden_username",
                                        Category::WebService};
+    // The GitHub repository the Mod List window reads mods.json and the mods from.
+    Setting<std::string> mod_list_repo_url{
+        linkage, "https://github.com/Takoroka/Eglantine-Mods", "mod_list_repo_url",
+        Category::WebService};
     Setting<std::string> eden_token{linkage, "",
                                     "eden_token", Category::WebService};
 

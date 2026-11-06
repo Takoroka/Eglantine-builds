@@ -399,6 +399,7 @@ private slots:
     void OnAbout();
     void OnEdenDependencies();
     void OnDataDialog();
+    void OnModList();
     void OnToggleFilterBar();
     void OnToggleStatusBar();
     void OnTogglePerfOverlay();
