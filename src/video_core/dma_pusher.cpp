@@ -127,10 +127,13 @@ void ReportListStats() {
     const double acquire_late = rate(stats.acquire_late);
     const double wait_for_idles = rate(stats.wait_for_idles);
     const double compute_draw_barriers = rate(stats.compute_draw_barriers);
+    const double fragment_barriers = rate(stats.fragment_barriers);
+    const double fragment_barriers_deferred = rate(stats.fragment_barriers_deferred);
+    const double fragment_barriers_read = rate(stats.fragment_barriers_read);
     if (entries == 0 && draw_writes == 0 && entry_waits == 0 && entry_skips == 0 &&
         split_drains == 0 && split_waits == 0 && indirect_draws == 0 && extended_draws == 0 &&
         extended_rechecks == 0 && acquire_ahead_met == 0 && resume_ahead_met == 0 &&
-        resume_ahead_waits == 0 && wait_for_idles == 0) {
+        resume_ahead_waits == 0 && wait_for_idles == 0 && fragment_barriers == 0) {
         return;
     }
     using Common::Nx2Ab::On;
@@ -156,7 +159,8 @@ void ReportListStats() {
              "acquires read ahead (bit 62 {}): {:.0f} met, {:.0f} parked; polls {:.0f} met, "
              "{:.0f} kept waiting; {:.0f} not readable ahead; check {:.0f} compared, {:.0f} met "
              "too early, {:.0f} met late | waits for idle {:.0f} (bit 60 {}), {:.0f} "
-             "compute-to-draw barriers",
+             "compute-to-draw barriers | fragment barriers {:.0f} (bit 53 {}): {:.0f} deferred, "
+             "{:.0f} passes ended for a draw sampling a render target",
              On(Common::Nx2Ab::ListDrawRanges) ? "on" : "off",
              On(Common::Nx2Ab::ListWriterWaitSkip) ? "on" : "off",
              On(Common::Nx2Ab::SemAcquireOnBack) ? "on" : "off",
@@ -177,7 +181,9 @@ void ReportListStats() {
              run_drain_ms, On(Common::Nx2Ab::AcquireNoDrain) ? "on" : "off", acquire_ahead_met,
              acquire_ahead_waits, resume_ahead_met, resume_ahead_waits, acquire_not_ahead,
              acquire_verified, acquire_early, acquire_late, wait_for_idles,
-             On(Common::Nx2Ab::WaitForIdleBarrier) ? "on" : "off", compute_draw_barriers);
+             On(Common::Nx2Ab::WaitForIdleBarrier) ? "on" : "off", compute_draw_barriers,
+             fragment_barriers, On(Common::Nx2Ab::FragmentBarrierDefer) ? "on" : "off",
+             fragment_barriers_deferred, fragment_barriers_read);
 }
 
 } // Anonymous namespace

@@ -32,6 +32,7 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/settings.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 
 #if defined(__clang__) && defined(NDEBUG)
@@ -865,6 +866,18 @@ bool GraphicsPipeline::ConfigureDescriptors(std::span<const VideoCommon::ImageVi
         Profile::Scope scope{Profile::Zone::RenderTargets};
         texture_cache.UpdateRenderTargets(false);
         texture_cache.CheckFeedbackLoop(views);
+        // A fragment barrier deferred in the current pass (RasterizerVulkan::FragmentBarrier) is
+        // recorded before the first draw that samples a render target: ending the pass records
+        // it, and ConfigureDraw begins the next one. Every draw after the barrier comes here
+        // first (the barrier's register write refuses the repeat paths), and the repeats and
+        // refreshes after it sample what this setup checked.
+        if (scheduler.FragmentBarrierPending()) {
+            const bool samples_render_target = texture_cache.SamplesRenderTargets(views);
+            scheduler.BeforeDrawSampling(samples_render_target);
+            if (samples_render_target) {
+                Tegra::Nx2CountList(Tegra::g_nx2_list_stats.fragment_barriers_read);
+            }
+        }
     }
     BindlessWords bindless_words;
     if (bindless_heap && texture_set_use == TextureSetUse::Replay) {
@@ -927,7 +940,8 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         }
     }
 
-    scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+    // A deferred fragment barrier stays deferred: the setup checked what this draw samples.
+    scheduler.RequestRenderpass(texture_cache.GetFramebuffer(), true);
     if (!is_built.load(std::memory_order::relaxed)) {
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {

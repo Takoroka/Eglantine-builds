@@ -1704,7 +1704,8 @@ void RasterizerVulkan::Clear(u32 layer_count) {
                                  !scheduler.IsRenderPassActive() &&
                                  (!use_color || color_full_channels) && ds_deferrable;
     if (!can_defer_clear) {
-        scheduler.RequestRenderpass(framebuffer);
+        // A clear reads nothing: a deferred fragment barrier stays deferred.
+        scheduler.RequestRenderpass(framebuffer, true);
     }
 
     query_cache.NotifySegment(true);
@@ -2359,6 +2360,18 @@ void RasterizerVulkan::WaitForIdle() {
 }
 
 void RasterizerVulkan::FragmentBarrier() {
+    Tegra::Nx2CountList(Tegra::g_nx2_list_stats.fragment_barriers);
+    // The barrier ending a render pass records (Scheduler::EndRenderPass) is what this asks for:
+    // what the pass's fragments wrote, visible to later reads. With A/B bit FragmentBarrierDefer
+    // an active pass goes on until a draw samples one of its render targets (GraphicsPipeline's
+    // setup ends it then), or until something else ends it: copies, dispatches, blits, a new
+    // framebuffer and submissions all do, and each records the barrier. The draw after this one
+    // takes the full setup either way (the guest's write to fragment_barrier changes a register).
+    if (Common::Nx2Ab::On(Common::Nx2Ab::FragmentBarrierDefer) && scheduler.IsRenderPassActive()) {
+        scheduler.DeferFragmentBarrier();
+        Tegra::Nx2CountList(Tegra::g_nx2_list_stats.fragment_barriers_deferred);
+        return;
+    }
     SCOPE_EXIT {
         NoteSetupChange();
     };

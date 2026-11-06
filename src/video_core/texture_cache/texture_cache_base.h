@@ -380,6 +380,19 @@ public:
         return last_feedback_loop_result;
     }
 
+    /// Whether any of these views (a draw's textures and images) is of an image the current render
+    /// targets (UpdateRenderTargets) are views of.
+    [[nodiscard]] bool SamplesRenderTargets(std::span<const ImageViewInOut> views) const noexcept {
+        if (rt_active_mask == 0) {
+            return false;
+        }
+        return std::ranges::any_of(views, [this](const ImageViewInOut& view) {
+            const ImageId image_id = view.id ? slot_image_views[view.id].image_id : ImageId{};
+            return SamplesRenderTargetImages(std::span(&image_id, 1), rt_active_mask, rt_image_id,
+                                             rt_depth_image_id);
+        });
+    }
+
     /// Counts the images WriteMemory found in written ranges.
     [[nodiscard]] u64 WrittenImages() const noexcept {
         return written_images;

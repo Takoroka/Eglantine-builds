@@ -32,6 +32,31 @@ struct RenderTargets {
     bool is_rescaled{};
 };
 
+/// Whether one of `images` (a draw's sampled and storage images) is the image of an active
+/// render target. rt_active_mask: bit i for color target i, bit NUM_RT for depth/stencil.
+[[nodiscard]] constexpr bool SamplesRenderTargetImages(std::span<const ImageId> images,
+                                                       u32 rt_active_mask,
+                                                       const std::array<ImageId, NUM_RT>& color_images,
+                                                       ImageId depth_image) noexcept {
+    if (rt_active_mask == 0) {
+        return false;
+    }
+    for (const ImageId image : images) {
+        if (!image) {
+            continue;
+        }
+        if ((rt_active_mask & (1u << NUM_RT)) != 0 && image == depth_image) {
+            return true;
+        }
+        for (size_t index = 0; index < NUM_RT; ++index) {
+            if ((rt_active_mask & (1u << index)) != 0 && image == color_images[index]) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 } // namespace VideoCommon
 
 namespace std {

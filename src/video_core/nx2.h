@@ -204,6 +204,11 @@ struct Nx2ListStats {
     // Vulkan (A/B bit WaitForIdleBarrier).
     std::atomic<u64> wait_for_idles;        ///< RasterizerVulkan::WaitForIdle
     std::atomic<u64> compute_draw_barriers; ///< Barriers between dispatches and the next render pass
+    // Vulkan fragment barriers (A/B bit FragmentBarrierDefer).
+    std::atomic<u64> fragment_barriers;          ///< RasterizerVulkan::FragmentBarrier calls
+    std::atomic<u64> fragment_barriers_deferred; ///< ... that left the render pass going
+    std::atomic<u64> fragment_barriers_read;     ///< Passes a deferred one ended for a draw sampling
+                                                 ///< a render target
 };
 inline Nx2ListStats g_nx2_list_stats{};
 
