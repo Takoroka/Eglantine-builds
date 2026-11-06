@@ -51,6 +51,7 @@ enum Feature : u64 {
                                             ///< base vertex/instance to the constant buffer
     WaitForIdleBarrier = 1ull << 60, ///< Waits for idle wait (a barrier), compute-to-draw barriers
                                      ///< (RasterizerVulkan::WaitForIdle, Scheduler)
+    AcquireNoDrain = 1ull << 62,     ///< Semaphore acquires read ahead of the back, no drain (puller)
 };
 
 inline const u64 g_mask = [] {
