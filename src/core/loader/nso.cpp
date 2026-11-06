@@ -11,7 +11,6 @@
 #include <vector>
 
 #include "common/common_funcs.h"
-#include "common/game_presets.h"
 #include "common/hex_util.h"
 #include "common/logging.h"
 #include "common/lz4_compression.h"
@@ -175,49 +174,6 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         pi_header = pm->PatchNSO(pi_header, name);
 
         std::copy(pi_header.begin() + sizeof(NSOHeader), pi_header.end(), patchable_section.data());
-    }
-
-    // Mario Kart World selects a 1- or 2-vblank frame mode in its main loop. Force its native
-    // 30 FPS mode. Match the instruction sequence instead of relying on a title-version-specific
-    // address.
-    if (Settings::values.mkw_30fps.GetValue() && name == "main" &&
-        process.GetProgramId() == Settings::MarioKartWorldProgramId) {
-        constexpr u32 ModeLoadInsn = 0xB9421268; // ldr w8, [x19, #0x210]
-        constexpr u32 mode_instruction = 0x52800008U | (2U << 5); // mov w8, #2
-        const auto& text = nso_header.segments[0];
-        u8* const code = codeset.memory.data() + module_start + text.location;
-        const size_t count = text.size / sizeof(u32);
-        const auto word = [code](size_t index) {
-            u32 value;
-            std::memcpy(&value, code + index * sizeof(u32), sizeof(value));
-            return value;
-        };
-        size_t mode_site = 0;
-        size_t mode_matches = 0;
-        for (size_t i = 2; i + 8 < count; ++i) {
-            if (word(i) != ModeLoadInsn || word(i - 2) != 0x6B01013F || // cmp w9, w1
-                (word(i - 1) & 0xFF00001F) != 0x54000001 ||             // b.ne
-                (word(i + 1) & 0xFF00001F) != 0x35000008) {             // cbnz w8
-                continue;
-            }
-            for (size_t j = i + 2; j < i + 8; ++j) {
-                if (word(j) == 0x52A84E08) { // mov w8, #60.0f
-                    mode_site = i;
-                    ++mode_matches;
-                    break;
-                }
-            }
-        }
-
-        if (mode_matches == 1) {
-            std::memcpy(code + mode_site * sizeof(u32), &mode_instruction,
-                        sizeof(mode_instruction));
-            LOG_INFO(Loader, "Mario Kart World: 30 FPS mode enabled (main+{:#x})",
-                     text.location + mode_site * sizeof(u32));
-        } else {
-            LOG_WARNING(Loader, "Mario Kart World FPS patch skipped (mode matches {})",
-                        mode_matches);
-        }
     }
 
 #ifdef HAS_NCE
