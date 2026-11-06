@@ -1890,10 +1890,18 @@ private:
         // the GPU thread sat idle waiting for the next frame's command lists). Wait for the
         // previous frame only. Not for every title: Splatoon Raiders reuses its command memory
         // as if the GPU were at most a frame behind (below).
+        // Hyrule Warriors: Age of Imprisonment the same way: it waits for its present images on
+        // the GPU (nvnQueueWaitSync after nvnWindowAcquireTexture, 1.0 main 0xaeb0), never on the
+        // CPU, so only this wait kept its CPU and GPU taking turns. In the user's play (11-05, the
+        // same heavy area) heavy windows went from 21.0 to 19.3 ms per frame, 54.3 to 56.3 fps
+        // and 1.0 to 0.37 frames over 100 ms per 600 presents, with no misread commands in 1.5 h.
+        // Eden can't see that wait (the replies hand out no fence for it), so it goes by title.
+        constexpr u64 HyruleWarriorsAgeOfImprisonmentProgramId = 0x04003F40232DE000ULL;
         if (!m_title_checked) {
             m_title_checked = true;
-            m_previous_frame_only =
-                system.GetApplicationProcessProgramID() == Settings::MarioKartWorldProgramId;
+            const u64 program_id = system.GetApplicationProcessProgramID();
+            m_previous_frame_only = program_id == Settings::MarioKartWorldProgramId ||
+                                    program_id == HyruleWarriorsAgeOfImprisonmentProgramId;
         }
         const auto entered = std::chrono::steady_clock::now();
         if (UseReleaseFence(frames_ahead)) {
