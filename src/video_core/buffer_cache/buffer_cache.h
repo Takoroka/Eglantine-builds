@@ -2099,6 +2099,10 @@ void BufferCache<P>::Nx2NoteListWrite(BufferId buffer_id, DAddr device_addr, u64
                     std::scoped_lock lock{nx2_list_mutex};
                     Nx2ListPage& entry = nx2_list_pages[page_addr];
                     ++entry.writes;
+                    entry.write_serial = nx2_gpu_write_serial;
+                    if (entry.tracked_from == ~u64{0}) {
+                        entry.tracked_from = nx2_gpu_write_serial;
+                    }
                     if (!nx2_collect_list_copies) {
                         const u64 chunks = Nx2PageChunks(page_addr, device_addr, size);
                         ++entry.draw_writes;
@@ -2400,6 +2404,59 @@ void BufferCache<P>::Nx2FlushListPages(std::span<const DAddr> pages) {
         Tegra::Nx2CountList(Tegra::g_nx2_list_stats.batch_flushes);
         Tegra::Nx2CountList(Tegra::g_nx2_list_stats.batch_pages, others);
         DownloadRanges(ranges);
+    }
+}
+
+template <class P>
+int BufferCache<P>::Nx2ListWrittenSince(DAddr device_addr, u64 size, u64 serial) {
+    if constexpr (IS_OPENGL) {
+        return -1;
+    } else {
+        constexpr u64 page_bits = Tegra::Nx2WrittenPageBits;
+        if (size == 0) {
+            return 0;
+        }
+        int written = 0;
+        std::scoped_lock lock{nx2_list_mutex};
+        for (u64 page = device_addr >> page_bits; page <= (device_addr + size - 1) >> page_bits;
+             ++page) {
+            const auto it = nx2_list_pages.find(page << page_bits);
+            if (it == nx2_list_pages.end() || it->second.tracked_from > serial) {
+                return -1;
+            }
+            if (it->second.write_serial > serial) {
+                written = 1;
+            }
+        }
+        return written;
+    }
+}
+
+template <class P>
+bool BufferCache<P>::Nx2ReadBack(DAddr device_addr, std::span<u8> out) {
+    if constexpr (IS_OPENGL) {
+        return false;
+    } else {
+        const u32 size = static_cast<u32>(out.size());
+        const u64 page = device_addr >> CACHING_PAGEBITS;
+        if (size == 0 || device_addr == 0 || page >= page_table.size() || !page_table[page]) {
+            return false;
+        }
+        Buffer& buffer = slot_buffers[page_table[page]];
+        if (!buffer.IsInBounds(device_addr, size)) {
+            return false;
+        }
+        auto staging = runtime.DownloadStagingBuffer(size);
+        const BufferCopy copy{
+            .src_offset = buffer.Offset(device_addr),
+            .dst_offset = staging.offset,
+            .size = size,
+        };
+        buffer.MarkUsage(copy.src_offset, copy.size);
+        runtime.CopyBuffer(staging.buffer, buffer, std::span{&copy, 1}, true);
+        runtime.Finish();
+        std::memcpy(out.data(), staging.mapped_span.data(), size);
+        return true;
     }
 }
 

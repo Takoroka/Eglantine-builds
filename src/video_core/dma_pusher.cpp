@@ -111,16 +111,25 @@ void ReportListStats() {
     const double indirect_checked = rate(stats.indirect_checked);
     const double indirect_odd = rate(stats.indirect_odd);
     const double indirect_barriers = rate(stats.indirect_barriers);
+    const double extended_draws = rate(stats.extended_draws);
+    const double extended_rechecks = rate(stats.extended_rechecks);
+    const double extended_compared = rate(stats.extended_compared);
+    const double extended_mismatched = rate(stats.extended_mismatched);
+    const double extended_fallbacks = rate(stats.extended_fallbacks);
+    const double barriers_skipped = rate(stats.barriers_skipped);
     if (entries == 0 && draw_writes == 0 && entry_waits == 0 && entry_skips == 0 &&
-        split_drains == 0 && split_waits == 0 && indirect_draws == 0) {
+        split_drains == 0 && split_waits == 0 && indirect_draws == 0 && extended_draws == 0 &&
+        extended_rechecks == 0) {
         return;
     }
     using Common::Nx2Ab::On;
     LOG_INFO(HW_GPU,
-             "Command lists per second (bit 48 {}, 49 {}, 50 {}, 51 {}, 52 {}): "
+             "Command lists per second (bit 48 {}, 49 {}, 50 {}, 51 {}, 52 {}, 55 {}): "
              "indirect draw macros {:.0f} drawn from the GPU ({:.0f} barriers), {:.0f} checked "
-             "({:.0f} odd) | acquire drains {:.0f} GEQUAL, {:.0f} with nothing else to parse, "
-             "{:.0f} met after it | {:.0f} entries on "
+             "({:.0f} odd); extended {:.0f} drawn on the GPU, {:.0f} re-drawn after the front's "
+             "read ({:.0f} compared, {:.0f} mismatched), {:.0f} fallbacks, {:.0f} barriers "
+             "skipped (writes elsewhere) | acquire drains {:.0f} GEQUAL, {:.0f} with nothing "
+             "else to parse, {:.0f} met after it | {:.0f} entries on "
              "GPU-written pages | read from copies {:.0f}, synced {:.0f}, past the draws' ranges "
              "{:.0f} | list drains {:.0f}: {:.1f} ms for the back, {:.1f} ms flushing ({:.0f} "
              "flushes, {:.0f} batched taking {:.0f} other pages); {:.0f} on pages draws "
@@ -137,8 +146,11 @@ void ReportListStats() {
              On(Common::Nx2Ab::ListWriterWaitSkip) ? "on" : "off",
              On(Common::Nx2Ab::SemAcquireOnBack) ? "on" : "off",
              On(Common::Nx2Ab::ListFlushBatch) ? "on" : "off",
-             On(Common::Nx2Ab::IndirectDrawMacro) ? "on" : "off", indirect_draws,
-             indirect_barriers, indirect_checked, indirect_odd, acquire_gequal, acquire_may_drain,
+             On(Common::Nx2Ab::IndirectDrawMacro) ? "on" : "off",
+             On(Common::Nx2Ab::IndirectDrawMacroExtended) ? "on" : "off", indirect_draws,
+             indirect_barriers, indirect_checked, indirect_odd, extended_draws, extended_rechecks,
+             extended_compared, extended_mismatched, extended_fallbacks, barriers_skipped,
+             acquire_gequal, acquire_may_drain,
              acquire_met, entries, copied, synced, exact,
              drains, drain_ms, flush_ms, flushes, batch_flushes, batch_pages, draw_page_reads,
              would_exact, writer_ms, copy_ms,

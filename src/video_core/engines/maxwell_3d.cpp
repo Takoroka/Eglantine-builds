@@ -1167,12 +1167,39 @@ struct Maxwell3D::FrontState {
     /// up here in a copy of the dirty tables (set once, when the channel is made).
     bool state_runs{};
     DirtyState::Tables dirty_tables{};
-    /// FrontIndirectDrawMacro: macro starts and whether their code is NVN2's indexed indirect
-    /// draw, for the macro code generation they were checked against.
-    std::unordered_map<u32, bool> indirect_macros;
+    /// FrontIndirectDrawMacro: macro starts and which of NVN2's indexed indirect draw macros
+    /// their code is, for the macro code generation they were checked against.
+    enum IndirectMacro : u8 { NotIndirect, PlainIndirect, ExtendedIndirect };
+    std::unordered_map<u32, IndirectMacro> indirect_macros;
     u64 indirect_macros_generation{~u64{0}};
-    /// EDEN_NX2_INDIRECT_MACRO_VERIFY: the running macro would have been drawn from the GPU.
-    bool indirect_check{};
+    /// EDEN_NX2_INDIRECT_MACRO_VERIFY: the running macro would have been drawn from the GPU
+    /// (CountIndirect), or is the extended one, which the back draws from the GPU once its
+    /// arguments are read (RecheckIndirect, at indirect_check_arguments).
+    enum IndirectCheck : u8 { NoIndirectCheck, CountIndirect, RecheckIndirect };
+    IndirectCheck indirect_check{};
+    GPUVAddr indirect_check_arguments{};
+    /// The constant buffers bound per stage, as ProcessCBBind binds them on the back (the
+    /// extended indirect macro's check, ExtendedWordsInBankZero).
+    std::array<std::array<ConstBufferInfo, Regs::MaxConstBuffers>, Regs::MaxShaderStage> cb_banks{};
+
+    void NoteCBBind(u32 method) {
+        constexpr u32 first = MAXWELL3D_REG_INDEX(bind_groups[0].raw_config);
+        constexpr u32 stride = sizeof(Regs::BindGroup) / sizeof(u32);
+        if (method < first || method >= first + stride * Regs::MaxShaderStage ||
+            (method - first) % stride != 0) {
+            return;
+        }
+        const u32 config = regs[method];
+        const u32 slot = (config >> 4) & 0x1f;
+        if (slot >= Regs::MaxConstBuffers) {
+            return;
+        }
+        ConstBufferInfo& info = cb_banks[(method - first) / stride][slot];
+        info.enabled = (config & 1) != 0;
+        info.address = (GPUVAddr{regs[MAXWELL3D_REG_INDEX(const_buffer.address_high)]} << 32) |
+                       regs[MAXWELL3D_REG_INDEX(const_buffer.address_low)];
+        info.size = regs[MAXWELL3D_REG_INDEX(const_buffer.size)];
+    }
 };
 
 namespace {
@@ -1362,6 +1389,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         fs.regs[method] = value;
     } else {
         fs.regs[method] = value;
+        fs.NoteCBBind(method);
         constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
         switch (method) {
         case MAXWELL3D_REG_INDEX(shadow_ram_control):
@@ -1447,12 +1475,28 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         }
         fs.parameters.insert(fs.parameters.end(), base_start, base_start + amount);
         if (amount == methods_pending) {
-            if (fs.indirect_check) [[unlikely]] {
+            if (fs.indirect_check == FrontState::RecheckIndirect && fs.parameters.size() == 6)
+                [[unlikely]] {
+                // The re-check arm: the extended macro's arguments are read, and the back draws
+                // them from the GPU all the same and compares what it holds with them.
+                fs.indirect_check = FrontState::NoIndirectCheck;
+                Nx2CountList(g_nx2_list_stats.extended_rechecks);
+                const auto topology = static_cast<Regs::PrimitiveTopology>(fs.parameters[0]);
+                const std::array<u32, 5> words{fs.parameters[1], fs.parameters[2],
+                                               fs.parameters[3], fs.parameters[4],
+                                               fs.parameters[5]};
+                fs.parameters.clear();
+                fs.executing_macro = 0;
+                FrontQueueIndirectDraw(system, split, fs, topology, fs.indirect_check_arguments,
+                                       true, words.data());
+                return;
+            }
+            if (fs.indirect_check != FrontState::NoIndirectCheck) [[unlikely]] {
                 // FrontIndirectDrawMacro would have drawn this one from the GPU: an indirect
                 // draw gives the same only with no base vertex or instance and one instance
                 // (other instance counts and bases are drawn the same by Vulkan too, but Eden's
                 // direct draws got them a different way).
-                fs.indirect_check = false;
+                fs.indirect_check = FrontState::NoIndirectCheck;
                 Nx2CountList(g_nx2_list_stats.indirect_checked);
                 if (fs.parameters.size() != 6 || fs.parameters[2] != 1 || fs.parameters[4] != 0 ||
                     fs.parameters[5] != 0) {
@@ -1514,6 +1558,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
             if (!execution_mask[method]) {
                 continue;
             }
+            fs.NoteCBBind(method);
             switch (method) {
             case MAXWELL3D_REG_INDEX(shadow_ram_control):
                 fs.control = static_cast<Regs::ShadowRamControl>(argument);
@@ -1566,6 +1611,8 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
 
 void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
                               FrontState& fs) {
+    // A call checked by FrontIndirectDrawMacro whose parameters didn't come as one run.
+    fs.indirect_check = FrontState::NoIndirectCheck;
 #ifdef ARCHITECTURE_x86_64
     const u32 method = fs.executing_macro;
     fs.executing_macro = 0;
@@ -1747,6 +1794,57 @@ constexpr std::array<u32, 30> Nx2IndexedIndirectDrawMacro{
     0x9d141437, 0x18c00111, 0xb18c0301, 0x01140003, 0x18c00143, 0xb18c0300,
 };
 
+// Its extended variant, 14 instructions, the one Donkey Kong Bananza feeds GPU-written arguments
+// (~1,400 a frame in its heavier areas). The same parameters and draws; before them it also
+// writes the base vertex and instance to the selected constant buffer at +0x640 and +0x644
+// (0x8e3 offset, 0x8e4/0x8e5 data) for the shaders, and after them 0, 0 there.
+constexpr std::array<u32, 42> Nx2ExtendedIndexedIndirectDrawMacro{
+    0x00000003, 0x1d180000, 0x31c20300, 0x00940003, 0x18c0017d, 0xf1c10300,
+    0x3c745437, 0x1d000111, 0xb1c08300, 0x6a201903, 0x18c00638, 0xf00c0300,
+    0x20200003, 0x00c00000, 0x301c0300, 0x00000003, 0x18c02001, 0x702c7700,
+    0x2c3417e3, 0x03c00161, 0xb04c0300, 0x01140003, 0x18c00161, 0x718c0300,
+    0x00000007, 0x22109a10, 0x34424300, 0x00000003, 0x18c007ff, 0x702c7700,
+    0x9d141437, 0x18c00111, 0xb18c0300, 0x0d14638f, 0x18c00143, 0xb18c0300,
+    0x60a00003, 0x18c00190, 0x318c0301, 0x00a00003, 0x18c00000, 0x318c0300,
+};
+// Where it writes them in the selected constant buffer.
+constexpr u32 ExtendedBaseVertexOffset = 0x640;
+constexpr u32 ExtendedBaseInstanceOffset = 0x644;
+
+// Whether the shaders can read the extended macro's two words only through bank 0, the bank the
+// HLE replacement replaces (the driver constant buffer, as NVN binds it in every stage): bank 0
+// holds the selected constant buffer wherever it is bound, and no other bank covers the words.
+// `bank_of(stage, bank)` gives a binding, as ProcessCBBind made it.
+template <typename BankOf>
+bool ExtendedWordsInBankZero(GPUVAddr selected, BankOf&& bank_of) {
+    if (selected == 0) {
+        return false;
+    }
+    const GPUVAddr words = selected + ExtendedBaseVertexOffset;
+    for (size_t stage = 0; stage < Maxwell3D::Regs::MaxShaderStage; ++stage) {
+        for (size_t bank = 0; bank < Maxwell3D::Regs::MaxConstBuffers; ++bank) {
+            const ConstBufferInfo& info = bank_of(stage, bank);
+            if (!info.enabled) {
+                continue;
+            }
+            if (bank == 0 ? info.address != selected
+                          : words < info.address + info.size && info.address < words + 8) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// What the GPU holds at the five words at `arguments` (a wait for the GPU, Maxwell3D's back).
+bool ReadBackArguments(Tegra::MemoryManager& memory_manager,
+                       VideoCore::RasterizerInterface& rasterizer, GPUVAddr arguments,
+                       std::array<u32, 5>& out) {
+    const auto device = memory_manager.GpuToCpuAddress(arguments);
+    return device && rasterizer.ReadBackGpuWords(
+                         *device, std::span<u8>{reinterpret_cast<u8*>(out.data()), sizeof(out)});
+}
+
 // The topologies HLE_DrawIndexedIndirect draws indirectly (the rest need the index count on the
 // CPU: quads are drawn as triangles from a generated index buffer).
 bool IndirectTopologySafe(Maxwell3D::Regs::PrimitiveTopology topology) {
@@ -1774,7 +1872,8 @@ bool IndirectTopologySafe(Maxwell3D::Regs::PrimitiveTopology topology) {
 
 bool Maxwell3D::FrontIndirectDrawMacro(Core::System& system, VideoCommon::GpuSplit& split,
                                        u32 method, GPUVAddr arguments) {
-    if (!Nx2IndirectDrawMacro() && !g_nx2_indirect_macro_verify) {
+    if (!Nx2IndirectDrawMacro() && !Nx2IndirectDrawMacroExtended() &&
+        !g_nx2_indirect_macro_verify) {
         return false;
     }
     auto& fs = Front(system, split);
@@ -1808,28 +1907,65 @@ bool Maxwell3D::FrontIndirectDrawMacro(Core::System& system, VideoCommon::GpuSpl
         fs.indirect_macros.clear();
         fs.indirect_macros_generation = engine.native_code_generation;
     }
-    const auto [it, inserted] = fs.indirect_macros.try_emplace(start, false);
+    const auto [it, inserted] = fs.indirect_macros.try_emplace(start, FrontState::NotIndirect);
     if (inserted) {
-        const size_t first = size_t{start} * 3;
-        it->second = first + Nx2IndexedIndirectDrawMacro.size() <= engine.native_code.size() &&
-                     std::equal(Nx2IndexedIndirectDrawMacro.begin(),
-                                Nx2IndexedIndirectDrawMacro.end(),
-                                engine.native_code.begin() + first);
+        const auto code_is = [&](std::span<const u32> code) {
+            const size_t first = size_t{start} * 3;
+            return first + code.size() <= engine.native_code.size() &&
+                   std::equal(code.begin(), code.end(), engine.native_code.begin() + first);
+        };
+        it->second = code_is(Nx2IndexedIndirectDrawMacro)           ? FrontState::PlainIndirect
+                     : code_is(Nx2ExtendedIndexedIndirectDrawMacro) ? FrontState::ExtendedIndirect
+                                                                    : FrontState::NotIndirect;
     }
-    if (!it->second) {
+    if (it->second == FrontState::NotIndirect) {
         return turned_down("other code");
     }
-    if (g_nx2_indirect_macro_verify || !Nx2IndirectDrawMacro()) {
-        // Read and run as before; FrontCallMultiMethod checks the words.
-        fs.indirect_check = g_nx2_indirect_macro_verify;
+    const bool extended = it->second == FrontState::ExtendedIndirect;
+    const bool enabled = extended ? Nx2IndirectDrawMacroExtended() : Nx2IndirectDrawMacro();
+    // The extended macro's words reach the shaders through the replacement of bank 0's reads:
+    // other bindings of them take the read as before.
+    if (extended && enabled &&
+        !ExtendedWordsInBankZero(
+            (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_high)]} << 32) |
+                fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_low)],
+            [&fs](size_t stage, size_t bank) -> const ConstBufferInfo& {
+                return fs.cb_banks[stage][bank];
+            })) {
+        return turned_down("the constant buffer isn't bank 0 alone");
+    }
+    if (g_nx2_indirect_macro_verify || !enabled) {
+        // Read and run as before; FrontCallMultiMethod checks the words (the re-check arm draws
+        // the extended macro from the GPU all the same once they are read).
+        if (extended && enabled && g_nx2_indirect_macro_verify >= 2) {
+            fs.indirect_check = FrontState::RecheckIndirect;
+            fs.indirect_check_arguments = arguments;
+        } else {
+            fs.indirect_check = g_nx2_indirect_macro_verify ? FrontState::CountIndirect
+                                                            : FrontState::NoIndirectCheck;
+        }
         return false;
     }
     const auto topology = static_cast<Regs::PrimitiveTopology>(fs.parameters[0]);
     fs.parameters.clear();
     fs.executing_macro = 0;
-    Nx2CountList(g_nx2_list_stats.indirect_draws);
-    split.DeferEngineWork([this, system_ptr = &system, topology, arguments] {
-        BackIndirectDrawMacro(*system_ptr, topology, arguments);
+    Nx2CountList(extended ? g_nx2_list_stats.extended_draws : g_nx2_list_stats.indirect_draws);
+    FrontQueueIndirectDraw(system, split, fs, topology, arguments, extended, nullptr);
+    return true;
+}
+
+void Maxwell3D::FrontQueueIndirectDraw(Core::System& system, VideoCommon::GpuSplit& split,
+                                       FrontState& fs, Regs::PrimitiveTopology topology,
+                                       GPUVAddr arguments, bool extended, const u32* expected) {
+    std::array<u32, 5> words{};
+    const bool recheck = expected != nullptr;
+    if (recheck) {
+        std::copy_n(expected, words.size(), words.begin());
+    }
+    split.DeferEngineWork([this, system_ptr = &system, topology, arguments, extended, recheck,
+                           words] {
+        BackIndirectDrawMacro(*system_ptr, topology, arguments, extended,
+                              recheck ? words.data() : nullptr);
     });
     // The macro's last writes.
     for (const size_t base : {MAXWELL3D_REG_INDEX(vertex_id_base),
@@ -1837,16 +1973,33 @@ bool Maxwell3D::FrontIndirectDrawMacro(Core::System& system, VideoCommon::GpuSpl
                               MAXWELL3D_REG_INDEX(global_base_instance_index)}) {
         FrontWrite(split, fs, static_cast<u32>(base), 0, true, true);
     }
-    return true;
+    if (extended) {
+        // ... and the extended one's: its two constant buffer words back to 0. Guest memory
+        // never held the arguments there, as the replacement drew without them.
+        constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+        FrontWrite(split, fs, MAXWELL3D_REG_INDEX(const_buffer.offset), ExtendedBaseVertexOffset,
+                   true, true);
+        FrontWrite(split, fs, cb_data, 0, true, true);
+        FrontWrite(split, fs, cb_data + 1, 0, true, true);
+    }
 }
 
 void Maxwell3D::BackIndirectDrawMacro(Core::System& system, Regs::PrimitiveTopology topology,
-                                      GPUVAddr arguments) {
+                                      GPUVAddr arguments, bool extended, const u32* expected) {
     // As FinishFrontMacro around a macro, with HLE_DrawIndexedIndirect's draw in between. The
     // base vertex and instance come from the arguments, as does the index range (the whole
     // bound index buffer is bound for it).
     ConsumeSink(system);
     draw_manager.DrawDeferred(*this);
+    if (extended &&
+        !ExtendedWordsInBankZero(regs.const_buffer.Address(),
+                                 [this](size_t stage, size_t bank) -> const ConstBufferInfo& {
+                                     return state.shader_stages[stage].const_buffers[bank];
+                                 })) {
+        // The front's copy of the bindings said otherwise (it hadn't seen them yet).
+        BackExtendedIndirectFallback(system, topology, arguments);
+        return;
+    }
     regs.vertex_id_base = 0;
     regs.global_base_vertex_index = 0;
     regs.global_base_instance_index = 0;
@@ -1860,10 +2013,83 @@ void Maxwell3D::BackIndirectDrawMacro(Core::System& system, Regs::PrimitiveTopol
     params.max_draw_counts = 1;
     params.stride = 0;
     params.after_gpu_writes = true;
+    params.page_barrier = extended;
     dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+    if (extended) {
+        // The shaders' reads of the macro's two constant buffer words become the draw's base
+        // vertex and instance (pipelines drawn so are keyed apart: app_stage).
+        engine_state = EngineHint::OnHLEMacro;
+        SetHLEReplacementAttributeType(0, ExtendedBaseVertexOffset,
+                                       HLEReplacementAttributeType::BaseVertex);
+        SetHLEReplacementAttributeType(0, ExtendedBaseInstanceOffset,
+                                       HLEReplacementAttributeType::BaseInstance);
+    }
     draw_manager.DrawIndexedIndirect(*this, topology, 0,
                                      static_cast<u32>(EstimateIndexBufferSize()));
+    if (extended) {
+        engine_state = EngineHint::None;
+        replace_table.clear();
+    }
     params.after_gpu_writes = false;
+    params.page_barrier = false;
+    if (expected == nullptr || ++indirect_rechecks % g_nx2_indirect_macro_verify_every != 0) {
+        return;
+    }
+    // The re-check arm: what the GPU holds at the arguments once the draw is recorded, against
+    // what the front read for it.
+    std::array<u32, 5> held{};
+    if (!ReadBackArguments(memory_manager, *rasterizer, arguments, held)) {
+        return;
+    }
+    Nx2CountList(g_nx2_list_stats.extended_compared);
+    if (std::equal(held.begin(), held.end(), expected)) {
+        return;
+    }
+    Nx2CountList(g_nx2_list_stats.extended_mismatched);
+    static u32 logged{};
+    if (logged++ < 16) {
+        LOG_WARNING(HW_GPU,
+                    "Extended indirect draw at {:#x}: the GPU holds {:08x}, the front read {:08x}",
+                    arguments, fmt::join(held, ","),
+                    fmt::join(std::span<const u32>{expected, held.size()}, ","));
+    }
+}
+
+void Maxwell3D::BackExtendedIndirectFallback(Core::System& system,
+                                             Regs::PrimitiveTopology topology,
+                                             GPUVAddr arguments) {
+    Nx2CountList(g_nx2_list_stats.extended_fallbacks);
+    std::array<u32, 5> words{};
+    if (!ReadBackArguments(memory_manager, *rasterizer, arguments, words)) {
+        // No cached buffer holds them: guest memory does.
+        memory_manager.ReadBlockUnsafe(arguments, words.data(), sizeof(words));
+    }
+    const u32 index_count = words[0];
+    const u32 instances = words[1];
+    const u32 first_index = words[2];
+    const u32 base_vertex = words[3];
+    const u32 base_instance = words[4];
+    // What the macro does, as HLE_DrawIndexedIndirect's fallback draws it: the base vertex and
+    // instance to the registers and the constant buffer, the draw, the registers back to 0 (the
+    // front sends the constant buffer's zeros). The first index register and the constant buffer
+    // offset keep their values, as the front's copy of the registers has them (its writes after
+    // this one count on that).
+    regs.vertex_id_base = base_vertex;
+    regs.global_base_vertex_index = base_vertex;
+    regs.global_base_instance_index = base_instance;
+    const u32 cb_offset = regs.const_buffer.offset;
+    regs.const_buffer.offset = ExtendedBaseVertexOffset;
+    const std::array<u32, 2> cb_words{base_vertex, base_instance};
+    ProcessCBMultiData(cb_words.data(), static_cast<u32>(cb_words.size()));
+    regs.const_buffer.offset = cb_offset;
+    if (instances != 0) {
+        dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+        draw_manager.DrawIndex(*this, topology, first_index, index_count, base_vertex,
+                               base_instance, instances);
+    }
+    regs.vertex_id_base = 0;
+    regs.global_base_vertex_index = 0;
+    regs.global_base_instance_index = 0;
 }
 
 } // namespace Tegra::Engines

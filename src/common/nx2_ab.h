@@ -28,6 +28,8 @@ enum Feature : u64 {
     ListFlushBatch = 1ull << 51,     ///< List drains download all draw-written list pages at once
     IndirectDrawMacro = 1ull << 52,  ///< GPU-written draw arguments of NVN2's indirect draw macro
                                      ///< drawn from the GPU (Maxwell3D::FrontIndirectDrawMacro)
+    IndirectDrawMacroExtended = 1ull << 55, ///< The same for the macro's variant that also writes
+                                            ///< base vertex/instance to the constant buffer
 };
 
 inline const u64 g_mask = [] {

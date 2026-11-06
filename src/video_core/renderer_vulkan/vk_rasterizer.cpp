@@ -917,8 +917,7 @@ void RasterizerVulkan::DrawIndirect() {
     };
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     const auto& params = maxwell3d->draw_manager.indirect_state;
-    if (params.after_gpu_writes &&
-        buffer_cache.Nx2GpuWriteSerial() != nx2_indirect_barrier_serial) {
+    if (params.after_gpu_writes && Nx2IndirectBarrierNeeded(params)) {
         // The arguments may be shader or copy output recorded since the last such barrier
         // (Maxwell3D::BackIndirectDrawMacro); a wait for idle orders the work but doesn't make
         // the writes visible to the indirect read.
@@ -1396,6 +1395,36 @@ void RasterizerVulkan::VerifyGpuWrittenCommandList(DAddr addr, std::span<const u
                                                    std::span<const u8> before) {
     // No cache lock, as in ReadGpuWrittenCommandList.
     buffer_cache.Nx2VerifyListRead(addr, words, before);
+}
+
+bool RasterizerVulkan::ReadBackGpuWords(DAddr addr, std::span<u8> out) {
+    // A submit and a wait, as a flush.
+    SCOPE_EXIT {
+        NoteSetupChange();
+    };
+    std::scoped_lock lock{buffer_cache.mutex};
+    return buffer_cache.Nx2ReadBack(addr, out);
+}
+
+bool RasterizerVulkan::Nx2IndirectBarrierNeeded(
+    const Tegra::Engines::Maxwell3D::DrawManager::IndirectParams& params) {
+    if (buffer_cache.Nx2GpuWriteSerial() == nx2_indirect_barrier_serial) {
+        return false;
+    }
+    if (!params.page_barrier || nx2_indirect_barrier_serial == ~u64{0}) {
+        return true;
+    }
+    // GPU work wrote something since the last barrier: the arguments only if their pages say so
+    // (Maxwell3D::BackIndirectDrawMacro, the extended macro). Its writers run as one batch a
+    // frame, while storage writes elsewhere come between nearly every two of its draws, and each
+    // barrier ends the render pass.
+    const auto device = gpu_memory->GpuToCpuAddress(params.indirect_start_address);
+    if (!device || buffer_cache.Nx2ListWrittenSince(*device, params.buffer_size,
+                                                     nx2_indirect_barrier_serial) != 0) {
+        return true;
+    }
+    Tegra::Nx2CountList(Tegra::g_nx2_list_stats.barriers_skipped);
+    return false;
 }
 
 void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {

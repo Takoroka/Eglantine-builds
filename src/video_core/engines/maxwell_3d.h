@@ -3098,6 +3098,8 @@ public:
             /// The arguments may be what earlier GPU work wrote without a barrier since
             /// (Maxwell3D::BackIndirectDrawMacro): the draw puts one in when storage was written.
             bool after_gpu_writes;
+            /// ... only when their own pages were written since (they are command list pages).
+            bool page_barrier;
         };
         void ProcessMethodCall(Maxwell3D& maxwell3d, u32 method, u32 argument);
         void Clear(Maxwell3D& maxwell3d, u32 layer_count);
@@ -3253,7 +3255,8 @@ public:
     /// The front, before the last five parameters of macro `method` (one taken so far) are read
     /// from GPU-written memory at `arguments`: when the macro is NVN2's indexed indirect draw,
     /// sends the back an indirect draw from those words instead and returns true (they need not
-    /// be read). A/B bit IndirectDrawMacro (nx2.h).
+    /// be read). A/B bits IndirectDrawMacro and, for its extended variant,
+    /// IndirectDrawMacroExtended (nx2.h).
     bool FrontIndirectDrawMacro(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                                 GPUVAddr arguments);
 
@@ -3461,9 +3464,19 @@ private:
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 count);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
+    /// FrontIndirectDrawMacro's draw: the back's part, then the macro's last writes. `expected`
+    /// (the re-check arm): the five words as the front read them, for the back to compare.
+    void FrontQueueIndirectDraw(Core::System& system, VideoCommon::GpuSplit& split,
+                                FrontState& state, Regs::PrimitiveTopology topology,
+                                GPUVAddr arguments, bool extended, const u32* expected);
     /// The back's part of FrontIndirectDrawMacro.
     void BackIndirectDrawMacro(Core::System& system, Regs::PrimitiveTopology topology,
-                               GPUVAddr arguments);
+                               GPUVAddr arguments, bool extended, const u32* expected);
+    /// The back, the extended macro when the shaders don't read its constant buffer words
+    /// through bank 0 alone: reads the arguments (a wait for the GPU) and draws as the macro does.
+    void BackExtendedIndirectFallback(Core::System& system, Regs::PrimitiveTopology topology,
+                                      GPUVAddr arguments);
+    u32 indirect_rechecks{}; ///< Back: re-check arm draws, for the every-n-th comparison
     std::unique_ptr<FrontState> front;
     bool front_macros{};
     // EDEN_NX2_SPLIT_VERIFY: the last SET_SHADOW_RAM_CONTROL writes each side saw (argument,

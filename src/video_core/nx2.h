@@ -100,8 +100,25 @@ inline void Nx2MarkCommandListPage(u64 device_address) {
 [[nodiscard]] inline bool Nx2IndirectDrawMacro() {
     return Common::Nx2Ab::On(Common::Nx2Ab::IndirectDrawMacro);
 }
-inline const bool g_nx2_indirect_macro_verify =
-    std::getenv("EDEN_NX2_INDIRECT_MACRO_VERIFY") != nullptr;
+// Donkey Kong Bananza's are its extended variant, which also writes the base vertex and instance
+// to the selected constant buffer (+0x640, +0x644) for the shaders, and zeros them after the
+// draw. With A/B bit IndirectDrawMacroExtended the back draws those from the GPU too, with the
+// shaders' reads of those two words replaced by the draw's base vertex and instance (Eden's HLE
+// replacement, as its HLE_DrawIndexedIndirect does for the Switch 1 macro).
+// EDEN_NX2_INDIRECT_MACRO_VERIFY=2: the re-check arm. The front reads the arguments as before,
+// and the back draws them from the GPU and compares, every EDEN_NX2_INDIRECT_MACRO_VERIFY_EVERY-th
+// draw (default 16), what the GPU holds with what the front read (a wait for the GPU each).
+[[nodiscard]] inline bool Nx2IndirectDrawMacroExtended() {
+    return Common::Nx2Ab::On(Common::Nx2Ab::IndirectDrawMacroExtended);
+}
+inline const int g_nx2_indirect_macro_verify = [] {
+    const char* value = std::getenv("EDEN_NX2_INDIRECT_MACRO_VERIFY");
+    return value == nullptr ? 0 : (std::max)(std::atoi(value), 1);
+}();
+inline const u32 g_nx2_indirect_macro_verify_every = [] {
+    const char* value = std::getenv("EDEN_NX2_INDIRECT_MACRO_VERIFY_EVERY");
+    return value == nullptr ? 16U : (std::max)(static_cast<u32>(std::atoi(value)), 1U);
+}();
 
 // Counts for the front's 10 s "command lists" log line (dma_pusher.cpp, ReportListStats).
 struct Nx2ListStats {
@@ -159,6 +176,14 @@ struct Nx2ListStats {
     std::atomic<u64> indirect_checked;   ///< Re-check mode: read and run as before, then checked
     std::atomic<u64> indirect_odd;       ///< ... with base vertex/instance not 0 or instances not 1
     std::atomic<u64> indirect_barriers;  ///< Barriers before such a draw (storage written since)
+    // Its extended variant (A/B bit IndirectDrawMacroExtended).
+    std::atomic<u64> extended_draws;     ///< Drawn from the GPU, the arguments not read
+    std::atomic<u64> extended_rechecks;  ///< Re-check mode: drawn from the GPU after the front read
+    std::atomic<u64> extended_compared;  ///< ... and the GPU's words compared with the front's
+    std::atomic<u64> extended_mismatched; ///< ... and found different (logged)
+    std::atomic<u64> extended_fallbacks; ///< The constant buffer isn't the shaders' bank 0 alone:
+                                         ///< the back read the arguments and drew as the macro does
+    std::atomic<u64> barriers_skipped;   ///< GPU writes since the last barrier, none to its words
 };
 inline Nx2ListStats g_nx2_list_stats{};
 
