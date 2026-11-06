@@ -1778,8 +1778,12 @@ bool Maxwell3D::FrontIndirectDrawMacro(Core::System& system, VideoCommon::GpuSpl
         return false;
     }
     auto& fs = Front(system, split);
-    // The topology, nothing else, came in the entry before.
-    if (fs.executing_macro != method || fs.parameters.size() != 1 ||
+    // The topology, nothing else, came in the entry before. A macro call sends its first
+    // parameter to the macro's even method and the rest to the odd one after it (increment
+    // once): the same macro.
+    if (fs.executing_macro < MacroRegistersStart ||
+        (fs.executing_macro - MacroRegistersStart) >> 1 != (method - MacroRegistersStart) >> 1 ||
+        fs.parameters.size() != 1 ||
         (fs.parameters[0] & ~0xffffU) != 0 ||
         !IndirectTopologySafe(static_cast<Regs::PrimitiveTopology>(fs.parameters[0]))) {
         return false;

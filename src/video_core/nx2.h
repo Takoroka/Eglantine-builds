@@ -154,6 +154,7 @@ struct Nx2ListStats {
     std::atomic<u64> acquire_gequal;     ///< GEQUAL acquires (the others: EQUAL, MASK)
     std::atomic<u64> acquire_may_drain;  ///< The front had nothing else to parse
     std::atomic<u64> acquire_met;        ///< The value was there once the back caught up
+    std::atomic<u64> acquire_parked;     ///< EQUAL/MASK parked without draining (AcquireParkEarly)
     // NVN2's indexed indirect draw macro with GPU-written arguments (A/B bit IndirectDrawMacro).
     std::atomic<u64> indirect_draws;     ///< Drawn from the GPU, the arguments not read
     std::atomic<u64> indirect_checked;   ///< Re-check mode: read and run as before, then checked

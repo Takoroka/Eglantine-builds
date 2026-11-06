@@ -107,6 +107,7 @@ void ReportListStats() {
     const double acquire_gequal = rate(stats.acquire_gequal);
     const double acquire_may_drain = rate(stats.acquire_may_drain);
     const double acquire_met = rate(stats.acquire_met);
+    const double acquire_parked = rate(stats.acquire_parked);
     const double indirect_draws = rate(stats.indirect_draws);
     const double indirect_checked = rate(stats.indirect_checked);
     const double indirect_odd = rate(stats.indirect_odd);
@@ -117,10 +118,10 @@ void ReportListStats() {
     }
     using Common::Nx2Ab::On;
     LOG_INFO(HW_GPU,
-             "Command lists per second (bit 48 {}, 49 {}, 50 {}, 51 {}, 52 {}): indirect draw "
-             "macros {:.0f} drawn from the GPU ({:.0f} barriers), {:.0f} checked ({:.0f} odd) | "
-             "acquire drains {:.0f} GEQUAL, {:.0f} with nothing else to parse, {:.0f} met after "
-             "it | {:.0f} entries on "
+             "Command lists per second (bit 48 {}, 49 {}, 50 {}, 51 {}, 52 {}, 53 {}): "
+             "indirect draw macros {:.0f} drawn from the GPU ({:.0f} barriers), {:.0f} checked "
+             "({:.0f} odd) | acquire drains {:.0f} GEQUAL, {:.0f} with nothing else to parse, "
+             "{:.0f} met after it, {:.0f} EQUAL/MASK parked first | {:.0f} entries on "
              "GPU-written pages | read from copies {:.0f}, synced {:.0f}, past the draws' ranges "
              "{:.0f} | list drains {:.0f}: {:.1f} ms for the back, {:.1f} ms flushing ({:.0f} "
              "flushes, {:.0f} batched taking {:.0f} other pages); {:.0f} on pages draws "
@@ -137,9 +138,10 @@ void ReportListStats() {
              On(Common::Nx2Ab::ListWriterWaitSkip) ? "on" : "off",
              On(Common::Nx2Ab::SemAcquireOnBack) ? "on" : "off",
              On(Common::Nx2Ab::ListFlushBatch) ? "on" : "off",
-             On(Common::Nx2Ab::IndirectDrawMacro) ? "on" : "off", indirect_draws,
+             On(Common::Nx2Ab::IndirectDrawMacro) ? "on" : "off",
+             On(Common::Nx2Ab::AcquireParkEarly) ? "on" : "off", indirect_draws,
              indirect_barriers, indirect_checked, indirect_odd, acquire_gequal, acquire_may_drain,
-             acquire_met, entries, copied, synced, exact,
+             acquire_met, acquire_parked, entries, copied, synced, exact,
              drains, drain_ms, flush_ms, flushes, batch_flushes, batch_pages, draw_page_reads,
              would_exact, writer_ms, copy_ms,
              matched, mismatched, no_copy, draw_writes, draw_kib, entry_waits, entry_wait_ms,
