@@ -290,9 +290,8 @@ public:
 
     void ChangeChannel(Tegra::Control::ChannelState& channel_state);
 
-    /// Stops using the current channel's dirty flags (the channel may already be gone): later
-    /// invalidations go to the tracker's own flags.
-    void DetachChannel() {
+    /// Stops using the bound channel's flags, for when it goes away.
+    void ClearChannel() {
         flags = &default_flags;
     }
 

@@ -328,6 +328,7 @@ struct Info {
     bool uses_sparse_residency{};
     bool uses_demote_to_helper_invocation{};
     bool uses_subgroup_vote{};
+    bool removed_conditional_barrier{};
     bool uses_subgroup_mask{};
     bool uses_fswzadd{};
     /// Matrix multiply-adds (HMMA) run in software (TensorMulAdd)

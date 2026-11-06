@@ -286,11 +286,9 @@ RasterizerVulkan::~RasterizerVulkan() {
     VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr);
     VideoCommon::GpuSplit::Get().SetBackIdleHook(nullptr, nullptr);
     VideoCommon::GpuSplit::Get().SetSubmitHook(nullptr, nullptr);
+    // The channels are gone by now, and submitting invalidates the state tracker's flags.
+    state_tracker.ClearChannel();
     scheduler.WaitWorker();
-    // On stop the channels can be destroyed before the rasterizer, and the final Finish
-    // invalidates the command buffer state through the tracker's flags pointer: point it at the
-    // tracker's own flags first. Idea: SmileyTatsu ca7c66c3b4.
-    state_tracker.DetachChannel();
     scheduler.Finish();
     delete std::exchange(g_diag_pool, nullptr);
 }
@@ -3739,12 +3737,16 @@ void RasterizerVulkan::BindChannel(Tegra::Control::ChannelState& channel) {
     query_cache.BindToChannel(channel_id);
     state_tracker.ChangeChannel(channel);
     state_tracker.InvalidateState();
+    bound_channel_id = channel_id;
 }
 
 void RasterizerVulkan::ReleaseChannel(s32 channel_id) {
     SCOPE_EXIT {
         NoteSetupChange();
     };
+    if (channel_id == bound_channel_id) {
+        state_tracker.ClearChannel();
+    }
     EraseChannel(channel_id);
     {
         std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
