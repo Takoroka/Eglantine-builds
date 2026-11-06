@@ -28,6 +28,7 @@
 #include "common/alignment.h"
 #include "common/div_ceil.h"
 #include "common/game_presets.h"
+#include "common/nx2_ab.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
@@ -1959,6 +1960,7 @@ private:
             }
             if (m_stats.last_present != std::chrono::steady_clock::time_point{}) {
                 const long long frame = to_us(entered - m_stats.last_present);
+                Common::Nx2Ab::OnPresent(frame); // TEMP A/B
                 m_stats.frame_us += frame;
                 m_stats.max_frame_us = (std::max)(m_stats.max_frame_us, frame);
                 m_stats.hitches += frame > 100'000 ? 1 : 0;
@@ -2041,6 +2043,7 @@ private:
         if (m_stats.last_present != std::chrono::steady_clock::time_point{}) {
             const long long frame =
                 std::chrono::duration_cast<std::chrono::microseconds>(entered - m_stats.last_present).count();
+            Common::Nx2Ab::OnPresent(frame); // TEMP A/B
             m_stats.frame_us += frame;
             m_stats.max_frame_us = (std::max)(m_stats.max_frame_us, frame);
             m_stats.hitches += frame > 100'000 ? 1 : 0;
