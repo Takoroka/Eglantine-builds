@@ -665,14 +665,20 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         features.shader_float16_int8.shaderFloat16 = false;
     }
 
-    // EDEN_NX2_FLOAT16=0 lowers all float16 shader math to float32; =1 keeps float16 where a
-    // workaround above turned it off. For comparing a game's float16 results between drivers that
-    // keep it (RADV: Splatoon Raiders' ink on a Steam Deck) and drivers that don't.
-    if (const char* value = std::getenv("EDEN_NX2_FLOAT16")) {
-        const bool float16 = value[0] == '1' && driver_float16;
-        LOG_INFO(Render_Vulkan, "EDEN_NX2_FLOAT16={}: float16 shader math {}", value,
-                 float16 ? "on" : "off");
-        features.shader_float16_int8.shaderFloat16 = float16;
+    // Game shaders' float16 math is lowered to float32 unless EDEN_NX2_FLOAT16=1 (=0 is the
+    // default): Splatoon Raiders' ink only registered on drivers without float16, and RADV (Steam
+    // Deck) kept it. The device feature stays as the workarounds above leave it, for the present
+    // shaders (FSR, ScaleForce; LSFG frame generation needs it). =1 gives game shaders the
+    // driver's float16, also where a workaround turned it off.
+    const char* const float16_value = std::getenv("EDEN_NX2_FLOAT16");
+    if (float16_value != nullptr && float16_value[0] == '1') {
+        features.shader_float16_int8.shaderFloat16 = driver_float16;
+        guest_float16 = driver_float16;
+        LOG_INFO(Render_Vulkan, "EDEN_NX2_FLOAT16=1: float16 shader math {}",
+                 driver_float16 ? "on" : "off (the driver has no float16)");
+    } else {
+        LOG_INFO(Render_Vulkan, "float16 shader math off (default; EDEN_NX2_FLOAT16=1 to use "
+                                "the driver's float16)");
     }
 
     has_broken_compute =
