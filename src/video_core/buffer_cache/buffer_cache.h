@@ -2379,6 +2379,30 @@ void BufferCache<P>::Nx2VerifyListRead(DAddr device_addr, std::span<const u8> wo
 }
 
 template <class P>
+void BufferCache<P>::Nx2FlushListPages(std::span<const DAddr> pages) {
+    if constexpr (!IS_OPENGL) {
+        constexpr DAddr page_size = DAddr{1} << Tegra::Nx2WrittenPageBits;
+        Common::RangeSet<DAddr> ranges;
+        for (const DAddr page : pages) {
+            ranges.Add(page, page_size);
+        }
+        u64 others = 0;
+        {
+            std::scoped_lock lock{nx2_list_mutex};
+            for (const auto& [page, entry] : nx2_list_pages) {
+                if (entry.draw_written && IsRegionGpuModified(page, page_size)) {
+                    ranges.Add(page, page_size);
+                    ++others;
+                }
+            }
+        }
+        Tegra::Nx2CountList(Tegra::g_nx2_list_stats.batch_flushes);
+        Tegra::Nx2CountList(Tegra::g_nx2_list_stats.batch_pages, others);
+        DownloadRanges(ranges);
+    }
+}
+
+template <class P>
 void BufferCache<P>::Nx2NoteListSynced(DAddr page) {
     if constexpr (!IS_OPENGL) {
         std::scoped_lock lock{nx2_list_mutex};

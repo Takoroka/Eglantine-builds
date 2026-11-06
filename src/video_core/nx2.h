@@ -84,6 +84,13 @@ inline void Nx2MarkCommandListPage(u64 device_address) {
 [[nodiscard]] inline bool Nx2ListDrawRanges() {
     return Common::Nx2Ab::On(Common::Nx2Ab::ListDrawRanges);
 }
+// Those lists drain, and the flush after the drain waits for the GPU once per page: the first
+// list of a page downloads what the draws wrote on it. With A/B bit ListFlushBatch, the first
+// one to need a flush downloads every command list page draws wrote at once (the pages of the
+// lists after it then hold their words already, unless draws wrote them again since).
+[[nodiscard]] inline bool Nx2ListFlushBatch() {
+    return Common::Nx2Ab::On(Common::Nx2Ab::ListFlushBatch);
+}
 
 // Counts for the front's 10 s "command lists" log line (dma_pusher.cpp, ReportListStats).
 struct Nx2ListStats {
@@ -94,6 +101,9 @@ struct Nx2ListStats {
     std::atomic<u64> drains;       ///< Drained the split and flushed (FlushGpuWrittenCommands)
     std::atomic<u64> drain_ns;     ///< Of those: waiting for the back
     std::atomic<u64> flush_ns;     ///< Of those: the flush (the host GPU's work and a download)
+    std::atomic<u64> flushes;      ///< Of those: the list's pages held GPU-written words
+    std::atomic<u64> batch_flushes; ///< ... downloaded with the other draw-written list pages
+    std::atomic<u64> batch_pages;  ///< Other pages those took along
     std::atomic<u64> writer_ns;    ///< ReadGpuWrittenCommands waiting for the last dispatch or copy
     std::atomic<u64> copy_ns;      ///< Waiting for the host GPU to finish a copy
     std::atomic<u64> draw_page_reads; ///< Of the drains: lists on pages draws write

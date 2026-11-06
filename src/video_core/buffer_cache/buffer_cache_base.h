@@ -368,6 +368,10 @@ public:
     /// what Nx2ReadListCopy would have read without draining (nx2.h, Nx2ListDrawRanges).
     void Nx2VerifyListRead(DAddr device_addr, std::span<const u8> words,
                            std::span<const u8> before);
+    /// Front thread, the split drained, cache lock held: downloads the GPU-written words of
+    /// `pages` (a command list's) and of every command list page draws write, in one wait for the
+    /// GPU (nx2.h, Nx2ListFlushBatch).
+    void Nx2FlushListPages(std::span<const DAddr> pages);
     /// Front thread, the split drained: the command list page was flushed to guest memory.
     void Nx2NoteListSynced(DAddr page);
     /// CPU and inline writes: they reach guest memory, so a synced page stays synced, but its copy

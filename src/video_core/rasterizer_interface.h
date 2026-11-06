@@ -112,6 +112,12 @@ public:
     /// Switch 2: the front flushed this command list page with the split drained.
     virtual void NoteGpuWrittenCommandListSynced([[maybe_unused]] DAddr page) {}
 
+    /// Switch 2, the front, drained: flushes a command list's device pages and every command list
+    /// page draws write, in one wait for the GPU. False: not done, the caller flushes the list.
+    virtual bool FlushGpuWrittenCommandListPages([[maybe_unused]] std::span<const DAddr> pages) {
+        return false;
+    }
+
     /// Switch 2, the front, drained and flushed (before NoteGpuWrittenCommandListSynced): a
     /// command list's words (within one 4 KiB page) as guest memory holds them now and held them
     /// before the drain, to compare with what a read without the drain finds where draws write

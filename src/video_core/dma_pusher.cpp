@@ -69,6 +69,9 @@ void ReportListStats() {
     const double drains = rate(stats.drains);
     const double drain_ms = ms(stats.drain_ns);
     const double flush_ms = ms(stats.flush_ns);
+    const double flushes = rate(stats.flushes);
+    const double batch_flushes = rate(stats.batch_flushes);
+    const double batch_pages = rate(stats.batch_pages);
     const double draw_page_reads = rate(stats.draw_page_reads);
     const double would_exact = rate(stats.would_exact);
     const double writer_ms = ms(stats.writer_ns);
@@ -107,9 +110,10 @@ void ReportListStats() {
     }
     using Common::Nx2Ab::On;
     LOG_INFO(HW_GPU,
-             "Command lists per second (bit 48 {}, 49 {}, 50 {}): {:.0f} entries on GPU-written "
-             "pages | read from copies {:.0f}, synced {:.0f}, past the draws' ranges {:.0f} | list "
-             "drains {:.0f}: {:.1f} ms for the back, {:.1f} ms flushing; {:.0f} on pages draws "
+             "Command lists per second (bit 48 {}, 49 {}, 50 {}, 51 {}): {:.0f} entries on "
+             "GPU-written pages | read from copies {:.0f}, synced {:.0f}, past the draws' ranges "
+             "{:.0f} | list drains {:.0f}: {:.1f} ms for the back, {:.1f} ms flushing ({:.0f} "
+             "flushes, {:.0f} batched taking {:.0f} other pages); {:.0f} on pages draws "
              "write ({:.0f} outside their ranges) | waits for writers {:.1f} ms, for copies "
              "{:.1f} ms | drained words vs guest memory/copy: {:.0f} same, {:.0f} different, "
              "{:.0f} neither current | draw writes to list pages {:.0f} ({:.0f} KiB) | entries on "
@@ -121,8 +125,10 @@ void ReportListStats() {
              "reads {:.0f} ({:.1f} ms), syncs {:.0f} ({:.1f} ms), runs {:.0f} ({:.1f} ms)",
              On(Common::Nx2Ab::ListDrawRanges) ? "on" : "off",
              On(Common::Nx2Ab::ListWriterWaitSkip) ? "on" : "off",
-             On(Common::Nx2Ab::SemAcquireOnBack) ? "on" : "off", entries, copied, synced, exact,
-             drains, drain_ms, flush_ms, draw_page_reads, would_exact, writer_ms, copy_ms,
+             On(Common::Nx2Ab::SemAcquireOnBack) ? "on" : "off",
+             On(Common::Nx2Ab::ListFlushBatch) ? "on" : "off", entries, copied, synced, exact,
+             drains, drain_ms, flush_ms, flushes, batch_flushes, batch_pages, draw_page_reads,
+             would_exact, writer_ms, copy_ms,
              matched, mismatched, no_copy, draw_writes, draw_kib, entry_waits, entry_wait_ms,
              entry_needed, entry_skips, entry_known_needed, entry_known_turned, split_drains,
              split_drain_ms, split_waits, split_wait_ms, acquire_drains, acquire_drain_ms,
@@ -868,8 +874,22 @@ void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
     const GPUVAddr end_page = (address + size + 0xfff) & ~GPUVAddr{0xfff};
     if (memory_manager.IsMemoryDirty(first_page, end_page - first_page,
                                      VideoCommon::CacheType::BufferCache)) {
-        memory_manager.FlushRegion(first_page, end_page - first_page,
-                                   VideoCommon::CacheType::BufferCache);
+        Nx2CountList(g_nx2_list_stats.flushes);
+        // Along with every other command list page draws wrote (nx2.h, Nx2ListFlushBatch).
+        boost::container::small_vector<DAddr, 4> pages;
+        bool batched = rasterizer != nullptr && Nx2ListFlushBatch();
+        for (GPUVAddr page = first_page; batched && page < end_page; page += 0x1000) {
+            const auto device = memory_manager.GpuToCpuAddress(page);
+            batched = device.has_value();
+            if (batched) {
+                pages.push_back(*device);
+            }
+        }
+        if (!batched || !rasterizer->FlushGpuWrittenCommandListPages(
+                            std::span<const DAddr>{pages.data(), pages.size()})) {
+            memory_manager.FlushRegion(first_page, end_page - first_page,
+                                       VideoCommon::CacheType::BufferCache);
+        }
     }
     Nx2CountList(g_nx2_list_stats.flush_ns, NanosecondsSince(flush_start));
     if (rasterizer == nullptr) {
