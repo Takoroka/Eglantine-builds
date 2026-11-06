@@ -22,6 +22,16 @@ namespace Common::Nx2Ab {
 
 // The registry of bits in use is C:\dev\nx2work\rounds\AB-BITS.md (bits 32 and up: 1ull << n).
 enum Feature : u64 {
+    // fences (11-05): direct draws with no vertices or no instances skip the draw setup.
+    ZeroDrawSkip = 1ull << 40,
+    // vkoff (11-05): draws with none of the dynamic states' dirty flags set skip their updates.
+    DynamicStateSkip = 1ull << 41,
+    // hosttime (11-06): writes of values only dynamic states read leave the next draw the repeat
+    // path (Maxwell3D::SameStateDynamic).
+    DynamicDeltas = 1ull << 44,
+    // hosttime (11-06): vertex streams bind a range resolved before without resolving it again
+    // while the mappings and buffers are as then (BufferCache::vertex_lookups).
+    VertexLookupCache = 1ull << 45,
     ListDrawRanges = 1ull << 48,     ///< Lists on pages draws write: past the draws' ranges (nx2.h)
     ListWriterWaitSkip = 1ull << 49, ///< Known CPU list pages skip the wait for writers (dma_pusher)
     SemAcquireOnBack = 1ull << 50,   ///< SEM_EXECUTE acquires checked on the back, no drain (puller)

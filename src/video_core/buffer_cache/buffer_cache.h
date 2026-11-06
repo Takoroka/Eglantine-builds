@@ -1759,6 +1759,7 @@ void BufferCache<P>::UpdateIndexBuffer() {
         }
         if (slot_buffers[inline_buffer_id].SizeBytes() < buffer_size) [[unlikely]] {
             slot_buffers.erase(inline_buffer_id);
+            ++buffer_set_serial;
             inline_buffer_id = CreateBuffer(0, buffer_size, false);
         }
         channel_state->index_buffer = Binding{
@@ -1813,6 +1814,30 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
         throw std::runtime_error("Native vertex stream exceeds supported 32-bit buffer size");
     }
     const GPUVAddr gpu_addr_end = native ? gpu_addr_begin + native_size : limit.Address() + 1;
+    // A range resolved before, while the address space, its mappings and the buffers are as then,
+    // binds what it bound (no translation, continuity check or buffer search). Not with accurate
+    // fences, where finding the buffer also synchronizes its writes.
+    // EDEN_NX2_VB_CACHE_VERIFY=1 resolves hits anyway and counts the differences.
+    static const bool verify = std::getenv("EDEN_NX2_VB_CACHE_VERIFY") != nullptr;
+    VertexLookup* const lookup =
+        array.enable != 0 && gpu_addr_end > gpu_addr_begin &&
+                Common::Nx2Ab::On(Common::Nx2Ab::VertexLookupCache) &&
+                !Settings::IsGPUFenceBehaviorAccurate()
+            ? &vertex_lookups[((gpu_addr_begin ^ (gpu_addr_end << 7)) * 0x9E3779B97F4A7C15ULL) >>
+                              (64 - VertexLookupBits)]
+            : nullptr;
+    const u64 map_generation = gpu_memory->MapGeneration();
+    const bool same_entry = lookup != nullptr && lookup->begin == gpu_addr_begin &&
+                            lookup->end == gpu_addr_end &&
+                            lookup->address_space == gpu_memory->GetID();
+    const bool hit = same_entry && lookup->map_generation == map_generation &&
+                     lookup->buffer_set_serial == buffer_set_serial;
+    if (hit && !verify) {
+        channel_state->vertex_buffers[index] = lookup->binding;
+        UpdateVertexBufferSlot(index, lookup->binding);
+        CountVertexLookup(VertexLookupOutcome::Hit);
+        return;
+    }
     const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
     const u32 address_size = static_cast<u32>(gpu_addr_end - gpu_addr_begin);
     u32 size = address_size; // TODO: Analyze stride and number of vertices
@@ -1830,8 +1855,45 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
         .size = size,
         .buffer_id = buffer_id,
     };
+    if (lookup != nullptr) {
+        if (hit) {
+            const bool differs = lookup->binding.device_addr != binding.device_addr ||
+                                 lookup->binding.size != binding.size ||
+                                 lookup->binding.buffer_id != binding.buffer_id;
+            CountVertexLookup(differs ? VertexLookupOutcome::HitMismatch : VertexLookupOutcome::Hit);
+        } else {
+            CountVertexLookup(!same_entry                                ? VertexLookupOutcome::MissEntry
+                              : lookup->map_generation != map_generation ? VertexLookupOutcome::MissMappings
+                                                                         : VertexLookupOutcome::MissBuffers);
+        }
+        // The buffer set as it is now: FindBuffer may have created the buffer.
+        *lookup = {gpu_addr_begin, gpu_addr_end, gpu_memory->GetID(), map_generation,
+                   buffer_set_serial, binding};
+    }
     channel_state->vertex_buffers[index] = binding;
     UpdateVertexBufferSlot(index, binding);
+}
+
+template <class P>
+void BufferCache<P>::CountVertexLookup(VertexLookupOutcome outcome) {
+    // EDEN_NX2_VB_CACHE_STATS=1 (or the verify): hits, misses by reason and mismatches every 10 s.
+    static const bool enabled = std::getenv("EDEN_NX2_VB_CACHE_STATS") != nullptr ||
+                                std::getenv("EDEN_NX2_VB_CACHE_VERIFY") != nullptr;
+    if (!enabled) {
+        return;
+    }
+    static std::array<u64, 5> counts{};
+    static auto last_log = std::chrono::steady_clock::now();
+    ++counts[static_cast<size_t>(outcome)];
+    if (const auto now = std::chrono::steady_clock::now(); now - last_log >= std::chrono::seconds{10}) {
+        LOG_INFO(HW_GPU,
+                 "nx2 vertex lookups: last {:.0f} s {} hits ({} differing from a full lookup), misses: "
+                 "{} other range in the entry, {} remapped, {} buffers created or deleted",
+                 std::chrono::duration<double>(now - last_log).count(), counts[0] + counts[1],
+                 counts[1], counts[2], counts[3], counts[4]);
+        counts = {};
+        last_log = now;
+    }
 }
 
 template <class P>
@@ -2616,6 +2678,7 @@ BufferId BufferCache<P>::CreateBuffer(DAddr device_addr, u32 wanted_size,
     }
     Register(new_buffer_id);
     TouchBuffer(new_buffer, new_buffer_id);
+    ++buffer_set_serial;
     return new_buffer_id;
 }
 
@@ -3016,6 +3079,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
 
 template <class P>
 void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
+    ++buffer_set_serial;
     if constexpr (requires { runtime.OnBufferDeleted(slot_buffers[buffer_id]); }) {
         runtime.OnBufferDeleted(slot_buffers[buffer_id]);
     }

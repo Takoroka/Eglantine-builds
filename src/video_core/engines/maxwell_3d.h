@@ -3147,6 +3147,10 @@ public:
         SameStateUniforms, ///< constant buffer uploads, addresses and binds
         SameStateGeometry, ///< vertex and index buffer addresses
         SameStateOther,    ///< everything else
+        /// Values only dynamic states read (UpdateDynamicStates, which a repeated draw runs too):
+        /// viewport scales and offsets, scissors, depth bias, blend constants, stencil references
+        /// and masks, line widths.
+        SameStateDynamic,
         NumSameStateKinds,
     };
     std::array<u64, NumSameStateKinds> same_state_serials{};

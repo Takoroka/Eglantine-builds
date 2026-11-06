@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <bit>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -743,6 +744,24 @@ bool GraphicsPipeline::ConfigureDescriptors(std::span<const VideoCommon::ImageVi
                                             bool full_setup, TextureSetUse texture_set_use) {
     namespace Profile = VideoCommon::Nx2Profile;
     const auto& regs{maxwell3d->regs};
+    if (SameStateVerifyEvery() != 0) {
+        const auto mix = [](u64 hash, u64 value) { return (hash ^ value) * 0x100000001b3ULL; };
+        SetupFingerprint fingerprint{0xcbf29ce484222325ULL, 0xcbf29ce484222325ULL};
+        for (const auto& view : views) {
+            fingerprint.textures = mix(fingerprint.textures, view.id.index);
+        }
+        for (u32 i = 0; i < num_textures; ++i) {
+            fingerprint.textures = mix(fingerprint.textures, samplers[i].index);
+        }
+        for (size_t stage = 0; stage < enabled_uniform_buffer_masks.size(); ++stage) {
+            const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
+            for (u32 mask = enabled_uniform_buffer_masks[stage]; mask != 0; mask &= mask - 1) {
+                const auto& cbuf{cbufs[std::countr_zero(mask)]};
+                fingerprint.uniforms = mix(mix(fingerprint.uniforms, cbuf.address), cbuf.size);
+            }
+        }
+        last_fingerprint = fingerprint;
+    }
     {
         Profile::Scope scope{Profile::Zone::DescriptorAcquire};
         guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
