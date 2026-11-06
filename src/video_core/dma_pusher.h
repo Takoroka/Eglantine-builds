@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <vector>
 #include <boost/container/small_vector.hpp>
 #include <deque>
@@ -204,6 +205,14 @@ public:
     void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands);
     /// Whether the entry lies on device pages the GPU has written (NX2).
     bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
+    /// An entry on pages no GPU work wrote yet: waits for the dispatches and copies still queued
+    /// (one may write it first), unless its pages are known CPU list pages (A/B bit
+    /// ListWriterWaitSkip). Returns whether the entry is GPU-written after all.
+    bool WaitForEntryWriters(GPUVAddr address, size_t size);
+    /// Whether every page of the entry is a known CPU list page (cpu_list_pages).
+    bool KnownCpuListPages(GPUVAddr address, size_t size);
+    /// The entry is GPU-written: its pages aren't CPU list pages (logged if they were known).
+    void ForgetCpuListPages(GPUVAddr address, size_t size);
     /// Copies the list's words from memory again, as of suspension count `now`.
     void RefreshSnapshot(CommandList& list, u64 now);
 
@@ -222,6 +231,12 @@ public:
     bool ReadGpuWrittenCommands(GPUVAddr address, u32 count);
     /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
     void FlushGpuWrittenCommands(GPUVAddr address, size_t size);
+
+    /// Device pages entries were read from unwritten after waiting for the writers, and how often
+    /// (WaitForEntryWriters).
+    std::unordered_map<u64, u32> cpu_list_pages;
+    /// FlushGpuWrittenCommands: the list's words before the drain.
+    Common::ScratchBuffer<u8> list_words_before;
 
 private:
 

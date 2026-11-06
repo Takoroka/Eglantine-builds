@@ -5,9 +5,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstdio>
+#include <span>
 
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -30,6 +33,111 @@ namespace Tegra {
 
 constexpr u32 MacroRegistersStart = 0xE00;
 constexpr u32 ComputeInline = 0x6D;
+
+namespace {
+
+u64 NanosecondsSince(std::chrono::steady_clock::time_point start) {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - start)
+                                .count());
+}
+
+// WaitForEntryWriters: waits that found a page's entries unwritten before it is a known CPU list
+// page.
+constexpr u32 CpuListPageAfter = 8;
+
+// Every 10 s: what the front did with command lists and how long it waited for the back (nx2.h,
+// Nx2ListStats), per second.
+void ReportListStats() {
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point window_start = Clock::now();
+    const Clock::time_point now = Clock::now();
+    const double seconds = std::chrono::duration<double>(now - window_start).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    window_start = now;
+    auto& stats = g_nx2_list_stats;
+    const auto rate = [seconds](std::atomic<u64>& counter) {
+        return static_cast<double>(counter.exchange(0, std::memory_order_relaxed)) / seconds;
+    };
+    const auto ms = [&](std::atomic<u64>& counter) { return rate(counter) / 1e6; };
+    const double entries = rate(stats.entries);
+    const double copied = rate(stats.copied);
+    const double synced = rate(stats.synced);
+    const double exact = rate(stats.exact);
+    const double drains = rate(stats.drains);
+    const double drain_ms = ms(stats.drain_ns);
+    const double flush_ms = ms(stats.flush_ns);
+    const double flushes = rate(stats.flushes);
+    const double batch_flushes = rate(stats.batch_flushes);
+    const double batch_pages = rate(stats.batch_pages);
+    const double draw_page_reads = rate(stats.draw_page_reads);
+    const double would_exact = rate(stats.would_exact);
+    const double writer_ms = ms(stats.writer_ns);
+    const double copy_ms = ms(stats.copy_ns);
+    const double matched = rate(stats.matched);
+    const double mismatched = rate(stats.mismatched);
+    const double no_copy = rate(stats.no_copy);
+    const double draw_writes = rate(stats.draw_writes);
+    const double draw_kib = rate(stats.draw_bytes) / 1024.0;
+    const double entry_waits = rate(stats.entry_waits);
+    const double entry_wait_ms = ms(stats.entry_wait_ns);
+    const double entry_needed = rate(stats.entry_needed);
+    const double entry_skips = rate(stats.entry_skips);
+    const double entry_known_needed = rate(stats.entry_known_needed);
+    const double entry_known_turned = rate(stats.entry_known_turned);
+    const double split_drains = rate(stats.split_drains);
+    const double split_drain_ms = ms(stats.split_drain_ns);
+    const double split_waits = rate(stats.split_waits);
+    const double split_wait_ms = ms(stats.split_wait_ns);
+    const double acquire_drains = rate(stats.acquire_drains);
+    const double acquire_drain_ms = ms(stats.acquire_drain_ns);
+    const double resume_drains = rate(stats.resume_drains);
+    const double resume_drain_ms = ms(stats.resume_drain_ns);
+    const double execute_drains = rate(stats.execute_drains);
+    const double execute_drain_ms = ms(stats.execute_drain_ns);
+    const double execute_on_back = rate(stats.execute_on_back);
+    const double macro_read_drains = rate(stats.macro_read_drains);
+    const double macro_read_drain_ms = ms(stats.macro_read_drain_ns);
+    const double sync_drains = rate(stats.sync_drains);
+    const double sync_drain_ms = ms(stats.sync_drain_ns);
+    const double run_drains = rate(stats.run_drains);
+    const double run_drain_ms = ms(stats.run_drain_ns);
+    if (entries == 0 && draw_writes == 0 && entry_waits == 0 && entry_skips == 0 &&
+        split_drains == 0 && split_waits == 0) {
+        return;
+    }
+    using Common::Nx2Ab::On;
+    LOG_INFO(HW_GPU,
+             "Command lists per second (bit 48 {}, 49 {}, 50 {}, 51 {}): {:.0f} entries on "
+             "GPU-written pages | read from copies {:.0f}, synced {:.0f}, past the draws' ranges "
+             "{:.0f} | list drains {:.0f}: {:.1f} ms for the back, {:.1f} ms flushing ({:.0f} "
+             "flushes, {:.0f} batched taking {:.0f} other pages); {:.0f} on pages draws "
+             "write ({:.0f} outside their ranges) | waits for writers {:.1f} ms, for copies "
+             "{:.1f} ms | drained words vs guest memory/copy: {:.0f} same, {:.0f} different, "
+             "{:.0f} neither current | draw writes to list pages {:.0f} ({:.0f} KiB) | entries on "
+             "unwritten pages: {:.0f} waits ({:.1f} ms), {:.0f} found GPU-written, {:.0f} skipped "
+             "as CPU list pages, {:.0f} known ones needed the wait, {:.0f} turned GPU-written | "
+             "all front waits for the back: {:.0f} drains ({:.1f} ms), {:.0f} position waits "
+             "({:.1f} ms) | drain calls: acquires {:.0f} ({:.1f} ms), resumed acquires {:.0f} "
+             "({:.1f} ms), SEM_EXECUTE {:.0f} ({:.1f} ms) + {:.0f} checked on the back, macro "
+             "reads {:.0f} ({:.1f} ms), syncs {:.0f} ({:.1f} ms), runs {:.0f} ({:.1f} ms)",
+             On(Common::Nx2Ab::ListDrawRanges) ? "on" : "off",
+             On(Common::Nx2Ab::ListWriterWaitSkip) ? "on" : "off",
+             On(Common::Nx2Ab::SemAcquireOnBack) ? "on" : "off",
+             On(Common::Nx2Ab::ListFlushBatch) ? "on" : "off", entries, copied, synced, exact,
+             drains, drain_ms, flush_ms, flushes, batch_flushes, batch_pages, draw_page_reads,
+             would_exact, writer_ms, copy_ms,
+             matched, mismatched, no_copy, draw_writes, draw_kib, entry_waits, entry_wait_ms,
+             entry_needed, entry_skips, entry_known_needed, entry_known_turned, split_drains,
+             split_drain_ms, split_waits, split_wait_ms, acquire_drains, acquire_drain_ms,
+             resume_drains, resume_drain_ms, execute_drains, execute_drain_ms, execute_on_back,
+             macro_read_drains, macro_read_drain_ms, sync_drains, sync_drain_ms, run_drains,
+             run_drain_ms);
+}
+
+} // Anonymous namespace
 
 DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Control::ChannelState& channel_state_)
     : system{system_}
@@ -177,13 +285,21 @@ bool DmaPusher::Step() {
         // written by a dispatch or copy still queued for it reads as unwritten, and its words as
         // stale (Fast Fusion's culling fills in instanced draws' arguments; stale ones asked for
         // billions of instances and lost the device loading a race).
-        bool gpu_written =
-            IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
-        if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
-            VideoCommon::GpuSplit::Get().WaitForWriters(false)) {
-            gpu_written =
-                IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+        const size_t entry_bytes = size_t{header.size} * sizeof(u32);
+        bool gpu_written = IsGpuWrittenCommands(dma_state.dma_get, entry_bytes);
+        if (gpu_written) {
+            Nx2CountList(g_nx2_list_stats.entries);
+            if (!cpu_list_pages.empty()) {
+                ForgetCpuListPages(dma_state.dma_get, entry_bytes);
+            }
+        } else if (VideoCommon::GpuSplit::Get().Active() &&
+                   VideoCommon::GpuSplit::Get().WritersQueued()) {
+            gpu_written = WaitForEntryWriters(dma_state.dma_get, entry_bytes);
+            if (gpu_written) {
+                Nx2CountList(g_nx2_list_stats.entries);
+            }
         }
+        ReportListStats();
         // The words as submitted, unless this is a resumed entry or the GPU has newer ones the
         // safe read below would flush (with the split, the front can't tell: it reads memory
         // unflushed anyway). Entries on pages the GPU writes (culling) always take the flushing
@@ -252,7 +368,11 @@ bool DmaPusher::Step() {
     }
 
     if (signal_sync) {
-        VideoCommon::GpuSplit::Get().Drain();
+        {
+            const Nx2CountedTime counted{g_nx2_list_stats.sync_drains,
+                                         g_nx2_list_stats.sync_drain_ns};
+            VideoCommon::GpuSplit::Get().Drain();
+        }
         rasterizer->SignalFence([this]() {
             std::scoped_lock lk(sync_mutex);
             synced = true;
@@ -596,6 +716,84 @@ bool DmaPusher::IsGpuWrittenCommands(GPUVAddr address, size_t size) {
     return false;
 }
 
+bool DmaPusher::WaitForEntryWriters(GPUVAddr address, size_t size) {
+    // The wait (Step) is for a dispatch or copy still queued that writes these pages first. Pages
+    // the game's CPU writes its command lists on never see one: once entries there were found
+    // unwritten after the wait CpuListPageAfter times, A/B bit ListWriterWaitSkip reads them
+    // without waiting (~50 waits a second in Donkey Kong Bananza, 3 ms each at the median).
+    auto& stats = g_nx2_list_stats;
+    const bool known = KnownCpuListPages(address, size);
+    if (known && Common::Nx2Ab::On(Common::Nx2Ab::ListWriterWaitSkip)) {
+        Nx2CountList(stats.entry_skips);
+        return false;
+    }
+    const auto wait_start = std::chrono::steady_clock::now();
+    if (!VideoCommon::GpuSplit::Get().WaitForWriters(false)) {
+        return false;
+    }
+    Nx2CountList(stats.entry_waits);
+    Nx2CountList(stats.entry_wait_ns, NanosecondsSince(wait_start));
+    if (IsGpuWrittenCommands(address, size)) {
+        Nx2CountList(stats.entry_needed);
+        if (known) {
+            Nx2CountList(stats.entry_known_needed);
+        }
+        if (!cpu_list_pages.empty()) {
+            ForgetCpuListPages(address, size);
+        }
+        return true;
+    }
+    for (GPUVAddr page = address & ~GPUVAddr{0xfff}; page < address + size; page += 0x1000) {
+        if (const auto device = memory_manager.GpuToCpuAddress(page)) {
+            u32& waits = cpu_list_pages[*device >> Nx2WrittenPageBits];
+            waits = (std::min)(waits + 1, CpuListPageAfter);
+        }
+    }
+    return false;
+}
+
+bool DmaPusher::KnownCpuListPages(GPUVAddr address, size_t size) {
+    if (size == 0 || cpu_list_pages.empty()) {
+        return false;
+    }
+    for (GPUVAddr page = address & ~GPUVAddr{0xfff}; page < address + size; page += 0x1000) {
+        const auto device = memory_manager.GpuToCpuAddress(page);
+        if (!device) {
+            return false;
+        }
+        const auto it = cpu_list_pages.find(*device >> Nx2WrittenPageBits);
+        if (it == cpu_list_pages.end() || it->second < CpuListPageAfter) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void DmaPusher::ForgetCpuListPages(GPUVAddr address, size_t size) {
+    for (GPUVAddr page = address & ~GPUVAddr{0xfff}; page < address + size; page += 0x1000) {
+        const auto device = memory_manager.GpuToCpuAddress(page);
+        if (!device) {
+            continue;
+        }
+        const auto it = cpu_list_pages.find(*device >> Nx2WrittenPageBits);
+        if (it == cpu_list_pages.end()) {
+            continue;
+        }
+        if (it->second >= CpuListPageAfter) {
+            // GPU work wrote a page its entries were read from without waiting for it: a list
+            // there may have been read before that work ran.
+            Nx2CountList(g_nx2_list_stats.entry_known_turned);
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1) < 16) {
+                LOG_WARNING(HW_GPU,
+                            "Command list page {:#x} the CPU wrote the lists of is GPU-written now",
+                            *device & ~u64{0xfff});
+            }
+        }
+        cpu_list_pages.erase(it);
+    }
+}
+
 bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
     // The pages are marked as command list pages: from the next write on, the buffer cache copies
     // them to host memory right after the dispatch or copy that writes them and submits. The
@@ -621,7 +819,10 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
         return false;
     }
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-        split.WaitForWriters(true);
+        const auto wait_start = std::chrono::steady_clock::now();
+        if (split.WaitForWriters(true)) {
+            Nx2CountList(g_nx2_list_stats.writer_ns, NanosecondsSince(wait_start));
+        }
     }
     using GpuWrittenList = VideoCore::RasterizerInterface::GpuWrittenList;
     command_headers.resize_destructive(count);
@@ -660,16 +861,53 @@ void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
     // The caches belong to the split's back: it first runs what the front queued (the dispatch
     // that writes these words among it). The whole pages are flushed: their next lists read
     // guest memory until GPU work writes them again.
+    // On pages draws write too, the words are compared after the flush with what a read without
+    // the drain finds, guest memory as it is now or the copy (nx2.h, Nx2ListDrawRanges).
+    list_words_before.resize_destructive(size);
+    memory_manager.ReadBlockUnsafe(address, list_words_before.data(), size);
+    Nx2CountList(g_nx2_list_stats.drains);
+    const auto drain_start = std::chrono::steady_clock::now();
     VideoCommon::GpuSplit::Get().Drain();
+    Nx2CountList(g_nx2_list_stats.drain_ns, NanosecondsSince(drain_start));
+    const auto flush_start = std::chrono::steady_clock::now();
     const GPUVAddr first_page = address & ~GPUVAddr{0xfff};
     const GPUVAddr end_page = (address + size + 0xfff) & ~GPUVAddr{0xfff};
     if (memory_manager.IsMemoryDirty(first_page, end_page - first_page,
                                      VideoCommon::CacheType::BufferCache)) {
-        memory_manager.FlushRegion(first_page, end_page - first_page,
-                                   VideoCommon::CacheType::BufferCache);
+        Nx2CountList(g_nx2_list_stats.flushes);
+        // Along with every other command list page draws wrote (nx2.h, Nx2ListFlushBatch).
+        boost::container::small_vector<DAddr, 4> pages;
+        bool batched = rasterizer != nullptr && Nx2ListFlushBatch();
+        for (GPUVAddr page = first_page; batched && page < end_page; page += 0x1000) {
+            const auto device = memory_manager.GpuToCpuAddress(page);
+            batched = device.has_value();
+            if (batched) {
+                pages.push_back(*device);
+            }
+        }
+        if (!batched || !rasterizer->FlushGpuWrittenCommandListPages(
+                            std::span<const DAddr>{pages.data(), pages.size()})) {
+            memory_manager.FlushRegion(first_page, end_page - first_page,
+                                       VideoCommon::CacheType::BufferCache);
+        }
     }
+    Nx2CountList(g_nx2_list_stats.flush_ns, NanosecondsSince(flush_start));
     if (rasterizer == nullptr) {
         return;
+    }
+    std::array<u8, 0x1000> words;
+    const GPUVAddr end = address + size;
+    for (GPUVAddr chunk = address; chunk < end;) {
+        const GPUVAddr chunk_end = (std::min)(end, (chunk & ~GPUVAddr{0xfff}) + 0x1000);
+        if (const auto device = memory_manager.GpuToCpuAddress(chunk);
+            device && Tegra::Nx2IsCommandListPage(*device)) {
+            const size_t piece = static_cast<size_t>(chunk_end - chunk);
+            memory_manager.ReadBlockUnsafe(chunk, words.data(), piece);
+            rasterizer->VerifyGpuWrittenCommandList(
+                *device, std::span<const u8>{words.data(), piece},
+                std::span<const u8>{list_words_before.data() + (chunk - address), piece});
+        }
+        chunk = chunk_end;
     }
     for (GPUVAddr page = first_page; page < end_page; page += 0x1000) {
         if (const auto device = memory_manager.GpuToCpuAddress(page);

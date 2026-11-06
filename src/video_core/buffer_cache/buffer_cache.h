@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <memory>
 #include <numeric>
@@ -2097,11 +2098,22 @@ void BufferCache<P>::Nx2NoteListWrite(BufferId buffer_id, DAddr device_addr, u64
                     std::scoped_lock lock{nx2_list_mutex};
                     Nx2ListPage& entry = nx2_list_pages[page_addr];
                     ++entry.writes;
-                    if (!nx2_collect_list_copies && !entry.draw_written) {
-                        entry.draw_written = true;
-                        LOG_INFO(HW_GPU, "Command list page {:#x} is written by draws too: its "
-                                         "lists drain the split",
-                                 page_addr);
+                    if (!nx2_collect_list_copies) {
+                        const u64 chunks = Nx2PageChunks(page_addr, device_addr, size);
+                        ++entry.draw_writes;
+                        entry.draw_chunks |= chunks;
+                        const DAddr end = (std::min)(page_addr + (DAddr{1} << page_bits),
+                                                     device_addr + size);
+                        Tegra::Nx2CountList(Tegra::g_nx2_list_stats.draw_writes);
+                        Tegra::Nx2CountList(Tegra::g_nx2_list_stats.draw_bytes,
+                                            end - (std::max)(page_addr, device_addr));
+                        if (!entry.draw_written) {
+                            entry.draw_written = true;
+                            LOG_INFO(HW_GPU,
+                                     "Command list page {:#x} is written by draws too ({:#x} "
+                                     "bytes at {:#x}, pieces {:#018x}): its lists drain the split",
+                                     page_addr, size, device_addr, chunks);
+                        }
                     }
                 }
                 if (nx2_collect_list_copies) {
@@ -2163,6 +2175,7 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
             }
             entry.copy = staging;
             entry.copy_writes = entry.writes;
+            entry.copy_draw_writes = entry.draw_writes;
             entry.copy_tick = tick;
             entry.copy_begin = static_cast<u32>(begin - page);
             entry.copy_end = static_cast<u32>(end - page);
@@ -2191,10 +2204,31 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out) -> Nx
         if (offset + out.size() > page_size) {
             return Nx2ListRead::Unknown;
         }
-        const auto current = [&](const Nx2ListPage& entry) {
-            return entry.copy && !entry.draw_written && entry.copy_writes == entry.writes &&
-                   offset >= entry.copy_begin && offset + out.size() <= entry.copy_end;
+        // How the list's words are read without draining: as the page's (no draw writes it), or
+        // past the draws that do (nx2.h, Nx2ListDrawRanges).
+        enum class Use { None, Page, Exact };
+        const u64 list_chunks = Nx2PageChunks(page, device_addr, out.size());
+        const auto past_draws = [&](const Nx2ListPage& entry) {
+            return Tegra::Nx2ListDrawRanges() && (entry.draw_chunks & list_chunks) == 0
+                       ? Use::Exact
+                       : Use::None;
         };
+        const auto copy_use = [&](const Nx2ListPage& entry) {
+            if (entry.draw_written) {
+                return entry.CopyPastDraws(offset, out.size()) ? past_draws(entry) : Use::None;
+            }
+            return entry.copy && entry.copy_writes == entry.writes &&
+                           offset >= entry.copy_begin && offset + out.size() <= entry.copy_end
+                       ? Use::Page
+                       : Use::None;
+        };
+        const auto count = [](Use use, bool copy) {
+            auto& stats = Tegra::g_nx2_list_stats;
+            Tegra::Nx2CountList(use == Use::Exact ? stats.exact
+                                : copy            ? stats.copied
+                                                  : stats.synced);
+        };
+        Use use{};
         u64 tick{};
         u64 writes{};
         const u32* marker{};
@@ -2204,18 +2238,30 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out) -> Nx
             if (it == nx2_list_pages.end()) {
                 return Nx2ListRead::Unknown;
             }
-            const Nx2ListPage& entry = it->second;
+            Nx2ListPage& entry = it->second;
             // Pages the CPU writes the lists of (GPU-written once, long before) stay synced.
-            if (!entry.draw_written && entry.synced_writes == entry.writes) {
-                return Nx2ListRead::Synced;
+            bool synced = false;
+            if (!entry.draw_written) {
+                synced = entry.synced_writes == entry.writes;
+                use = synced ? Use::Page : copy_use(entry);
+            } else if (entry.SyncedPastDraws()) {
+                synced = true;
+                use = past_draws(entry);
+            } else {
+                use = copy_use(entry);
             }
-            if (!current(entry)) {
+            if (use == Use::None) {
                 return Nx2ListRead::Unknown;
+            }
+            if (synced) {
+                count(use, false);
+                return Nx2ListRead::Synced;
             }
             // The lists after the first of a batch find the copy done: read it at once.
             marker = Nx2CopyMarker(*entry.copy);
             if (runtime.IsFree(entry.copy_tick) || runtime.Nx2ListCopyMarked(marker)) {
                 std::memcpy(out.data(), entry.copy->mapped_span.data() + offset, out.size());
+                count(use, true);
                 return Nx2ListRead::Copied;
             }
             tick = entry.copy_tick;
@@ -2223,15 +2269,136 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out) -> Nx
         }
         // Submitted with the work that wrote the page (Nx2CopyListPages's caller flushes). The
         // copy stays mapped if the back replaces it meanwhile; the checks below catch that.
+        const auto wait_start = std::chrono::steady_clock::now();
         runtime.Nx2WaitListCopy(marker, tick);
+        Tegra::Nx2CountList(Tegra::g_nx2_list_stats.copy_ns,
+                            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                 std::chrono::steady_clock::now() - wait_start)
+                                                 .count()));
         std::scoped_lock lock{nx2_list_mutex};
         const auto it = nx2_list_pages.find(page);
-        if (it == nx2_list_pages.end() || !current(it->second) || it->second.copy_tick != tick ||
-            it->second.copy_writes != writes) {
+        if (it == nx2_list_pages.end() || copy_use(it->second) == Use::None ||
+            it->second.copy_tick != tick || it->second.copy_writes != writes) {
             return Nx2ListRead::Unknown;
         }
         std::memcpy(out.data(), it->second.copy->mapped_span.data() + offset, out.size());
+        count(use, true);
         return Nx2ListRead::Copied;
+    }
+}
+
+template <class P>
+u64 BufferCache<P>::Nx2PageChunks(DAddr page, DAddr begin, u64 size) {
+    constexpr DAddr page_size = DAddr{1} << Tegra::Nx2WrittenPageBits;
+    static_assert(page_size / 64 == 64, "one bit per 64 bytes of a page");
+    const DAddr first = (std::max)(page, begin);
+    const DAddr end = (std::min)(page + page_size, begin + size);
+    if (first >= end) {
+        return 0;
+    }
+    const u64 low = (first - page) / 64;
+    const u64 pieces = (end - page - 1) / 64 - low + 1;
+    return (pieces == 64 ? ~u64{0} : (u64{1} << pieces) - 1) << low;
+}
+
+template <class P>
+void BufferCache<P>::Nx2VerifyListRead(DAddr device_addr, std::span<const u8> words,
+                                       std::span<const u8> before) {
+    if constexpr (!IS_OPENGL) {
+        constexpr DAddr page_size = DAddr{1} << Tegra::Nx2WrittenPageBits;
+        const DAddr page = device_addr & ~(page_size - 1);
+        const u64 offset = device_addr - page;
+        if (words.empty() || offset + words.size() > page_size || before.size() != words.size()) {
+            return;
+        }
+        auto& stats = Tegra::g_nx2_list_stats;
+        std::scoped_lock lock{nx2_list_mutex};
+        const auto it = nx2_list_pages.find(page);
+        if (it == nx2_list_pages.end() || !it->second.draw_written) {
+            return;
+        }
+        Nx2ListPage& entry = it->second;
+        Tegra::Nx2CountList(stats.draw_page_reads);
+        if ((entry.draw_chunks & Nx2PageChunks(page, device_addr, words.size())) == 0) {
+            Tegra::Nx2CountList(stats.would_exact);
+        }
+        // What Nx2ReadListCopy reads past the draws: guest memory as it was before the drain, or
+        // the copy. The split is drained and the page flushed, so the GPU is done with the copy.
+        const u8* read = nullptr;
+        const char* what = nullptr;
+        bool compared = false;
+        const auto compare = [&](const u8* data, const char* name) {
+            compared = true;
+            if (read == nullptr && std::memcmp(data, words.data(), words.size()) != 0) {
+                read = data;
+                what = name;
+            }
+        };
+        if (entry.SyncedPastDraws()) {
+            compare(before.data(), "guest memory");
+        }
+        if (entry.CopyPastDraws(offset, words.size()) &&
+            (runtime.IsFree(entry.copy_tick) ||
+             runtime.Nx2ListCopyMarked(Nx2CopyMarker(*entry.copy)))) {
+            compare(entry.copy->mapped_span.data() + offset, "the copy");
+        }
+        if (!compared) {
+            Tegra::Nx2CountList(stats.no_copy);
+            return;
+        }
+        if (read == nullptr) {
+            Tegra::Nx2CountList(stats.matched);
+            return;
+        }
+        Tegra::Nx2CountList(stats.mismatched);
+        size_t first = 0;
+        while (read[first] == words[first]) {
+            ++first;
+        }
+        if (!entry.mismatched) {
+            entry.mismatched = true;
+            LOG_INFO(HW_GPU,
+                     "Command list page {:#x}: draws changed list words ({:#x} bytes at +{:#x}, "
+                     "first at +{:#x}, {} was stale, draw pieces {:#018x})",
+                     page, words.size(), offset, offset + first, what, entry.draw_chunks);
+        }
+        // What the draws write into the lists (the first 32 changes, up to 8 words each).
+        static u32 dumped{};
+        if (dumped < 32) {
+            ++dumped;
+            std::array<u32, 8> was{};
+            std::array<u32, 8> now{};
+            const size_t count = (std::min)(words.size() / sizeof(u32), was.size());
+            std::memcpy(was.data(), read, count * sizeof(u32));
+            std::memcpy(now.data(), words.data(), count * sizeof(u32));
+            LOG_INFO(HW_GPU, "Command list at {:#x} ({:#x} bytes) was {:08x}, now {:08x}",
+                     device_addr, words.size(), fmt::join(was.begin(), was.begin() + count, " "),
+                     fmt::join(now.begin(), now.begin() + count, " "));
+        }
+    }
+}
+
+template <class P>
+void BufferCache<P>::Nx2FlushListPages(std::span<const DAddr> pages) {
+    if constexpr (!IS_OPENGL) {
+        constexpr DAddr page_size = DAddr{1} << Tegra::Nx2WrittenPageBits;
+        Common::RangeSet<DAddr> ranges;
+        for (const DAddr page : pages) {
+            ranges.Add(page, page_size);
+        }
+        u64 others = 0;
+        {
+            std::scoped_lock lock{nx2_list_mutex};
+            for (const auto& [page, entry] : nx2_list_pages) {
+                if (entry.draw_written && IsRegionGpuModified(page, page_size)) {
+                    ranges.Add(page, page_size);
+                    ++others;
+                }
+            }
+        }
+        Tegra::Nx2CountList(Tegra::g_nx2_list_stats.batch_flushes);
+        Tegra::Nx2CountList(Tegra::g_nx2_list_stats.batch_pages, others);
+        DownloadRanges(ranges);
     }
 }
 
@@ -2241,6 +2408,7 @@ void BufferCache<P>::Nx2NoteListSynced(DAddr page) {
         std::scoped_lock lock{nx2_list_mutex};
         Nx2ListPage& entry = nx2_list_pages[page];
         entry.synced_writes = entry.writes;
+        entry.synced_other_writes = entry.writes - entry.draw_writes;
     }
 }
 
@@ -2266,9 +2434,24 @@ void BufferCache<P>::Nx2NoteListHostWrite(DAddr device_addr, u64 size) {
             }
             Nx2ListPage& entry = it->second;
             const bool synced = entry.synced_writes == entry.writes;
+            const bool synced_past_draws = entry.SyncedPastDraws();
             ++entry.writes;
             if (synced) {
                 entry.synced_writes = entry.writes;
+            }
+            if (synced_past_draws) {
+                entry.synced_other_writes = entry.writes - entry.draw_writes;
+            }
+            // The 64-byte pieces this write covers whole hold its bytes now, not the draws'
+            // (until a draw writes them again).
+            const DAddr page_addr = page << page_bits;
+            const DAddr whole_begin =
+                Common::AlignUp((std::max)(device_addr, page_addr), DAddr{64});
+            const DAddr whole_end = Common::AlignDown(
+                (std::min)(device_addr + size, page_addr + (DAddr{1} << page_bits)), DAddr{64});
+            if (whole_begin < whole_end) {
+                entry.draw_chunks &=
+                    ~Nx2PageChunks(page_addr, whole_begin, whole_end - whole_begin);
             }
         }
     }

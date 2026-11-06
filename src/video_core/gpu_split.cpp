@@ -240,6 +240,8 @@ void GpuSplit::Drain() {
     }
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+    const Tegra::Nx2CountedTime counted{Tegra::g_nx2_list_stats.split_drains,
+                                        Tegra::g_nx2_list_stats.split_drain_ns};
     // Everything consumed is not enough: the back submits deferred work (Scheduler::DeferFlush)
     // from its idle hook afterwards, and the caller may use the scheduler once this returns.
     bool hook_asked = false;
@@ -456,6 +458,8 @@ void GpuSplit::WaitFor(u64 target) {
     }
     wait_target.store(target, std::memory_order_seq_cst);
     Publish();
+    const Tegra::Nx2CountedTime counted{Tegra::g_nx2_list_stats.split_waits,
+                                        Tegra::g_nx2_list_stats.split_wait_ns};
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache >= target) {

@@ -1362,6 +1362,22 @@ void RasterizerVulkan::NoteGpuWrittenCommandListSynced(DAddr page) {
     buffer_cache.Nx2NoteListSynced(page);
 }
 
+bool RasterizerVulkan::FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) {
+    // As FlushRegion with the buffer cache only.
+    SCOPE_EXIT {
+        NoteSetupChange();
+    };
+    std::scoped_lock lock{buffer_cache.mutex};
+    buffer_cache.Nx2FlushListPages(pages);
+    return true;
+}
+
+void RasterizerVulkan::VerifyGpuWrittenCommandList(DAddr addr, std::span<const u8> words,
+                                                   std::span<const u8> before) {
+    // No cache lock, as in ReadGpuWrittenCommandList.
+    buffer_cache.Nx2VerifyListRead(addr, words, before);
+}
+
 void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
     SCOPE_EXIT {
         NoteSetupChange();

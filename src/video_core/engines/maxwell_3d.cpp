@@ -24,6 +24,7 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_sem_model.h"
 #include "video_core/rasterizer_interface.h"
@@ -1628,6 +1629,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     const auto drain_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                std::chrono::steady_clock::now() - drain_start)
                                                .count());
+    Tegra::Nx2CountList(Tegra::g_nx2_list_stats.macro_read_drains);
+    Tegra::Nx2CountList(Tegra::g_nx2_list_stats.macro_read_drain_ns, drain_ns);
     const bool gpu_dirty =
         memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache);
     if (gpu_dirty) {

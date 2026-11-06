@@ -362,6 +362,16 @@ public:
     /// written by no GPU work since), else Copied with `out` filled from the copy of its last
     /// write once the GPU is done with it. Unknown otherwise: the caller drains and flushes.
     Nx2ListRead Nx2ReadListCopy(DAddr device_addr, std::span<u8> out);
+    /// Front thread, the split drained and the page flushed (before Nx2NoteListSynced): `words`
+    /// are the list's words at `device_addr` (within one page) as guest memory holds them now,
+    /// `before` as it held them before the drain. On pages draws write too, they are compared with
+    /// what Nx2ReadListCopy would have read without draining (nx2.h, Nx2ListDrawRanges).
+    void Nx2VerifyListRead(DAddr device_addr, std::span<const u8> words,
+                           std::span<const u8> before);
+    /// Front thread, the split drained, cache lock held: downloads the GPU-written words of
+    /// `pages` (a command list's) and of every command list page draws write, in one wait for the
+    /// GPU (nx2.h, Nx2ListFlushBatch).
+    void Nx2FlushListPages(std::span<const DAddr> pages);
     /// Front thread, the split drained: the command list page was flushed to guest memory.
     void Nx2NoteListSynced(DAddr page);
     /// CPU and inline writes: they reach guest memory, so a synced page stays synced, but its copy
@@ -748,10 +758,30 @@ private:
         u32 copy_end{};
         /// Written outside a compute dispatch or a DMA copy (a draw's storage writes) at least
         /// once: the front can't tell from what it sent whether such a write is still queued, so
-        /// the page's lists always drain the split instead of reading a copy.
+        /// the page's lists drain the split instead of reading guest memory or a copy, unless the
+        /// draws' ranges miss the list (nx2.h, Nx2ListDrawRanges).
         bool draw_written{};
+        bool mismatched{};       ///< A drained read found guest memory or the copy stale (logged)
+        u64 draw_writes{};       ///< Of `writes`: draws' (outside a dispatch or copy)
+        u64 copy_draw_writes{};  ///< `draw_writes` when the copy was made
+        /// `writes - draw_writes` when the front last flushed the page: guest memory holds what
+        /// other work wrote while equal
+        u64 synced_other_writes{~u64{0}};
+        u64 draw_chunks{};       ///< 64-byte pieces of the page the draws' ranges cover
         std::optional<Nx2Staging> copy;
+
+        /// No write but draws' since the copy, and it holds [offset, offset + size).
+        [[nodiscard]] bool CopyPastDraws(u64 offset, u64 size) const {
+            return copy && offset >= copy_begin && offset + size <= copy_end &&
+                   writes - draw_writes == copy_writes - copy_draw_writes;
+        }
+        /// No write but draws' since the front flushed the page.
+        [[nodiscard]] bool SyncedPastDraws() const {
+            return synced_other_writes == writes - draw_writes;
+        }
     };
+    /// 64-byte pieces of `page` that [begin, begin + size) covers (one bit each).
+    static u64 Nx2PageChunks(DAddr page, DAddr begin, u64 size);
     /// The word after a list copy's page: the GPU sets it once the copy is done.
     static u32* Nx2CopyMarker(const Nx2Staging& copy);
     std::mutex nx2_list_mutex; ///< nx2_list_pages: the split's front reads the copies

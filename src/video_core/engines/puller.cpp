@@ -64,8 +64,12 @@ void GuestSyncPoint(DmaPusher& dma_pusher) {
     OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->OnGuestSyncPoint(); });
 }
 
-void DrainBack(DmaPusher& dma_pusher) {
-    VideoCommon::GpuSplit::Get().Drain();
+/// `count`, `ns`: the caller's counters in Tegra::g_nx2_list_stats (drains by cause).
+void DrainBack(DmaPusher& dma_pusher, std::atomic<u64>& count, std::atomic<u64>& ns) {
+    {
+        const Nx2CountedTime counted{count, ns};
+        VideoCommon::GpuSplit::Get().Drain();
+    }
     // An acquire is checked next.
     GuestSyncPoint(dma_pusher);
 }
@@ -120,7 +124,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     }
     // The release may still be queued for the split GPU thread's back half (and the caches
     // ReadSemaphoreWord asks are its state).
-    DrainBack(dma_pusher);
+    DrainBack(dma_pusher, g_nx2_list_stats.resume_drains, g_nx2_list_stats.resume_drain_ns);
     const u32 current = ReadSemaphoreWord(dma_pusher, pending_acquire->address);
     if (Nx2SemaphoreWaiters::Get().Latched(this)) {
         if (static std::atomic<u32> rescued{};
@@ -349,7 +353,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                         return;
                     }
                     if (Model::g_mode == Model::Mode::Check) {
-                        DrainBack(dma_pusher);
+                        DrainBack(dma_pusher, g_nx2_list_stats.acquire_drains,
+                                  g_nx2_list_stats.acquire_drain_ns);
                         const u32 actual = ReadSemaphoreWord(dma_pusher, acquire.address);
                         const bool met = acquire.Matches(actual);
                         ++(met ? counts.right : counts.wrong);
@@ -382,7 +387,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                 return;
             }
         }
-        DrainBack(dma_pusher);
+        DrainBack(dma_pusher, g_nx2_list_stats.acquire_drains, g_nx2_list_stats.acquire_drain_ns);
         if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
             return;
         }
@@ -401,7 +406,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             waiters.Remove(this);
         }
     } else {
-        DrainBack(dma_pusher);
+        DrainBack(dma_pusher, g_nx2_list_stats.acquire_drains, g_nx2_list_stats.acquire_drain_ns);
         do {
             const u32 word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
             regs.acquire_source = true;
@@ -445,7 +450,7 @@ void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
 }
 
 void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
-    DrainBack(dma_pusher);
+    DrainBack(dma_pusher, g_nx2_list_stats.acquire_drains, g_nx2_list_stats.acquire_drain_ns);
     u32 word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
     const auto value = regs.semaphore_acquire;
     while (word != value) {
@@ -477,22 +482,37 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
         return;
     }
     // Acquires: check once after flushing pending fences; never block the GPU thread on them.
-    DrainBack(dma_pusher);
-    dma_pusher.rasterizer->ReleaseFences();
-    const u32 word = dma_pusher.memory_manager.Read<u32>(address);
-    const bool ready = operation == 0   ? word == payload
-                       : operation == 2 ? word >= payload
-                       : operation == 3 ? static_cast<s32>(word - payload) >= 0
-                       : operation == 4 ? (word & payload) != 0
-                       : operation == 5 ? (word & payload) == 0
-                                        : true;
-    if (!ready) {
-        static std::atomic<u32> reported{};
-        if (reported.fetch_add(1) < 8) {
-            LOG_WARNING(HW_GPU, "SEM_EXECUTE op {} at {:#x}: {:#x} vs {:#x} not met, continuing",
-                        operation, address, word, payload);
+    const auto check = [rasterizer = dma_pusher.rasterizer, memory = &dma_pusher.memory_manager,
+                        address, payload, operation] {
+        rasterizer->ReleaseFences();
+        const u32 word = memory->Read<u32>(address);
+        const bool ready = operation == 0   ? word == payload
+                           : operation == 2 ? word >= payload
+                           : operation == 3 ? static_cast<s32>(word - payload) >= 0
+                           : operation == 4 ? (word & payload) != 0
+                           : operation == 5 ? (word & payload) == 0
+                                            : true;
+        if (!ready) {
+            static std::atomic<u32> reported{};
+            if (reported.fetch_add(1) < 8) {
+                LOG_WARNING(HW_GPU,
+                            "SEM_EXECUTE op {} at {:#x}: {:#x} vs {:#x} not met, continuing",
+                            operation, address, word, payload);
+            }
         }
+    };
+    // The check holds nothing up, so with A/B bit SemAcquireOnBack the back makes it where the
+    // acquire is in the stream, after the releases queued before it, and the front goes on
+    // without draining the split for it.
+    if (VideoCommon::GpuSplit::Get().Active() &&
+        Common::Nx2Ab::On(Common::Nx2Ab::SemAcquireOnBack)) {
+        Nx2CountList(g_nx2_list_stats.execute_on_back);
+        GuestSyncPoint(dma_pusher);
+        OnBack(check);
+        return;
     }
+    DrainBack(dma_pusher, g_nx2_list_stats.execute_drains, g_nx2_list_stats.execute_drain_ns);
+    check();
 }
 
 /// Calls a GPU puller method.
