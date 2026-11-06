@@ -126,6 +126,14 @@ public:
                                              [[maybe_unused]] std::span<const u8> words,
                                              [[maybe_unused]] std::span<const u8> before) {}
 
+    /// Switch 2, the split's back (checks and rare fallbacks): copies what the GPU holds at
+    /// [addr, addr + out.size()) into `out`, waiting for the GPU, without touching guest memory.
+    /// False: not done.
+    virtual bool ReadBackGpuWords([[maybe_unused]] DAddr addr,
+                                  [[maybe_unused]] std::span<u8> out) {
+        return false;
+    }
+
     /// Check if the the specified memory area requires flushing to CPU Memory.
     virtual bool MustFlushRegion(DAddr addr, u64 size,
                                  VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;

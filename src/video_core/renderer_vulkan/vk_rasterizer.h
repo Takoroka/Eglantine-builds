@@ -106,6 +106,7 @@ public:
     bool FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) override;
     void VerifyGpuWrittenCommandList(DAddr addr, std::span<const u8> words,
                                      std::span<const u8> before) override;
+    bool ReadBackGpuWords(DAddr addr, std::span<u8> out) override;
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
@@ -307,6 +308,11 @@ private:
 
     std::atomic<u64> setup_events{};
     u64 buffer_events{}; ///< InnerInvalidation and uniform binds (split back thread)
+    /// BufferCache::Nx2GpuWriteSerial at the last barrier before an indirect draw (DrawIndirect).
+    u64 nx2_indirect_barrier_serial{~u64{0}};
+    /// DrawIndirect with arguments GPU work may have written: whether a barrier must come first.
+    bool Nx2IndirectBarrierNeeded(
+        const Tegra::Engines::Maxwell3D::DrawManager::IndirectParams& params);
     /// The last draw whose setup the next draw may reuse (RepeatRefusal).
     struct RepeatableDraw {
         GraphicsPipeline* pipeline{};

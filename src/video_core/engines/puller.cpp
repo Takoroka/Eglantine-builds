@@ -387,8 +387,17 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                 return;
             }
         }
+        // What these wait for (nx2.h, Nx2ListStats): the op, whether the front had anything else
+        // to parse, and whether the back's releases met the value.
+        if (op == GpuSemaphoreOperation::AcquireGequal) {
+            Nx2CountList(g_nx2_list_stats.acquire_gequal);
+        }
+        if (may_drain) {
+            Nx2CountList(g_nx2_list_stats.acquire_may_drain);
+        }
         DrainBack(dma_pusher, g_nx2_list_stats.acquire_drains, g_nx2_list_stats.acquire_drain_ns);
         if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+            Nx2CountList(g_nx2_list_stats.acquire_met);
             return;
         }
         // Registered before the fences run, so a release among them that meets the value counts

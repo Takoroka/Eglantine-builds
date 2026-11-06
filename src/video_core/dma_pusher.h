@@ -211,6 +211,9 @@ public:
     bool WaitForEntryWriters(GPUVAddr address, size_t size);
     /// Whether every page of the entry is a known CPU list page (cpu_list_pages).
     bool KnownCpuListPages(GPUVAddr address, size_t size);
+    /// A GPU-written entry that is the draw arguments of an indirect draw macro: the back draws
+    /// from them, the front doesn't read them (Maxwell3D::FrontIndirectDrawMacro).
+    bool IndirectDrawMacro(const CommandListHeader& header);
     /// The entry is GPU-written: its pages aren't CPU list pages (logged if they were known).
     void ForgetCpuListPages(GPUVAddr address, size_t size);
     /// Copies the list's words from memory again, as of suspension count `now`.

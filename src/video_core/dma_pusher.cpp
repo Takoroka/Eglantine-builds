@@ -104,13 +104,32 @@ void ReportListStats() {
     const double sync_drain_ms = ms(stats.sync_drain_ns);
     const double run_drains = rate(stats.run_drains);
     const double run_drain_ms = ms(stats.run_drain_ns);
+    const double acquire_gequal = rate(stats.acquire_gequal);
+    const double acquire_may_drain = rate(stats.acquire_may_drain);
+    const double acquire_met = rate(stats.acquire_met);
+    const double indirect_draws = rate(stats.indirect_draws);
+    const double indirect_checked = rate(stats.indirect_checked);
+    const double indirect_odd = rate(stats.indirect_odd);
+    const double indirect_barriers = rate(stats.indirect_barriers);
+    const double extended_draws = rate(stats.extended_draws);
+    const double extended_rechecks = rate(stats.extended_rechecks);
+    const double extended_compared = rate(stats.extended_compared);
+    const double extended_mismatched = rate(stats.extended_mismatched);
+    const double extended_fallbacks = rate(stats.extended_fallbacks);
+    const double barriers_skipped = rate(stats.barriers_skipped);
     if (entries == 0 && draw_writes == 0 && entry_waits == 0 && entry_skips == 0 &&
-        split_drains == 0 && split_waits == 0) {
+        split_drains == 0 && split_waits == 0 && indirect_draws == 0 && extended_draws == 0 &&
+        extended_rechecks == 0) {
         return;
     }
     using Common::Nx2Ab::On;
     LOG_INFO(HW_GPU,
-             "Command lists per second (bit 48 {}, 49 {}, 50 {}, 51 {}): {:.0f} entries on "
+             "Command lists per second (bit 48 {}, 49 {}, 50 {}, 51 {}, 52 {}, 55 {}): "
+             "indirect draw macros {:.0f} drawn from the GPU ({:.0f} barriers), {:.0f} checked "
+             "({:.0f} odd); extended {:.0f} drawn on the GPU, {:.0f} re-drawn after the front's "
+             "read ({:.0f} compared, {:.0f} mismatched), {:.0f} fallbacks, {:.0f} barriers "
+             "skipped (writes elsewhere) | acquire drains {:.0f} GEQUAL, {:.0f} with nothing "
+             "else to parse, {:.0f} met after it | {:.0f} entries on "
              "GPU-written pages | read from copies {:.0f}, synced {:.0f}, past the draws' ranges "
              "{:.0f} | list drains {:.0f}: {:.1f} ms for the back, {:.1f} ms flushing ({:.0f} "
              "flushes, {:.0f} batched taking {:.0f} other pages); {:.0f} on pages draws "
@@ -126,7 +145,13 @@ void ReportListStats() {
              On(Common::Nx2Ab::ListDrawRanges) ? "on" : "off",
              On(Common::Nx2Ab::ListWriterWaitSkip) ? "on" : "off",
              On(Common::Nx2Ab::SemAcquireOnBack) ? "on" : "off",
-             On(Common::Nx2Ab::ListFlushBatch) ? "on" : "off", entries, copied, synced, exact,
+             On(Common::Nx2Ab::ListFlushBatch) ? "on" : "off",
+             On(Common::Nx2Ab::IndirectDrawMacro) ? "on" : "off",
+             On(Common::Nx2Ab::IndirectDrawMacroExtended) ? "on" : "off", indirect_draws,
+             indirect_barriers, indirect_checked, indirect_odd, extended_draws, extended_rechecks,
+             extended_compared, extended_mismatched, extended_fallbacks, barriers_skipped,
+             acquire_gequal, acquire_may_drain,
+             acquire_met, entries, copied, synced, exact,
              drains, drain_ms, flush_ms, flushes, batch_flushes, batch_pages, draw_page_reads,
              would_exact, writer_ms, copy_ms,
              matched, mismatched, no_copy, draw_writes, draw_kib, entry_waits, entry_wait_ms,
@@ -325,6 +350,8 @@ bool DmaPusher::Step() {
             RecordParsedEntry(header, commands);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+        } else if (gpu_written && IndirectDrawMacro(header)) {
+            // An indirect draw's arguments: the back draws from them on the GPU.
         } else if (ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size))) {
             const std::span<const CommandHeader> commands{command_headers.data(), header.size};
             RecordParsedEntry(header, commands);
@@ -750,6 +777,42 @@ bool DmaPusher::WaitForEntryWriters(GPUVAddr address, size_t size) {
         }
     }
     return false;
+}
+
+bool DmaPusher::IndirectDrawMacro(const CommandListHeader& header) {
+    // The entry is exactly the rest of a macro's parameters (sent non-incrementing, as macro
+    // calls are), and the 3D engine runs macros on the split's front.
+    if (header.size != 5 || dma_state.method_count != 5 || !dma_state.non_incrementing ||
+        command_resume_offset != 0 || dma_state.method < MacroRegistersStart ||
+        subchannel_type[dma_state.subchannel] != Engines::EngineTypes::Maxwell3D) {
+        // The first few short GPU-written entries this turns down, and why.
+        static std::atomic<u32> logged{};
+        if (header.size <= 8 && logged.fetch_add(1) < 24) {
+            LOG_INFO(HW_GPU,
+                     "Indirect draw macro: entry {:#x} ({} words) not taken: method {:#x}, {} "
+                     "words left, non-incrementing {}, resume offset {}, engine {}",
+                     u64{header.addr}, u64{header.size}, dma_state.method,
+                     dma_state.method_count, dma_state.non_incrementing, command_resume_offset,
+                     static_cast<u32>(subchannel_type[dma_state.subchannel]));
+        }
+        return false;
+    }
+    auto& split = VideoCommon::GpuSplit::Get();
+    auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannels[dma_state.subchannel]);
+    if (!split.Active() || !split.FrontMacros() || maxwell3d == nullptr ||
+        !maxwell3d->GetNativeMacroEngine().native_turing) {
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1) < 4) {
+            LOG_INFO(HW_GPU, "Indirect draw macro: not taken, macros don't run on the front");
+        }
+        return false;
+    }
+    if (!maxwell3d->FrontIndirectDrawMacro(system, split, dma_state.method, dma_state.dma_get)) {
+        return false;
+    }
+    dma_state.method_count = 0;
+    dma_state.is_last_call = true;
+    return true;
 }
 
 bool DmaPusher::KnownCpuListPages(GPUVAddr address, size_t size) {

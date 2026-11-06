@@ -57,6 +57,7 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 
 namespace Vulkan {
@@ -1156,6 +1157,24 @@ void RasterizerVulkan::DrawIndirect() {
     };
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     const auto& params = maxwell3d->draw_manager.indirect_state;
+    if (params.after_gpu_writes && Nx2IndirectBarrierNeeded(params)) {
+        // The arguments may be shader or copy output recorded since the last such barrier
+        // (Maxwell3D::BackIndirectDrawMacro); a wait for idle orders the work but doesn't make
+        // the writes visible to the indirect read.
+        nx2_indirect_barrier_serial = buffer_cache.Nx2GpuWriteSerial();
+        Tegra::Nx2CountList(Tegra::g_nx2_list_stats.indirect_barriers);
+        scheduler.RequestOutsideRenderPassOperationContext();
+        scheduler.Record([](vk::CommandBuffer cmdbuf) {
+            static constexpr VkMemoryBarrier barrier{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                   VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, 0, barrier);
+        });
+    }
     buffer_cache.SetDrawIndirect(&params);
     PrepareDraw(params.is_indexed, [this, &params] {
         if (mesh_draw) {
@@ -1616,6 +1635,36 @@ void RasterizerVulkan::VerifyGpuWrittenCommandList(DAddr addr, std::span<const u
                                                    std::span<const u8> before) {
     // No cache lock, as in ReadGpuWrittenCommandList.
     buffer_cache.Nx2VerifyListRead(addr, words, before);
+}
+
+bool RasterizerVulkan::ReadBackGpuWords(DAddr addr, std::span<u8> out) {
+    // A submit and a wait, as a flush.
+    SCOPE_EXIT {
+        NoteSetupChange();
+    };
+    std::scoped_lock lock{buffer_cache.mutex};
+    return buffer_cache.Nx2ReadBack(addr, out);
+}
+
+bool RasterizerVulkan::Nx2IndirectBarrierNeeded(
+    const Tegra::Engines::Maxwell3D::DrawManager::IndirectParams& params) {
+    if (buffer_cache.Nx2GpuWriteSerial() == nx2_indirect_barrier_serial) {
+        return false;
+    }
+    if (!params.page_barrier || nx2_indirect_barrier_serial == ~u64{0}) {
+        return true;
+    }
+    // GPU work wrote something since the last barrier: the arguments only if their pages say so
+    // (Maxwell3D::BackIndirectDrawMacro, the extended macro). Its writers run as one batch a
+    // frame, while storage writes elsewhere come between nearly every two of its draws, and each
+    // barrier ends the render pass.
+    const auto arguments = gpu_memory->GpuToCpuAddress(params.indirect_start_address);
+    if (!arguments || buffer_cache.Nx2ListWrittenSince(*arguments, params.buffer_size,
+                                                        nx2_indirect_barrier_serial) != 0) {
+        return true;
+    }
+    Tegra::Nx2CountList(Tegra::g_nx2_list_stats.barriers_skipped);
+    return false;
 }
 
 void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {

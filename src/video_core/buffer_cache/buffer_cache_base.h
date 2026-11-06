@@ -379,6 +379,19 @@ public:
     /// CPU and inline writes: they reach guest memory, so a synced page stays synced, but its copy
     /// no longer holds the page.
     void Nx2NoteListHostWrite(DAddr device_addr, u64 size);
+    /// Bumped by every GPU write the cache is told of (MarkWrittenBuffer): a reader of GPU-written
+    /// words outside the usual bindings (an indirect draw's arguments) needs a barrier while it
+    /// changed since the last one.
+    [[nodiscard]] u64 Nx2GpuWriteSerial() const noexcept {
+        return nx2_gpu_write_serial;
+    }
+    /// Back thread: whether GPU work wrote [device_addr, device_addr + size) after
+    /// Nx2GpuWriteSerial was `serial`, as its command list pages tell: 1 written, 0 not, -1
+    /// unknown (a page isn't a command list page, or wasn't one for every write since).
+    int Nx2ListWrittenSince(DAddr device_addr, u64 size, u64 serial);
+    /// Back thread, cache lock held: copies what the GPU holds at [device_addr, + out.size())
+    /// into `out`, waiting for the GPU (checks). False: no buffer holds the range.
+    bool Nx2ReadBack(DAddr device_addr, std::span<u8> out);
 
     /// Bytes of the index buffer the last graphics setup bound and synchronized.
     [[nodiscard]] u32 IndexBindingSize() const noexcept {
@@ -838,6 +851,10 @@ private:
         /// other work wrote while equal
         u64 synced_other_writes{~u64{0}};
         u64 draw_chunks{};       ///< 64-byte pieces of the page the draws' ranges cover
+        /// nx2_gpu_write_serial at the last GPU write noted to the page, and at the first: every
+        /// GPU write to it after `tracked_from` was noted (its page bit stays set once set).
+        u64 write_serial{};
+        u64 tracked_from{~u64{0}};
         std::optional<Nx2Staging> copy;
 
         /// No write but draws' since the copy, and it holds [offset, offset + size).
@@ -856,6 +873,7 @@ private:
     static u32* Nx2CopyMarker(const Nx2Staging& copy);
     std::mutex nx2_list_mutex; ///< nx2_list_pages: the split's front reads the copies
     std::unordered_map<DAddr, Nx2ListPage> nx2_list_pages;
+    u64 nx2_gpu_write_serial{}; ///< Nx2GpuWriteSerial
     /// Copies replaced while the GPU may still write them: freed once it is past their tick.
     std::vector<std::pair<u64, Nx2Staging>> nx2_retired_list_copies;
     boost::container::small_vector<std::pair<BufferId, DAddr>, 8> nx2_list_copy_requests;
