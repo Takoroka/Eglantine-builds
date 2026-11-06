@@ -117,9 +117,11 @@ void ReportListStats() {
     const double extended_mismatched = rate(stats.extended_mismatched);
     const double extended_fallbacks = rate(stats.extended_fallbacks);
     const double barriers_skipped = rate(stats.barriers_skipped);
+    const double wait_for_idles = rate(stats.wait_for_idles);
+    const double compute_draw_barriers = rate(stats.compute_draw_barriers);
     if (entries == 0 && draw_writes == 0 && entry_waits == 0 && entry_skips == 0 &&
         split_drains == 0 && split_waits == 0 && indirect_draws == 0 && extended_draws == 0 &&
-        extended_rechecks == 0) {
+        extended_rechecks == 0 && wait_for_idles == 0) {
         return;
     }
     using Common::Nx2Ab::On;
@@ -141,7 +143,9 @@ void ReportListStats() {
              "all front waits for the back: {:.0f} drains ({:.1f} ms), {:.0f} position waits "
              "({:.1f} ms) | drain calls: acquires {:.0f} ({:.1f} ms), resumed acquires {:.0f} "
              "({:.1f} ms), SEM_EXECUTE {:.0f} ({:.1f} ms) + {:.0f} checked on the back, macro "
-             "reads {:.0f} ({:.1f} ms), syncs {:.0f} ({:.1f} ms), runs {:.0f} ({:.1f} ms)",
+             "reads {:.0f} ({:.1f} ms), syncs {:.0f} ({:.1f} ms), runs {:.0f} ({:.1f} ms) | "
+             "waits for idle {:.0f} (bit 60 {}), {:.0f} "
+             "compute-to-draw barriers",
              On(Common::Nx2Ab::ListDrawRanges) ? "on" : "off",
              On(Common::Nx2Ab::ListWriterWaitSkip) ? "on" : "off",
              On(Common::Nx2Ab::SemAcquireOnBack) ? "on" : "off",
@@ -159,7 +163,8 @@ void ReportListStats() {
              split_drain_ms, split_waits, split_wait_ms, acquire_drains, acquire_drain_ms,
              resume_drains, resume_drain_ms, execute_drains, execute_drain_ms, execute_on_back,
              macro_read_drains, macro_read_drain_ms, sync_drains, sync_drain_ms, run_drains,
-             run_drain_ms);
+             run_drain_ms, wait_for_idles,
+             On(Common::Nx2Ab::WaitForIdleBarrier) ? "on" : "off", compute_draw_barriers);
 }
 
 } // Anonymous namespace

@@ -90,6 +90,17 @@ public:
     /// of a renderpass.
     void RequestOutsideRenderPassOperationContext();
 
+    /// A dispatch was recorded (A/B bit WaitForIdleBarrier): the next render pass begins after a
+    /// barrier that makes what it wrote visible to the draws.
+    void RequestComputeBarrier() noexcept {
+        compute_barrier_pending = true;
+    }
+
+    /// A full barrier was recorded: no render pass needs the barrier after the dispatches before it.
+    void ClearComputeBarrier() noexcept {
+        compute_barrier_pending = false;
+    }
+
     /// Returns true when a render pass is currently active in the scheduler state.
     bool IsRenderPassActive() const {
         return state.renderpass != VK_NULL_HANDLE;
@@ -370,6 +381,7 @@ private:
 
     State state;
     u64 record_serial = 0;
+    bool compute_barrier_pending = false; ///< RequestComputeBarrier
 
     u32 num_renderpass_images = 0;
     std::array<VkImage, 9> renderpass_images{};

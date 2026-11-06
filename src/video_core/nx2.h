@@ -192,6 +192,9 @@ struct Nx2ListStats {
     std::atomic<u64> extended_fallbacks; ///< The constant buffer isn't the shaders' bank 0 alone:
                                          ///< the back read the arguments and drew as the macro does
     std::atomic<u64> barriers_skipped;   ///< GPU writes since the last barrier, none to its words
+    // Vulkan (A/B bit WaitForIdleBarrier).
+    std::atomic<u64> wait_for_idles;        ///< RasterizerVulkan::WaitForIdle
+    std::atomic<u64> compute_draw_barriers; ///< Barriers between dispatches and the next render pass
 };
 inline Nx2ListStats g_nx2_list_stats{};
 

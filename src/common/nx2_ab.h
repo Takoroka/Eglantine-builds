@@ -49,6 +49,8 @@ enum Feature : u64 {
                                      ///< drawn from the GPU (Maxwell3D::FrontIndirectDrawMacro)
     IndirectDrawMacroExtended = 1ull << 55, ///< The same for the macro's variant that also writes
                                             ///< base vertex/instance to the constant buffer
+    WaitForIdleBarrier = 1ull << 60, ///< Waits for idle wait (a barrier), compute-to-draw barriers
+                                     ///< (RasterizerVulkan::WaitForIdle, Scheduler)
 };
 
 inline const u64 g_mask = [] {
