@@ -32,6 +32,9 @@ enum Feature : u64 {
     // hosttime (11-06): vertex streams bind a range resolved before without resolving it again
     // while the mappings and buffers are as then (BufferCache::vertex_lookups).
     VertexLookupCache = 1ull << 45,
+    // texlookup (11-06): alias walks return at once when no alias was modified after the image
+    // (ImageBase::alias_tick_bound).
+    AliasWalkSkip = 1ull << 47,
 };
 
 inline const u64 g_mask = [] {

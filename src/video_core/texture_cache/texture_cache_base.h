@@ -132,6 +132,11 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 uploaded_bytes{};    ///< Guest bytes those uploads read
     u64 largest_upload{};    ///< Largest of them
     u64 layer_uploads{};     ///< Of them, uploads of only the written layers
+    u64 alias_syncs{};          ///< SynchronizeAliases calls
+    u64 alias_syncs_skipped{};  ///< Of them, returned with no alias newer by the tick bound
+    u64 alias_walk_steps{};     ///< Aliases the other calls walked
+    u64 alias_syncs_copied{};   ///< Calls that copied from newer aliases
+    u64 alias_verify_misses{};  ///< EDEN_NX2_ALIAS_SKIP_VERIFY: skips that had a newer alias
     bool native_thresholds_applied{};
     u64 native_critical_memory{};
     u64 native_expected_memory{};
@@ -539,6 +544,9 @@ private:
 
     /// Synchronize image aliases, copying data if needed
     void SynchronizeAliases(ImageId image_id);
+
+    /// Raise the alias tick bound of the image's aliases to its modification tick
+    void RaiseAliasTickBounds(const ImageBase& image) noexcept;
 
     /// Prepare an image view to be used
     void PrepareImageView(ImageViewId image_view_id, bool is_modification, bool invalidate);

@@ -18,6 +18,7 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/alignment.h"
+#include "common/nx2_ab.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
 #include "video_core/control/channel_state.h"
@@ -38,6 +39,13 @@ namespace VideoCommon {
 /// EDEN_NATIVE_DRAW_DIAGNOSTICS is read once: getenv scans the whole environment block on Windows.
 [[nodiscard]] inline bool NativeDrawDiagnostics() {
     static const bool enabled = std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS") != nullptr;
+    return enabled;
+}
+
+/// EDEN_NX2_ALIAS_SKIP_VERIFY: alias walks the tick bound skips still look for newer aliases and
+/// count the ones the skip would have missed (logged every 600 frames).
+[[nodiscard]] inline bool AliasSkipVerify() {
+    static const bool enabled = std::getenv("EDEN_NX2_ALIAS_SKIP_VERIFY") != nullptr;
     return enabled;
 }
 
@@ -461,6 +469,13 @@ void TextureCache<P>::TickFrame() {
     // Every 600 frames: device memory in use against the collector's thresholds.
     // Skip expensive heap allocation, map construction, and sorting unless debug logging is explicitly enabled.
     static const bool log_tc = std::getenv("EDEN_NX2_TC_LOG") != nullptr;
+    if ((log_tc || AliasSkipVerify()) && frame_tick % 600 == 0) {
+        LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} alias syncs, {} skipped by the tick bound, {} walked {} aliases, {} copied from newer aliases, {} verify misses",
+                 alias_syncs, alias_syncs_skipped, alias_syncs - alias_syncs_skipped,
+                 alias_walk_steps, alias_syncs_copied, alias_verify_misses);
+        alias_syncs = alias_syncs_skipped = alias_walk_steps = alias_syncs_copied = 0;
+        alias_verify_misses = 0;
+    }
     static u64 frames{};
     if (log_tc && ++frames % 600 == 0) {
         u64 image_bytes{};
@@ -2797,6 +2812,12 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         join_alias_indices.emplace(aliased_id, alias_index);
         new_image.flags |= ImageFlagBits::Alias;
     }
+    // The new image and its aliases each bound the other's modification tick.
+    for (const AliasedImage& alias : new_image_base.aliased_images) {
+        new_image_base.alias_tick_bound = (std::max)(new_image_base.alias_tick_bound,
+                                                     slot_images[alias.id].modification_tick);
+    }
+    RaiseAliasTickBounds(new_image_base);
     for (const ImageId aliased_id : join_bad_overlap_ids) {
         ImageBase& aliased = slot_images[aliased_id];
         aliased.overlapping_images.push_back(new_image_id);
@@ -2827,6 +2848,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             const AliasedImage& aliased = new_image.aliased_images[alias_pointer->second];
             CopyImage(new_image_id, aliased.id, aliased.copies);
             new_image.modification_tick = overlap.modification_tick;
+            RaiseAliasTickBounds(new_image);
             continue;
         }
         if (True(overlap.flags & ImageFlagBits::GpuModified)) {
@@ -2842,6 +2864,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                 runtime.CopyImage(new_image, overlap, copies);
             }
             new_image.modification_tick = overlap.modification_tick;
+            RaiseAliasTickBounds(new_image);
         }
         if (True(overlap.flags & ImageFlagBits::Tracked)) {
             UntrackImage(overlap, copy_object.id);
@@ -3605,19 +3628,45 @@ void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     image.modification_tick = ++modification_tick;
     if (!image.aliased_images.empty()) {
         // Its aliases are synchronized from it when they are prepared next.
+        RaiseAliasTickBounds(image);
         BumpTextureSetGeneration();
     }
 }
 
 template <class P>
+void TextureCache<P>::RaiseAliasTickBounds(const ImageBase& image) noexcept {
+    for (const AliasedImage& alias : image.aliased_images) {
+        u64& bound = slot_images[alias.id].alias_tick_bound;
+        bound = (std::max)(bound, image.modification_tick);
+    }
+}
+
+template <class P>
 void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
-    boost::container::small_vector<const AliasedImage*, 8> aliased_images;
     Image& image = slot_images[image_id];
+    ++alias_syncs;
+    // No alias was modified after this image: the walk would find nothing to copy.
+    if (image.modification_tick >= image.alias_tick_bound &&
+        Common::Nx2Ab::On(Common::Nx2Ab::AliasWalkSkip)) {
+        if (!AliasSkipVerify()) {
+            ++alias_syncs_skipped;
+            return;
+        }
+        for (const AliasedImage& aliased : image.aliased_images) {
+            if (image.modification_tick < slot_images[aliased.id].modification_tick) {
+                ++alias_verify_misses;
+            }
+        }
+    }
+    boost::container::small_vector<const AliasedImage*, 8> aliased_images;
     bool any_rescaled = True(image.flags & ImageFlagBits::Rescaled);
     bool any_modified = True(image.flags & ImageFlagBits::GpuModified);
     u64 most_recent_tick = image.modification_tick;
+    u64 newest_alias_tick = 0;
+    alias_walk_steps += image.aliased_images.size();
     for (const AliasedImage& aliased : image.aliased_images) {
         ImageBase& aliased_image = slot_images[aliased.id];
+        newest_alias_tick = (std::max)(newest_alias_tick, aliased_image.modification_tick);
         if (image.modification_tick < aliased_image.modification_tick) {
             most_recent_tick = (std::max)(most_recent_tick, aliased_image.modification_tick);
             aliased_images.push_back(&aliased);
@@ -3625,9 +3674,12 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
             any_modified |= True(aliased_image.flags & ImageFlagBits::GpuModified);
         }
     }
+    // Exact again (a deleted alias may have left it higher).
+    image.alias_tick_bound = newest_alias_tick;
     if (aliased_images.empty()) {
         return;
     }
+    ++alias_syncs_copied;
     const bool can_rescale = ImageCanRescale(image);
     if (any_rescaled) {
         if (can_rescale) {
@@ -3637,6 +3689,7 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
         }
     }
     image.modification_tick = most_recent_tick;
+    RaiseAliasTickBounds(image);
     if (any_modified) {
         image.flags |= ImageFlagBits::GpuModified;
     }
