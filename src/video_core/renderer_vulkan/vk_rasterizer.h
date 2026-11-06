@@ -296,6 +296,8 @@ private:
 
     std::atomic<u64> setup_events{};
     u64 buffer_events{}; ///< InnerInvalidation and uniform binds (split back thread)
+    /// BufferCache::Nx2GpuWriteSerial at the last barrier before an indirect draw (DrawIndirect).
+    u64 nx2_indirect_barrier_serial{~u64{0}};
     /// The last draw whose setup the next draw may reuse (RepeatRefusal).
     struct RepeatableDraw {
         GraphicsPipeline* pipeline{};

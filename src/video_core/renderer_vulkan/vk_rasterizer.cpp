@@ -56,6 +56,7 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 
 namespace Vulkan {
@@ -916,6 +917,25 @@ void RasterizerVulkan::DrawIndirect() {
     };
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     const auto& params = maxwell3d->draw_manager.indirect_state;
+    if (params.after_gpu_writes &&
+        buffer_cache.Nx2GpuWriteSerial() != nx2_indirect_barrier_serial) {
+        // The arguments may be shader or copy output recorded since the last such barrier
+        // (Maxwell3D::BackIndirectDrawMacro); a wait for idle orders the work but doesn't make
+        // the writes visible to the indirect read.
+        nx2_indirect_barrier_serial = buffer_cache.Nx2GpuWriteSerial();
+        Tegra::Nx2CountList(Tegra::g_nx2_list_stats.indirect_barriers);
+        scheduler.RequestOutsideRenderPassOperationContext();
+        scheduler.Record([](vk::CommandBuffer cmdbuf) {
+            static constexpr VkMemoryBarrier barrier{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                   VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, 0, barrier);
+        });
+    }
     buffer_cache.SetDrawIndirect(&params);
     PrepareDraw(params.is_indexed, [this, &params] {
         if (mesh_draw) {

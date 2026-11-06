@@ -377,6 +377,12 @@ public:
     /// CPU and inline writes: they reach guest memory, so a synced page stays synced, but its copy
     /// no longer holds the page.
     void Nx2NoteListHostWrite(DAddr device_addr, u64 size);
+    /// Bumped by every GPU write the cache is told of (MarkWrittenBuffer): a reader of GPU-written
+    /// words outside the usual bindings (an indirect draw's arguments) needs a barrier while it
+    /// changed since the last one.
+    [[nodiscard]] u64 Nx2GpuWriteSerial() const noexcept {
+        return nx2_gpu_write_serial;
+    }
 
     /// Bytes of the index buffer the last graphics setup bound and synchronized.
     [[nodiscard]] u32 IndexBindingSize() const noexcept {
@@ -786,6 +792,7 @@ private:
     static u32* Nx2CopyMarker(const Nx2Staging& copy);
     std::mutex nx2_list_mutex; ///< nx2_list_pages: the split's front reads the copies
     std::unordered_map<DAddr, Nx2ListPage> nx2_list_pages;
+    u64 nx2_gpu_write_serial{}; ///< Nx2GpuWriteSerial
     /// Copies replaced while the GPU may still write them: freed once it is past their tick.
     std::vector<std::pair<u64, Nx2Staging>> nx2_retired_list_copies;
     boost::container::small_vector<std::pair<BufferId, DAddr>, 8> nx2_list_copy_requests;

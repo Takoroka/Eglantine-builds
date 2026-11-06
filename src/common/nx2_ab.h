@@ -26,6 +26,8 @@ enum Feature : u64 {
     ListWriterWaitSkip = 1ull << 49, ///< Known CPU list pages skip the wait for writers (dma_pusher)
     SemAcquireOnBack = 1ull << 50,   ///< SEM_EXECUTE acquires checked on the back, no drain (puller)
     ListFlushBatch = 1ull << 51,     ///< List drains download all draw-written list pages at once
+    IndirectDrawMacro = 1ull << 52,  ///< GPU-written draw arguments of NVN2's indirect draw macro
+                                     ///< drawn from the GPU (Maxwell3D::FrontIndirectDrawMacro)
 };
 
 inline const u64 g_mask = [] {

@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -91,6 +92,16 @@ inline void Nx2MarkCommandListPage(u64 device_address) {
 [[nodiscard]] inline bool Nx2ListFlushBatch() {
     return Common::Nx2Ab::On(Common::Nx2Ab::ListFlushBatch);
 }
+// Most of those lists are no command lists at all: Donkey Kong Bananza's are the GPU-written
+// arguments of NVN2's indexed indirect draw macro (Maxwell3D::FrontIndirectDrawMacro). With A/B
+// bit IndirectDrawMacro the back draws from them on the GPU instead of the front reading them.
+// EDEN_NX2_INDIRECT_MACRO_VERIFY=1: read them and run the macro as before, and count the calls
+// the bit would have drawn from the GPU and the arguments it couldn't have given the same way.
+[[nodiscard]] inline bool Nx2IndirectDrawMacro() {
+    return Common::Nx2Ab::On(Common::Nx2Ab::IndirectDrawMacro);
+}
+inline const bool g_nx2_indirect_macro_verify =
+    std::getenv("EDEN_NX2_INDIRECT_MACRO_VERIFY") != nullptr;
 
 // Counts for the front's 10 s "command lists" log line (dma_pusher.cpp, ReportListStats).
 struct Nx2ListStats {
@@ -139,6 +150,15 @@ struct Nx2ListStats {
     std::atomic<u64> sync_drain_ns;
     std::atomic<u64> run_drains;         ///< GPU thread: functions run before later reads
     std::atomic<u64> run_drain_ns;
+    // Of the acquire drains (puller semaphore trigger), what they waited for.
+    std::atomic<u64> acquire_gequal;     ///< GEQUAL acquires (the others: EQUAL, MASK)
+    std::atomic<u64> acquire_may_drain;  ///< The front had nothing else to parse
+    std::atomic<u64> acquire_met;        ///< The value was there once the back caught up
+    // NVN2's indexed indirect draw macro with GPU-written arguments (A/B bit IndirectDrawMacro).
+    std::atomic<u64> indirect_draws;     ///< Drawn from the GPU, the arguments not read
+    std::atomic<u64> indirect_checked;   ///< Re-check mode: read and run as before, then checked
+    std::atomic<u64> indirect_odd;       ///< ... with base vertex/instance not 0 or instances not 1
+    std::atomic<u64> indirect_barriers;  ///< Barriers before such a draw (storage written since)
 };
 inline Nx2ListStats g_nx2_list_stats{};
 

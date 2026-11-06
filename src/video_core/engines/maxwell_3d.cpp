@@ -12,6 +12,7 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <unordered_map>
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/scope_exit.h"
@@ -1166,6 +1167,12 @@ struct Maxwell3D::FrontState {
     /// up here in a copy of the dirty tables (set once, when the channel is made).
     bool state_runs{};
     DirtyState::Tables dirty_tables{};
+    /// FrontIndirectDrawMacro: macro starts and whether their code is NVN2's indexed indirect
+    /// draw, for the macro code generation they were checked against.
+    std::unordered_map<u32, bool> indirect_macros;
+    u64 indirect_macros_generation{~u64{0}};
+    /// EDEN_NX2_INDIRECT_MACRO_VERIFY: the running macro would have been drawn from the GPU.
+    bool indirect_check{};
 };
 
 namespace {
@@ -1440,6 +1447,18 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         }
         fs.parameters.insert(fs.parameters.end(), base_start, base_start + amount);
         if (amount == methods_pending) {
+            if (fs.indirect_check) [[unlikely]] {
+                // FrontIndirectDrawMacro would have drawn this one from the GPU: an indirect
+                // draw gives the same only with no base vertex or instance and one instance
+                // (other instance counts and bases are drawn the same by Vulkan too, but Eden's
+                // direct draws got them a different way).
+                fs.indirect_check = false;
+                Nx2CountList(g_nx2_list_stats.indirect_checked);
+                if (fs.parameters.size() != 6 || fs.parameters[2] != 1 || fs.parameters[4] != 0 ||
+                    fs.parameters[5] != 0) {
+                    Nx2CountList(g_nx2_list_stats.indirect_odd);
+                }
+            }
             FrontRunMacro(system, split, fs);
         }
         return;
@@ -1708,6 +1727,126 @@ void Maxwell3D::FinishFrontMacro(Core::System& system) {
     // What ProcessMacro and CallMacroMethod do around the macro.
     ConsumeSink(system);
     draw_manager.DrawDeferred(*this);
+}
+
+namespace {
+
+// NVN2's indexed indirect draw macro, its 10 instructions (3 words each; the branches are
+// relative, so the words are the same wherever it is loaded). Parameters: the topology, then a
+// VkDrawIndexedIndirectCommand: index count, instances, first index, base vertex, base instance.
+// It writes the first index (0x5f7), the base vertex (0x446, 0x50d) and the base instance
+// (0x50e), draws the instances with begin (0x586) / index count (0x5f8) / end (0x585) (none for
+// 0 instances), and sets 0x446, 0x50d and 0x50e back to 0: the five words are draw arguments
+// and nothing else, as for Eden's HLE_DrawIndexedIndirect on Switch 1. Donkey Kong Bananza
+// supplies them from GPU-written memory in a GP entry of their own, ~380 a frame.
+constexpr std::array<u32, 30> Nx2IndexedIndirectDrawMacro{
+    0x00000003, 0x1d080000, 0x31c10300, 0x00940003, 0x18c0017d, 0xf1c00300,
+    0x3c741437, 0x18c00111, 0xb18c0300, 0x0078143b, 0x18c02001, 0x700c7700,
+    0x2c3417e3, 0x01c00161, 0xb02c0300, 0x01140003, 0x18c00161, 0x718c0300,
+    0x00000007, 0x20009a10, 0x34214300, 0x00000003, 0x18c007ff, 0x700c7700,
+    0x9d141437, 0x18c00111, 0xb18c0301, 0x01140003, 0x18c00143, 0xb18c0300,
+};
+
+// The topologies HLE_DrawIndexedIndirect draws indirectly (the rest need the index count on the
+// CPU: quads are drawn as triangles from a generated index buffer).
+bool IndirectTopologySafe(Maxwell3D::Regs::PrimitiveTopology topology) {
+    using Topology = Maxwell3D::Regs::PrimitiveTopology;
+    switch (topology) {
+    case Topology::Points:
+    case Topology::Lines:
+    case Topology::LineLoop:
+    case Topology::LineStrip:
+    case Topology::Triangles:
+    case Topology::TriangleStrip:
+    case Topology::TriangleFan:
+    case Topology::LinesAdjacency:
+    case Topology::LineStripAdjacency:
+    case Topology::TrianglesAdjacency:
+    case Topology::TriangleStripAdjacency:
+    case Topology::Patches:
+        return true;
+    default:
+        return false;
+    }
+}
+
+} // Anonymous namespace
+
+bool Maxwell3D::FrontIndirectDrawMacro(Core::System& system, VideoCommon::GpuSplit& split,
+                                       u32 method, GPUVAddr arguments) {
+    if (!Nx2IndirectDrawMacro() && !g_nx2_indirect_macro_verify) {
+        return false;
+    }
+    auto& fs = Front(system, split);
+    // The topology, nothing else, came in the entry before.
+    if (fs.executing_macro != method || fs.parameters.size() != 1 ||
+        (fs.parameters[0] & ~0xffffU) != 0 ||
+        !IndirectTopologySafe(static_cast<Regs::PrimitiveTopology>(fs.parameters[0]))) {
+        return false;
+    }
+    auto& engine = GetNativeMacroEngine();
+    const auto positions = GetNativeMacroPositions();
+    const u32 start = positions[((method - MacroRegistersStart) >> 1) % positions.size()];
+    if (fs.indirect_macros_generation != engine.native_code_generation) {
+        fs.indirect_macros.clear();
+        fs.indirect_macros_generation = engine.native_code_generation;
+    }
+    const auto [it, inserted] = fs.indirect_macros.try_emplace(start, false);
+    if (inserted) {
+        const size_t first = size_t{start} * 3;
+        it->second = first + Nx2IndexedIndirectDrawMacro.size() <= engine.native_code.size() &&
+                     std::equal(Nx2IndexedIndirectDrawMacro.begin(),
+                                Nx2IndexedIndirectDrawMacro.end(),
+                                engine.native_code.begin() + first);
+    }
+    if (!it->second) {
+        return false;
+    }
+    if (g_nx2_indirect_macro_verify || !Nx2IndirectDrawMacro()) {
+        // Read and run as before; FrontCallMultiMethod checks the words.
+        fs.indirect_check = g_nx2_indirect_macro_verify;
+        return false;
+    }
+    const auto topology = static_cast<Regs::PrimitiveTopology>(fs.parameters[0]);
+    fs.parameters.clear();
+    fs.executing_macro = 0;
+    Nx2CountList(g_nx2_list_stats.indirect_draws);
+    split.DeferEngineWork([this, system_ptr = &system, topology, arguments] {
+        BackIndirectDrawMacro(*system_ptr, topology, arguments);
+    });
+    // The macro's last writes.
+    for (const size_t base : {MAXWELL3D_REG_INDEX(vertex_id_base),
+                              MAXWELL3D_REG_INDEX(global_base_vertex_index),
+                              MAXWELL3D_REG_INDEX(global_base_instance_index)}) {
+        FrontWrite(split, fs, static_cast<u32>(base), 0, true, true);
+    }
+    return true;
+}
+
+void Maxwell3D::BackIndirectDrawMacro(Core::System& system, Regs::PrimitiveTopology topology,
+                                      GPUVAddr arguments) {
+    // As FinishFrontMacro around a macro, with HLE_DrawIndexedIndirect's draw in between. The
+    // base vertex and instance come from the arguments, as does the index range (the whole
+    // bound index buffer is bound for it).
+    ConsumeSink(system);
+    draw_manager.DrawDeferred(*this);
+    regs.vertex_id_base = 0;
+    regs.global_base_vertex_index = 0;
+    regs.global_base_instance_index = 0;
+    auto& params = draw_manager.indirect_state;
+    params.is_byte_count = false;
+    params.is_indexed = true;
+    params.include_count = false;
+    params.count_start_address = 0;
+    params.indirect_start_address = arguments;
+    params.buffer_size = 5 * sizeof(u32);
+    params.max_draw_counts = 1;
+    params.stride = 0;
+    params.after_gpu_writes = true;
+    dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+    draw_manager.DrawIndexedIndirect(*this, topology, 0,
+                                     static_cast<u32>(EstimateIndexBufferSize()));
+    params.after_gpu_writes = false;
 }
 
 } // namespace Tegra::Engines

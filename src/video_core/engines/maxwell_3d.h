@@ -3095,6 +3095,9 @@ public:
             size_t buffer_size;
             size_t max_draw_counts;
             size_t stride;
+            /// The arguments may be what earlier GPU work wrote without a barrier since
+            /// (Maxwell3D::BackIndirectDrawMacro): the draw puts one in when storage was written.
+            bool after_gpu_writes;
         };
         void ProcessMethodCall(Maxwell3D& maxwell3d, u32 method, u32 argument);
         void Clear(Maxwell3D& maxwell3d, u32 layer_count);
@@ -3247,6 +3250,12 @@ public:
                          u32 argument, bool is_last_call);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* base_start, u32 amount, u32 methods_pending);
+    /// The front, before the last five parameters of macro `method` (one taken so far) are read
+    /// from GPU-written memory at `arguments`: when the macro is NVN2's indexed indirect draw,
+    /// sends the back an indirect draw from those words instead and returns true (they need not
+    /// be read). A/B bit IndirectDrawMacro (nx2.h).
+    bool FrontIndirectDrawMacro(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
+                                GPUVAddr arguments);
 
     bool ShouldExecute() const {
         return execute_on;
@@ -3452,6 +3461,9 @@ private:
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 count);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
+    /// The back's part of FrontIndirectDrawMacro.
+    void BackIndirectDrawMacro(Core::System& system, Regs::PrimitiveTopology topology,
+                               GPUVAddr arguments);
     std::unique_ptr<FrontState> front;
     bool front_macros{};
     // EDEN_NX2_SPLIT_VERIFY: the last SET_SHADOW_RAM_CONTROL writes each side saw (argument,
