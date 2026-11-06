@@ -22,6 +22,8 @@ namespace Common::Nx2Ab {
 
 // The registry of bits in use is C:\dev\nx2work\rounds\AB-BITS.md (bits 32 and up: 1ull << n).
 enum Feature : u64 {
+    // fences (11-05): direct draws with no vertices or no instances skip the draw setup.
+    ZeroDrawSkip = 1ull << 40,
 };
 
 inline const u64 g_mask = [] {

@@ -26,6 +26,7 @@
 #include "common/assert.h"
 #include "shader_recompiler/exception.h"
 #include "common/logging.h"
+#include "common/nx2_ab.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -739,6 +740,38 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
         }
     }
 }
+
+// TEMP (measurement aid): EDEN_NX2_ZERO_DRAW_STATS=1 logs every 30 s how many direct draws had
+// no vertices or no instances and how many of them skipped the draw setup.
+void CountDirectDraw(bool no_vertices, bool no_instances, bool skipped) {
+    static const bool enabled = std::getenv("EDEN_NX2_ZERO_DRAW_STATS") != nullptr;
+    if (!enabled) {
+        return;
+    }
+    static u64 draws{};
+    static u64 zero_vertices{};
+    static u64 zero_instances{};
+    static u64 skips{};
+    static auto last_log = std::chrono::steady_clock::now();
+    ++draws;
+    zero_vertices += no_vertices ? 1 : 0;
+    zero_instances += no_instances ? 1 : 0;
+    skips += skipped ? 1 : 0;
+    if ((draws & 1023) != 0) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_log < std::chrono::seconds{30}) {
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - last_log).count();
+    LOG_INFO(HW_GPU,
+             "nx2 zero draws: last {:.1f} s {} direct draws, {} with no vertices, {} with no "
+             "instances, {} skipped",
+             seconds, draws, zero_vertices, zero_instances, skips);
+    last_log = now;
+    draws = zero_vertices = zero_instances = skips = 0;
+}
 } // Anonymous namespace
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
@@ -868,6 +901,27 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
             LOG_INFO(HW_GPU, "nx2 draw target {:#x} {}x{} format={:#x} vs={:#x} ps={:#x} blend={} (pairs so far {})",
                      rt.Address(), rt.width, rt.height, static_cast<u32>(rt.format), vs, ps,
                      regs.blend.enable[0], seen.size());
+        }
+    }
+    // A draw with no vertices (after the quad conversion) or no instances draws nothing: it
+    // returns before the pipeline, buffer and descriptor setup and records nothing. What that
+    // setup would have applied stays pending for the next draw or clear: dirty flags, constant
+    // buffer changes, a deferred clear (realized at the next render pass request or end) and the
+    // sample counter's state. Task/mesh draws draw their group count whatever the instance
+    // count, and transform feedback draws still go through.
+    {
+        const auto& regs = maxwell3d->regs;
+        const bool no_vertices =
+            MakeDrawParams(maxwell3d->draw_manager.draw_state, instance_count, is_indexed)
+                .num_vertices == 0;
+        const bool no_instances = instance_count == 0;
+        const bool skip = (no_vertices || (no_instances && !regs.IsMeshEnabled())) &&
+                          regs.transform_feedback_enabled == 0 &&
+                          Common::Nx2Ab::On(Common::Nx2Ab::ZeroDrawSkip);
+        CountDirectDraw(no_vertices, no_instances, skip);
+        if (skip) {
+            gpu.TickWork();
+            return;
         }
     }
     PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
