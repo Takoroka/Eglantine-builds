@@ -1418,9 +1418,9 @@ bool RasterizerVulkan::Nx2IndirectBarrierNeeded(
     // (Maxwell3D::BackIndirectDrawMacro, the extended macro). Its writers run as one batch a
     // frame, while storage writes elsewhere come between nearly every two of its draws, and each
     // barrier ends the render pass.
-    const auto device = gpu_memory->GpuToCpuAddress(params.indirect_start_address);
-    if (!device || buffer_cache.Nx2ListWrittenSince(*device, params.buffer_size,
-                                                     nx2_indirect_barrier_serial) != 0) {
+    const auto arguments = gpu_memory->GpuToCpuAddress(params.indirect_start_address);
+    if (!arguments || buffer_cache.Nx2ListWrittenSince(*arguments, params.buffer_size,
+                                                        nx2_indirect_barrier_serial) != 0) {
         return true;
     }
     Tegra::Nx2CountList(Tegra::g_nx2_list_stats.barriers_skipped);
