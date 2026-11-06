@@ -49,6 +49,14 @@ enum Feature : u64 {
                                      ///< drawn from the GPU (Maxwell3D::FrontIndirectDrawMacro)
     IndirectDrawMacroExtended = 1ull << 55, ///< The same for the macro's variant that also writes
                                             ///< base vertex/instance to the constant buffer
+    // backperf (11-06): pipelines whose only writes are storage buffers take the buffer refresh
+    // path (never a full repeat): RasterizerVulkan::PrepareDraw.
+    StorageWriteRefresh = 1ull << 56,
+    // backperf (11-06): a cached write to pages without GPU-written data asks the GPU-modified
+    // sets once (BufferCache::CachedWriteMemory), and a dirty memory gather with nothing
+    // collected returns before the collectors' lock and the swap
+    // (Core::GPUDirtyMemoryManager::Gather). Idea: zortos293/lichii 44bf47d37.
+    CachedWriteOneLookup = 1ull << 59,
     WaitForIdleBarrier = 1ull << 60, ///< Waits for idle wait (a barrier), compute-to-draw barriers
                                      ///< (RasterizerVulkan::WaitForIdle, Scheduler)
     AcquireNoDrain = 1ull << 62,     ///< Semaphore acquires read ahead of the back, no drain (puller)

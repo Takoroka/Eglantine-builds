@@ -8,6 +8,8 @@
 
 #include <array>
 #include <atomic>
+#include <unordered_map>
+#include <vector>
 
 #include <boost/container/static_vector.hpp>
 
@@ -218,6 +220,10 @@ private:
     void RememberDrawSetup(GraphicsPipeline* pipeline, bool is_indexed, u64 setup_events_seen);
     /// After a draw's buffer refresh.
     void RememberBufferRefresh(bool is_indexed);
+    /// EDEN_NX2_REPEAT_STATS=1 (counters only): the path every draw takes (repeat, buffer refresh,
+    /// full setup) and why the others were refused, with the register methods behind register
+    /// refusals; indirect draws as if DrawIndirect's own setup changes didn't count. Every 10 s.
+    void CountRepeat(u32 refusal, bool refresh);
     /// Same-state verify (EDEN_NX2_SAME_STATE_VERIFY): what the fast path would have reused.
     struct SameStateExpectation {
         const GraphicsPipeline* pipeline{};
@@ -327,8 +333,33 @@ private:
         Tegra::Engines::Maxwell3D::Regs::PrimitiveTopology topology{};
         bool is_indexed{};
         bool valid{};
+        bool refresh_only{}; ///< The pipeline writes storage buffers: a refresh, never a repeat
+        /// BufferCache::BufferSetSerial at the setup: a refresh keeps the storage bindings, so a
+        /// storage-writing pipeline refreshes only while no buffer was created or deleted.
+        u64 buffer_set_serial{};
+        u8 invalid_reason{}; ///< Why not valid (repeat stats only)
     } repeat;
     u64 same_state_verify_count{};
+    bool indirect_draw{};      ///< DrawIndirect's PrepareDraw is running
+    bool last_draw_indirect{}; ///< The draw prepared before this one was indirect
+    struct RepeatStats {
+        u64 draws{};
+        u64 indirect{};
+        u64 repeats{};
+        u64 refreshes{};
+        u64 indirect_repeats{};   ///< ... of them indirect (would-be: DrawIndirect never repeats)
+        u64 indirect_refreshes{};
+        u64 writer_refreshes{};   ///< Refreshes of storage-writing pipelines (StorageWriteRefresh)
+        u64 writer_refused{};     ///< ... refused with no refusal bit (views, cbuf words, buffer set)
+        std::array<u64, 10> refused_first{}; ///< Full setups by the lowest refusal bit set
+        std::array<u64, 10> refused_any{};   ///< ... by every refusal bit set
+        std::array<u64, 8> invalid{};        ///< RefusalNoPrevious: why the last setup wasn't repeatable
+        /// Register refusals by Maxwell3D::last_other_method (NUM_REGS: a state run; the last
+        /// slot: an HLE/interpreted macro).
+        std::vector<u64> other_methods;
+        /// Back-event refusals by the other engine of the last engine switch (null: a call).
+        std::unordered_map<const Tegra::Engines::EngineInterface*, u64> back_event_engines;
+    } repeat_stats;
 
     /// Uniform slot keep (uniform_stream_reuse.h): what happened since the last draw that bound
     /// uniform buffers. Clean when nothing but the guest writes listed here did.

@@ -419,6 +419,9 @@ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
     }
     regs.reg_array[method] = argument;
     ++same_state_serials[same_state_kinds[method]];
+    if (same_state_kinds[method] == SameStateOther) {
+        last_other_method = method;
+    }
     for (auto const& table : dirty.tables)
         dirty.flags[table[method]] = true;
 }
@@ -645,6 +648,7 @@ void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* bas
     case MAXWELL3D_REG_INDEX(inline_data): {
         ASSERT(methods_pending == amount);
         ++same_state_serials[SameStateOther];
+        last_other_method = MAXWELL3D_REG_INDEX(inline_data);
         upload_state.ProcessData(base_start, amount);
         return;
     }

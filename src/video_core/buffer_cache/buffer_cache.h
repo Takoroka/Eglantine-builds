@@ -245,7 +245,36 @@ void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
     DAddr aligned_start = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
     DAddr aligned_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
     if (!IsRegionGpuModified(aligned_start, aligned_end - aligned_start)) {
-        WriteMemory(device_addr, size);
+        if (!Common::Nx2Ab::On(Common::Nx2Ab::CachedWriteOneLookup)) {
+            WriteMemory(device_addr, size);
+            return;
+        }
+        // No GPU-written range on the write's pages, so none in the write either: WriteMemory's
+        // own lookups (the range, then its pages before downloading them) would find nothing.
+        // EDEN_NX2_WRITE_LOOKUP_VERIFY=1 runs them anyway and counts the writes where they
+        // found something (those then take WriteMemory).
+        static const bool verify = std::getenv("EDEN_NX2_WRITE_LOOKUP_VERIFY") != nullptr;
+        if (verify) {
+            static u64 checked = 0;
+            static u64 differing = 0;
+            static auto last_log = std::chrono::steady_clock::now();
+            const bool found = IsRegionGpuModified(device_addr, size) ||
+                               gpu_modified_ranges.Intersects(aligned_start, aligned_end - aligned_start);
+            ++checked;
+            differing += found ? 1 : 0;
+            if (const auto now = std::chrono::steady_clock::now(); now - last_log >= std::chrono::seconds{10}) {
+                last_log = now;
+                LOG_INFO(HW_GPU, "nx2 cached write lookups (verify): {} writes, {} where the full lookups found GPU data",
+                         checked, differing);
+            }
+            if (found) {
+                WriteMemory(device_addr, size);
+                return;
+            }
+        }
+        Nx2NoteListHostWrite(device_addr, size);
+        memory_tracker.MarkRegionAsCpuModified(device_addr, size);
+        MarkVertexBuffersStale(device_addr, size);
         return;
     }
 

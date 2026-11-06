@@ -3159,6 +3159,9 @@ public:
         NumSameStateKinds,
     };
     std::array<u64, NumSameStateKinds> same_state_serials{};
+    /// The method of the last write that bumped same_state_serials[SameStateOther] (repeat stats:
+    /// which registers refuse the repeat path); NUM_REGS for a state run.
+    u32 last_other_method{};
 
     /// Constant buffer memory written by uploads and slots bound since the last draw (the
     /// rasterizer resets them).
@@ -3277,6 +3280,9 @@ public:
             if ((tags >> kind) & 1) {
                 ++same_state_serials[kind];
             }
+        }
+        if ((tags >> SameStateOther) & 1) {
+            last_other_method = Regs::NUM_REGS;
         }
     }
 

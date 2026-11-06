@@ -319,6 +319,9 @@ GraphicsPipeline::GraphicsPipeline(
         can_repeat_draws &= !written(info->storage_buffers_descriptors) &&
                             !written(info->image_buffer_descriptors) &&
                             !written(info->image_descriptors) && !info->is_task && !info->is_mesh;
+        // Image writes mark the images modified in the full setup only (FillImageViews).
+        can_refresh_written &= !written(info->image_buffer_descriptors) &&
+                               !written(info->image_descriptors) && !info->is_task && !info->is_mesh;
         // The constant buffer words the setup reads: texture handles and storage buffer
         // addresses (with their sizes), one range per descriptor: uploads often go to the same
         // buffer, between them.
@@ -1143,8 +1146,8 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .patchControlPoints = std::min(key.state.patch_control_points_minus_one.Value() + 1,
-                                       device.GetMaxTessellationPatchSize()),
+        .patchControlPoints = (std::min)(key.state.patch_control_points_minus_one.Value() + 1,
+                                         device.GetMaxTessellationPatchSize()),
     };
     std::array<VkViewportSwizzleNV, Maxwell::NumViewports> swizzles;
     std::ranges::transform(key.state.viewport_swizzles, swizzles.begin(), UnpackViewportSwizzle);

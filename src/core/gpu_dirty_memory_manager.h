@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/nx2_ab.h"
 #include "core/device_memory_manager.h"
 
 namespace Core {
@@ -33,6 +34,9 @@ public:
                 if (IsValid(tmp.address)) {
                     std::scoped_lock lk(guard);
                     back_buffer.emplace_back(tmp);
+                    if (tmp.mask != 0) {
+                        has_back.store(true, std::memory_order_release);
+                    }
                     current.exchange(t, std::memory_order_relaxed);
                     return;
                 }
@@ -67,10 +71,19 @@ public:
         // FlushRegion also gathers off the GPU thread (host1x video decode reads); serialize
         // gatherers so one cannot swap or clear front_buffer while another iterates it.
         std::scoped_lock gather_lk(gather_guard);
+        // Gathered at every fence, for every core: usually nothing was collected since. Entries
+        // with no bits set (the placeholder current holds after a gather) give no callback.
+        // Checked under gather_lk: an earlier gatherer has finished its callbacks by then.
+        if (Common::Nx2Ab::On(Common::Nx2Ab::CachedWriteOneLookup) &&
+            !has_back.load(std::memory_order_acquire) &&
+            current.load(std::memory_order_acquire).mask == 0) {
+            return;
+        }
         {
             std::scoped_lock lk(guard);
             TransformAddress t = current.exchange(default_transform, std::memory_order_relaxed);
             front_buffer.swap(back_buffer);
+            has_back.store(false, std::memory_order_relaxed);
             if (IsValid(t.address)) {
                 front_buffer.emplace_back(t);
             }
@@ -137,6 +150,8 @@ private:
     }
 
     std::atomic<TransformAddress> current{};
+    /// back_buffer holds an entry with bits set (written under guard)
+    std::atomic<bool> has_back{false};
     std::mutex guard;
     std::mutex gather_guard;
     std::vector<TransformAddress> back_buffer;
