@@ -122,13 +122,12 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     split.Defer([gpu = &system.GPU()] { gpu->TickWork(); });
                 } else if (auto* run = std::get_if<RunCommand>(&next.data)) {
                     if (run->before_later_reads) {
-                        {
-                            const Tegra::Nx2CountedTime counted{
-                                Tegra::g_nx2_list_stats.run_drains,
-                                Tegra::g_nx2_list_stats.run_drain_ns};
-                            split.Drain();
-                        }
-                        run->func();
+                        // GPU memory maps unmap caches (UnmapMemory downloads): the back's state.
+                        const Tegra::Nx2CountedTime counted{
+                            Tegra::g_nx2_list_stats.run_drains,
+                            Tegra::g_nx2_list_stats.run_drain_ns};
+                        split.DeferFunction(std::move(run->func));
+                        split.Drain();
                     } else {
                         split.DeferFunction(std::move(run->func));
                     }

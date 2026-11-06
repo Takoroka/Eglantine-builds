@@ -168,6 +168,13 @@ public:
 
     size_t MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const;
 
+    /// Bumped after each page table change: lookups cached under one value stay valid until then.
+    /// The same counter as MapGeneration (both sides of the 11-06 merge added one, at the same
+    /// places).
+    [[nodiscard]] u64 MapSerial() const {
+        return map_generation.load(std::memory_order_acquire);
+    }
+
     bool IsWithinGPUAddressRange(GPUVAddr gpu_addr) const {
         return gpu_addr < address_space_size;
     }
@@ -191,6 +198,8 @@ public:
 private:
     template <typename FuncMapped, typename FuncReserved, typename FuncUnmapped>
     inline void MemoryOperation(GPUVAddr gpu_src_addr, std::size_t size, bool is_big_page, FuncMapped&& func_mapped, FuncReserved&& func_reserved, FuncUnmapped&& func_unmapped) const;
+
+    size_t MaxContinuousRangeUncached(GPUVAddr gpu_addr, size_t size) const;
 
     void ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe) const;
     void WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe);
@@ -248,7 +257,7 @@ private:
     inline void SetEntry(size_t position, EntryType entry, bool is_big_page);
 
     Common::MultiLevelPageTable<u32> page_table;
-    Common::RangeMap<GPUVAddr, PTEKind> kind_map;
+    mutable Common::RangeMap<GPUVAddr, PTEKind> kind_map;
     Common::SparseLargeVector<u32> big_page_table_dev;
     /// Bumped whenever page table entries may have changed: GpuToCpuAddress's per-thread cached
     /// translations hold while it is the same.

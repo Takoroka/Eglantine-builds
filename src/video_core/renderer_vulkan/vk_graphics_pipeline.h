@@ -11,6 +11,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdlib>
+#include <functional>
 #include <mutex>
 #include <span>
 #include <type_traits>
@@ -224,6 +225,9 @@ public:
     }
 
 private:
+    /// Builds the pipeline once, on whichever thread gets here first.
+    void RunBuild();
+
     template <typename Spec>
     bool ConfigureImpl(bool is_indexed);
 
@@ -357,6 +361,8 @@ private:
     u32 last_descriptor_buffer_chunk{};
     u64 last_descriptor_buffer_generation{};
 
+    std::function<void()> build_task;
+    std::atomic_bool build_claimed{false};
     std::condition_variable build_condvar;
     std::mutex build_mutex;
     std::atomic_bool is_built{false};

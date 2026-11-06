@@ -584,21 +584,26 @@ void RasterizerOpenGL::OnCacheInvalidation(DAddr addr, u64 size) {
     shader_cache.InvalidateRegion(addr, size);
 }
 
-void RasterizerOpenGL::OnCacheInvalidations(
-    std::span<const std::pair<DAddr, std::size_t>> writes) {
+void RasterizerOpenGL::OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
     {
         std::scoped_lock lock{texture_cache.mutex};
-        for (const auto& [addr, size] : writes) {
+        for (const auto& [addr, size] : ranges) {
             if (addr != 0 && size != 0) {
                 texture_cache.WriteMemory(addr, size);
             }
         }
     }
     {
+        // Every write leaves the GPU-written ranges before the first is applied (ClaimCpuWrites).
         std::scoped_lock lock{buffer_cache.mutex};
-        buffer_cache.WriteMemories(writes);
+        buffer_cache.ClaimCpuWrites(ranges);
+        for (const auto& [addr, size] : ranges) {
+            if (addr != 0 && size != 0) {
+                buffer_cache.WriteMemory(addr, size);
+            }
+        }
     }
-    for (const auto& [addr, size] : writes) {
+    for (const auto& [addr, size] : ranges) {
         if (addr != 0 && size != 0) {
             shader_cache.InvalidateRegion(addr, size);
         }

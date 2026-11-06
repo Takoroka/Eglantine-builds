@@ -295,6 +295,11 @@ struct WordManager {
             if (type == Type::GPU)
                 mask &= ~untracked_words[index];
             const u64 word = state_words[index] & mask;
+            if (word == 0 &&
+                (!clear || ((type != Type::CPU && type != Type::CachedCPU) ||
+                            (untracked_words[index] & mask) == 0))) {
+                return;
+            }
             if (clear) {
                 if (type == Type::CPU && (Span(Type::Hot)[index] & word) != 0) {
                     CountHotUploads(index, Span(Type::Hot)[index] & word);

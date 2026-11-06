@@ -100,7 +100,7 @@ public:
     void InvalidateRegion(DAddr addr, u64 size,
                           VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     void OnCacheInvalidation(PAddr addr, u64 size) override;
-    void OnCacheInvalidations(std::span<const std::pair<DAddr, std::size_t>> writes) override;
+    void OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) override;
     bool OnCPUWrite(PAddr addr, u64 size) override;
     void InvalidateGPUCache() override;
     void OnGuestSyncPoint() override;
