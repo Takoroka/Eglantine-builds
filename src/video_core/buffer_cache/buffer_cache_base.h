@@ -24,6 +24,7 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/common_types.h"
+#include "common/nx2_ab.h"
 #include "common/spin_recursive_mutex.h"
 #include "common/div_ceil.h"
 #include "common/literals.h"
@@ -477,6 +478,9 @@ private:
 
     void UpdateVertexBuffer(u32 index);
 
+    /// Vertex lookup statistics (EDEN_NX2_VB_CACHE_STATS / EDEN_NX2_VB_CACHE_VERIFY).
+    void CountVertexLookup(bool hit, bool mismatch);
+
     void UpdateDrawIndirect();
 
     void UpdateUniformBuffers(size_t stage);
@@ -606,6 +610,21 @@ private:
     u32 stale_vertex_buffers_mask = 0;
     u64 vertex_buffers_serial = 0;
     std::array<Binding, 32> v_buffer{};
+
+    /// Vertex stream lookups (UpdateVertexBuffer): a GPU address range's binding, valid while the
+    /// address space, its mappings and the set of buffers are as when it was stored. Games set
+    /// their streams per mesh, so a frame's meshes come back to the same few ranges.
+    struct VertexLookup {
+        GPUVAddr begin{};
+        GPUVAddr end{};
+        size_t address_space{};
+        u64 map_generation{};
+        u64 buffer_set_serial{};
+        Binding binding{};
+    };
+    std::array<VertexLookup, 64> vertex_lookups{};
+    /// Bumped whenever a buffer is created or deleted (lookups made before may name another one).
+    u64 buffer_set_serial = 1;
 
     boost::container::small_vector<BufferCopy, 4> upload_copies;
 

@@ -27,6 +27,9 @@ enum Feature : u64 {
     // hosttime (11-06): writes of values only dynamic states read leave the next draw the repeat
     // path (Maxwell3D::SameStateDynamic).
     DynamicDeltas = 1ull << 44,
+    // hosttime (11-06): vertex streams bind a range resolved before without resolving it again
+    // while the mappings and buffers are as then (BufferCache::vertex_lookups).
+    VertexLookupCache = 1ull << 45,
 };
 
 inline const u64 g_mask = [] {
