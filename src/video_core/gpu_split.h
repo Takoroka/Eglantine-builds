@@ -207,7 +207,7 @@ public:
     /// Whether WaitForWriters would wait.
     [[nodiscard]] bool WritersQueued() const {
         return consumed.load(std::memory_order_acquire) <
-               std::min(last_writer_position, write_position);
+               (std::min)(last_writer_position, write_position);
     }
 
     /// On the back, while it runs an entry: whether more work was sent after it (false on any
