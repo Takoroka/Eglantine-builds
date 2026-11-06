@@ -214,6 +214,15 @@ private:
     void RememberDrawSetup(GraphicsPipeline* pipeline, bool is_indexed, u64 setup_events_seen);
     /// After a draw's buffer refresh.
     void RememberBufferRefresh(bool is_indexed);
+    /// Same-state verify (EDEN_NX2_SAME_STATE_VERIFY): what the fast path would have reused.
+    struct SameStateExpectation {
+        const GraphicsPipeline* pipeline{};
+        GraphicsPipeline::SetupFingerprint fingerprint{};
+        bool repeat{};  ///< repeat (everything reused) rather than buffer refresh
+        bool active{};  ///< this draw is checked: it takes the full setup
+    };
+    /// After the full setup of a checked draw: compares it with the fast path's.
+    void CheckSameState(const SameStateExpectation& expected, const GraphicsPipeline* pipeline);
     /// Something a draw's setup reads may have changed outside the 3D registers (rasterizer calls
     /// for other work, cache invalidations from guest threads, counted once they are done).
     void NoteSetupChange() noexcept {
@@ -308,6 +317,7 @@ private:
         bool is_indexed{};
         bool valid{};
     } repeat;
+    u64 same_state_verify_count{};
 };
 
 } // namespace Vulkan

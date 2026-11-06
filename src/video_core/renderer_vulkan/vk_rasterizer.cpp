@@ -424,6 +424,49 @@ bool RasterizerVulkan::CanRefreshBuffers() const {
     return true;
 }
 
+void RasterizerVulkan::CheckSameState(const SameStateExpectation& expected,
+                                      const GraphicsPipeline* pipeline) {
+    // Counted per 10 s; each mismatching shader pair is named once (the first 16).
+    static u64 repeats{}, refreshes{}, pipelines{}, textures{}, uniforms{};
+    static auto last_log = std::chrono::steady_clock::now();
+    static std::set<std::tuple<u64, u64, int>> reported;
+    const auto actual = pipeline->LastSetupFingerprint();
+    const bool pipeline_differs = pipeline != expected.pipeline;
+    // Another pipeline resolves other textures and buffers: only the pipeline counts then. A
+    // refresh rebinds the constant buffers, so only a repeat must have the same ones.
+    const bool textures_differ =
+        !pipeline_differs && actual.textures != expected.fingerprint.textures;
+    const bool uniforms_differ =
+        !pipeline_differs && expected.repeat && actual.uniforms != expected.fingerprint.uniforms;
+    ++(expected.repeat ? repeats : refreshes);
+    pipelines += pipeline_differs ? 1 : 0;
+    textures += textures_differ ? 1 : 0;
+    uniforms += uniforms_differ ? 1 : 0;
+    if ((pipeline_differs || textures_differ || uniforms_differ) && reported.size() < 16) {
+        const auto& regs = maxwell3d->regs;
+        const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
+        const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
+        const int what = pipeline_differs ? 0 : textures_differ ? 1 : 2;
+        if (reported.emplace(vs, ps, what).second) {
+            LOG_WARNING(HW_GPU, "nx2 same-state verify: {} draw vs={:#x} ps={:#x}: {} differ from the fast path's",
+                        expected.repeat ? "repeat" : "refresh", vs, ps,
+                        what == 0   ? "the pipeline would"
+                        : what == 1 ? "the image views or samplers would"
+                                    : "the constant buffer bindings would");
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_log >= std::chrono::seconds{10}) {
+        LOG_INFO(HW_GPU,
+                 "nx2 same-state verify: last {:.0f} s checked {} repeat and {} refresh draws; "
+                 "mismatches: pipeline {}, textures {}, constant buffers {}",
+                 std::chrono::duration<double>(now - last_log).count(), repeats, refreshes,
+                 pipelines, textures, uniforms);
+        repeats = refreshes = pipelines = textures = uniforms = 0;
+        last_log = now;
+    }
+}
+
 void RasterizerVulkan::RememberBufferRefresh(bool is_indexed) {
     repeat.serials = maxwell3d->same_state_serials;
     repeat.buffer_events = buffer_events;
@@ -501,7 +544,14 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     // texture buffers and render targets stay; the buffer bindings and descriptors are redone.
     const bool refresh = refusal != 0 && (refusal & ~RefusalBuffers) == 0 && CanRefreshBuffers();
     maxwell3d->cbuf_changes.Reset();
-    if (refusal == 0 || refresh) {
+    // EDEN_NX2_SAME_STATE_VERIFY=<n>: every n-th draw that could take one of those paths takes
+    // the full setup instead, which is then compared with what the fast path would have used.
+    SameStateExpectation expected{};
+    if ((refusal == 0 || refresh) && SameStateVerifyEvery() != 0 &&
+        ++same_state_verify_count % SameStateVerifyEvery() == 0) {
+        expected = {repeat.pipeline, repeat.pipeline->LastSetupFingerprint(), refusal == 0, true};
+    }
+    if ((refusal == 0 || refresh) && !expected.active) {
         std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
         // A guest thread's invalidation may have finished while this thread waited for the lock.
         if (setup_events.load(std::memory_order_relaxed) == repeat.setup_events) {
@@ -601,6 +651,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
         report_failure("configure failed");
         return;
+    }
+    if (expected.active) {
+        CheckSameState(expected, pipeline);
     }
 
     {

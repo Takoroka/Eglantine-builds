@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cstdlib>
 #include <mutex>
 #include <span>
 #include <type_traits>
@@ -53,6 +54,17 @@ struct GraphicsPipelineCacheKey {
 static_assert(std::has_unique_object_representations_v<GraphicsPipelineCacheKey>);
 static_assert(std::is_trivially_copyable_v<GraphicsPipelineCacheKey>);
 static_assert(std::is_trivially_constructible_v<GraphicsPipelineCacheKey>);
+
+/// EDEN_NX2_SAME_STATE_VERIFY=<n>: every n-th draw that could reuse the previous draw's setup
+/// (repeat or buffer refresh) runs the full setup instead, and the rasterizer compares what it
+/// resolved with what the fast path would have used. 0 (the default) = off.
+inline u32 SameStateVerifyEvery() {
+    static const u32 every = [] {
+        const char* value = std::getenv("EDEN_NX2_SAME_STATE_VERIFY");
+        return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
+    }();
+    return every;
+}
 
 } // namespace Vulkan
 
@@ -132,6 +144,17 @@ public:
     /// buffers), so RefreshBuffers may keep the last setup's image views.
     [[nodiscard]] bool CanRefreshBuffers() const noexcept {
         return can_refresh_buffers;
+    }
+
+    /// With the same-state verify on: what the last setup or refresh of this pipeline resolved
+    /// its textures to (image view and sampler ids) and which guest constant buffers it bound
+    /// (address and size of every enabled slot).
+    struct SetupFingerprint {
+        u64 textures{};
+        u64 uniforms{};
+    };
+    [[nodiscard]] SetupFingerprint LastSetupFingerprint() const noexcept {
+        return last_fingerprint;
     }
 
     enum class ConfigureResult {
@@ -302,6 +325,7 @@ private:
     /// The last full setup's image views and samplers (RefreshBuffers).
     std::vector<VideoCommon::ImageViewInOut> last_views;
     std::vector<VideoCommon::SamplerId> last_samplers;
+    SetupFingerprint last_fingerprint{}; ///< same-state verify only
 
     /// Texture set (EDEN_NX2_BINDLESS): what the textures of the last full setup that resolved
     /// them came to. Later setups with the same handles reuse it while it is current
