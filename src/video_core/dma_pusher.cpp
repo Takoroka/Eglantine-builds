@@ -146,7 +146,7 @@ void ReportListStats() {
              On(Common::Nx2Ab::ListWriterWaitSkip) ? "on" : "off",
              On(Common::Nx2Ab::SemAcquireOnBack) ? "on" : "off",
              On(Common::Nx2Ab::ListFlushBatch) ? "on" : "off",
-             On(Common::Nx2Ab::IndirectDrawMacro) ? "on" : "off",
+             Nx2IndirectDrawMacro() ? "on" : "off",
              On(Common::Nx2Ab::IndirectDrawMacroExtended) ? "on" : "off", indirect_draws,
              indirect_barriers, indirect_checked, indirect_odd, extended_draws, extended_rechecks,
              extended_compared, extended_mismatched, extended_fallbacks, barriers_skipped,

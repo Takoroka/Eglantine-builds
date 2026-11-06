@@ -97,8 +97,13 @@ inline void Nx2MarkCommandListPage(u64 device_address) {
 // bit IndirectDrawMacro the back draws from them on the GPU instead of the front reading them.
 // EDEN_NX2_INDIRECT_MACRO_VERIFY=1: read them and run the macro as before, and count the calls
 // the bit would have drawn from the GPU and the arguments it couldn't have given the same way.
+// Opt-in (EDEN_NX2_INDIRECT_MACRO=1): no game measured feeds this macro GPU-written arguments.
+inline const bool g_nx2_indirect_macro = [] {
+    const char* value = std::getenv("EDEN_NX2_INDIRECT_MACRO");
+    return value != nullptr && value[0] == '1';
+}();
 [[nodiscard]] inline bool Nx2IndirectDrawMacro() {
-    return Common::Nx2Ab::On(Common::Nx2Ab::IndirectDrawMacro);
+    return g_nx2_indirect_macro && Common::Nx2Ab::On(Common::Nx2Ab::IndirectDrawMacro);
 }
 // Donkey Kong Bananza's are its extended variant, which also writes the base vertex and instance
 // to the selected constant buffer (+0x640, +0x644) for the shaders, and zeros them after the
