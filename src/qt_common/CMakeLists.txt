@@ -26,6 +26,7 @@ add_library(qt_common STATIC
     util/compress.h util/compress.cpp
     util/fs.h util/fs.cpp
     util/mod.h util/mod.cpp
+    util/mod_list.h util/mod_list.cpp
     util/vk.h util/vk.cpp
 
     abstract/frontend.h abstract/frontend.cpp

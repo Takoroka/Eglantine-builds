@@ -12,6 +12,9 @@ namespace QtCommon::Compress {
 
 bool compressDir(QString fileCompressed, QString dir, const Options& options,
                  QtCommon::QtProgressCallback callback) {
+    if (!callback) {
+        callback = [](std::size_t, std::size_t) { return true; };
+    }
     // Create zip
     QuaZip zip(fileCompressed);
     QDir().mkpath(QFileInfo(fileCompressed).absolutePath());
@@ -182,6 +185,10 @@ QStringList extractDir(QString fileCompressed, QString dir, QtCommon::QtProgress
 }
 
 QStringList extractDir(QuaZip& zip, const QString& dir, QtCommon::QtProgressCallback callback) {
+    // The header defaults the callback to empty; calling that threw std::bad_function_call.
+    if (!callback) {
+        callback = [](std::size_t, std::size_t) { return true; };
+    }
     if (!zip.open(QuaZip::mdUnzip)) {
         return QStringList();
     }

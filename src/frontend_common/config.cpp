@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
@@ -23,6 +24,23 @@
 #include "common/assert.h"
 
 namespace FS = Common::FS;
+
+namespace {
+// Collapses doubled slashes in paths, but keeps the one after a URL scheme ("https://"), which
+// has two or more letters where a drive ("C:") has one.
+void CollapseSlashes(std::string& value) {
+    std::size_t start = 0;
+    const auto scheme_end = value.find("://");
+    if (scheme_end != std::string::npos && scheme_end >= 2 &&
+        std::all_of(value.begin(), value.begin() + scheme_end,
+                    [](char c) { return std::isalpha(static_cast<unsigned char>(c)) != 0; })) {
+        start = scheme_end + 3;
+    }
+    for (auto pos = value.find("//", start); pos != std::string::npos; pos = value.find("//", pos)) {
+        value.erase(pos, 1);
+    }
+}
+} // Anonymous namespace
 
 Config::Config(const ConfigType config_type)
     : type(config_type), global{config_type == ConfigType::GlobalConfig} {}
@@ -815,7 +833,7 @@ std::string Config::ReadStringSetting(const std::string& key,
             config->GetValue(GetSection().c_str(), full_key.c_str(), default_value.value().c_str());
     }
     boost::replace_all(result, "\"", "");
-    boost::replace_all(result, "//", "/");
+    CollapseSlashes(result);
     return result;
 }
 
@@ -1009,7 +1027,7 @@ std::string Config::AdjustOutputString(const std::string& string) {
         boost::replace_all(adjusted_string, "//", "/");
         adjusted_string.insert(0, "/");
     } else {
-        boost::replace_all(adjusted_string, "//", "/");
+        CollapseSlashes(adjusted_string);
     }
 #endif
 

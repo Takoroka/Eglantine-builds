@@ -607,11 +607,6 @@ struct Values {
     SwitchableSetting<bool> use_video_framerate{linkage, false, "use_video_framerate",
                                                 Category::RendererAdvanced};
 
-    // Mario Kart World: select a fixed or dynamic in-game frame-rate mode (loader/nso.cpp).
-    SwitchableSetting<bool> mkw_30fps{linkage, false, "mkw_30fps", Category::RendererAdvanced};
-    SwitchableSetting<bool> mkw_dynamic_fps{linkage, false, "mkw_dynamic_fps",
-                                            Category::RendererAdvanced};
-
     SwitchableSetting<bool> use_reactive_flushing{linkage,
 #ifdef __ANDROID__
                                                   false,
@@ -955,6 +950,10 @@ struct Values {
                                      Category::WebService};
     Setting<std::string> eden_username{linkage, "Eden", "eden_username",
                                        Category::WebService};
+    // The GitHub repository the Mod List window reads mods.json and the mods from.
+    Setting<std::string> mod_list_repo_url{
+        linkage, "https://github.com/Takoroka/Eglantine-Mods", "mod_list_repo_url",
+        Category::WebService};
     Setting<std::string> eden_token{linkage, "",
                                     "eden_token", Category::WebService};
 

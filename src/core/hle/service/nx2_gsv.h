@@ -2383,8 +2383,7 @@ private:
     // timing: present word 12, (swap interval << 16) | refresh rate. Fire Emblem: Fortune's Weave
     // sends 0x1003c during its boot logos and 0x2003c (two vblanks per frame, 30 fps) after; paced
     // at every vblank it ran at double speed. EDEN_NX2_SWAP_INTERVAL=<n> forces the interval.
-    // Returns how long the frame is shown (interval vblanks at the speed limit), on the present's
-    // thread (it reads the current process).
+    // Returns how long the frame is shown (interval vblanks at the speed limit).
     static u32 ForcedSwapInterval() {
         static const u32 forced_interval = [] {
             const char* value = std::getenv("EDEN_NX2_SWAP_INTERVAL");
@@ -2395,17 +2394,8 @@ private:
 
     std::chrono::nanoseconds FrameInterval(u32 timing, u32& swap_interval) {
         const u32 forced_interval = ForcedSwapInterval();
-        const auto& process = Kernel::GetCurrentProcess(kernel);
-        const bool mkw_dynamic =
-            process.GetProgramId() == Settings::MarioKartWorldProgramId &&
-            process.IsMkwDynamicFpsPatchApplied() && Settings::values.mkw_dynamic_fps.GetValue();
-        swap_interval = std::clamp<u32>(timing >> 16, 1, 4);
-        if (mkw_dynamic) {
-            swap_interval = 1;
-        }
-        if (forced_interval != 0) {
-            swap_interval = forced_interval;
-        }
+        swap_interval =
+            forced_interval != 0 ? forced_interval : std::clamp<u32>(timing >> 16, 1, 4);
         const u32 refresh_rate = (timing & 0xffff) >= 30 && (timing & 0xffff) <= 240 ? timing & 0xffff : 60;
         if (timing != std::exchange(m_swap_word, timing)) {
             LOG_INFO(Service, "nx2:vi2 present #{} swap interval {} at {} Hz (word 12 = {:#x})",

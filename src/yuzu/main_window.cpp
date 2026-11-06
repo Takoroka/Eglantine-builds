@@ -42,6 +42,7 @@
 #include "ryujinx_dialog.h"
 #include "set_play_time_dialog.h"
 #include "util/util.h"
+#include "qt_common/game_list/game_list_p.h"
 #include "yuzu/game/game_list.h"
 #include "yuzu/nup_dialogs.h"
 
@@ -56,6 +57,7 @@
 #include "configuration/configure_input.h"
 #include "configuration/configure_per_game.h"
 #include "configuration/configure_tas.h"
+#include "configuration/mod_list_dialog.h"
 
 #include "util/clickable_label.h"
 #include "util/controller_navigation.h"
@@ -1645,6 +1647,7 @@ void MainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_About, &MainWindow::OnAbout);
     connect_menu(ui->action_Eden_Dependencies, &MainWindow::OnEdenDependencies);
     connect_menu(ui->action_Data_Manager, &MainWindow::OnDataDialog);
+    connect_menu(ui->action_Mod_List, &MainWindow::OnModList);
 }
 
 void MainWindow::UpdateMenuState() {
@@ -4030,6 +4033,33 @@ void MainWindow::OnDataDialog() {
 
     // refresh stuff in case it was cleared
     OnGameListRefresh();
+}
+
+void MainWindow::OnModList() {
+    // The games the game list found; the mod list shows only mods for them.
+    std::vector<ModListDialog::Game> games;
+    const auto* model = game_list->GetModel();
+    const auto add_games = [&](const auto& self, const QModelIndex& parent) -> void {
+        for (int row = 0; row < model->rowCount(parent); ++row) {
+            const auto item = model->index(row, 0, parent);
+            const u64 program_id = item.data(GameListItemPath::ProgramIdRole).toULongLong();
+            if (program_id != 0 &&
+                std::none_of(games.begin(), games.end(), [program_id](const auto& game) {
+                    return game.title_id == program_id;
+                })) {
+                games.push_back({program_id, item.data(GameListItemPath::TitleRole).toString()});
+            }
+            self(self, item);
+        }
+    };
+    add_games(add_games, QModelIndex{});
+
+    ModListDialog dialog(std::move(games), this);
+    dialog.exec();
+    config->SaveAllValues();
+    if (dialog.Changed()) {
+        OnGameListRefresh();
+    }
 }
 
 void MainWindow::OnToggleFilterBar() {
