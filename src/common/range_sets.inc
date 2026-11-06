@@ -233,6 +233,17 @@ bool RangeSet<AddressType>::Intersects(AddressType base_address, size_t size) co
 }
 
 template <typename AddressType>
+bool RangeSet<AddressType>::Covers(AddressType base_address, size_t size) const {
+    const auto& set = m_impl->m_ranges_set;
+    if (set.empty() || size == 0) {
+        return false;
+    }
+    const AddressType end_address = base_address + static_cast<AddressType>(size);
+    const auto it = set.lower_bound(typename RangeSetImpl::IntervalType{base_address, end_address});
+    return it != set.end() && it->lower() <= base_address && end_address <= it->upper();
+}
+
+template <typename AddressType>
 bool RangeSet<AddressType>::FreeGap(AddressType base_address, size_t size, AddressType& gap_begin,
                                     AddressType& gap_end) const {
     const auto& set = m_impl->m_ranges_set;

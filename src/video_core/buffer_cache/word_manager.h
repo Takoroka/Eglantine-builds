@@ -123,6 +123,11 @@ struct WordManager {
     /// @param dirty_addr    Base address to mark or unmark as modified
     /// @param size          Size in bytes to mark or unmark as modified
     void ChangeRegionState(Type type, bool enable, u64 dirty_addr, u64 size) noexcept {
+        // Anything but GPU marks and unmarking CPU modified pages can leave a page CPU modified or
+        // untracked: no longer CPU clean.
+        if (type != Type::GPU && type != Type::Preflushable && (type != Type::CPU || enable)) {
+            ++dirty_generation;
+        }
         std::span<u64> state_words = Span(type);
         [[maybe_unused]] std::span<u64> untracked_words = Span(Type::Untracked);
         [[maybe_unused]] std::span<u64> cached_words = Span(Type::CachedCPU);
@@ -136,6 +141,7 @@ struct WordManager {
                 // the GPU writes is tracked again first, and marked for an upload of the guest's
                 // writes since the last one.
                 const u64 demoted = Span(Type::Hot)[index] & mask;
+                ++dirty_generation;
                 Span(Type::Hot)[index] &= ~demoted;
                 Span(Type::CPU)[index] |= demoted;
                 CollectChangedRanges(true, index, untracked_words[index], demoted, demoted_ranges);
@@ -221,16 +227,22 @@ struct WordManager {
         auto const cold_words = Span(Type::Cold);
         auto const cpu_words = Span(Type::CPU);
         u64 any = 0;
+        u64 rearmed = 0;
         for (size_t index = 0; index < num_words; ++index) {
             cpu_words[index] |= hot_words[index];
+            rearmed |= hot_words[index];
             // Pages kept cold keep the manager listed until the next demotion clears them.
             any |= hot_words[index] | cold_words[index];
+        }
+        if (rearmed != 0) {
+            ++dirty_generation;
         }
         return any != 0;
     }
 
     /// @brief Hot pages become ordinary untracked CPU modified pages: the next upload protects them
     void DemoteHotPages() noexcept {
+        ++dirty_generation;
         auto const hot_words = Span(Type::Hot);
         auto const cpu_words = Span(Type::CPU);
         for (size_t index = 0; index < num_words; ++index) {
@@ -422,6 +434,9 @@ struct WordManager {
         std::vector<std::pair<VAddr, u64>> ranges;
         for (u64 word_index = 0; word_index < num_words; ++word_index) {
             const u64 cached_bits = cached_words[word_index];
+            if (cached_bits != 0) {
+                ++dirty_generation;
+            }
             CollectChangedRanges(false, word_index, untracked_words[word_index], cached_bits, ranges);
             untracked_words[word_index] |= cached_bits;
             cpu_words[word_index] |= cached_bits;
@@ -494,6 +509,9 @@ struct WordManager {
     std::array<u64, size_t(Type::Max) * num_words> heap = {};
     DeviceTracker* tracker = nullptr;
     VAddr cpu_addr = 0;
+    /// Bumped by every change that can leave a page CPU modified or untracked (IsRegionCpuClean
+    /// false); BufferCache::IsRangeCpuClean trusts an earlier clean answer while it is unchanged.
+    u64 dirty_generation = 0;
     bool hot_pages_enabled = false; ///< Set by the memory tracker
     bool has_hot = false;           ///< A page became hot since the tracker last looked
     bool has_recent = false;        ///< A page was remembered as recently uploaded

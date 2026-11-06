@@ -32,6 +32,10 @@ enum Feature : u64 {
     // hosttime (11-06): vertex streams bind a range resolved before without resolving it again
     // while the mappings and buffers are as then (BufferCache::vertex_lookups).
     VertexLookupCache = 1ull << 45,
+    // backperf (11-06): a buffer range found CPU clean stays clean without a new check while none of
+    // its tracking regions turned a page dirty (BufferCache::IsRangeCpuClean); written ranges the
+    // GPU-modified sets cover already aren't added again.
+    BufferCheckSkip = 1ull << 46,
     ListDrawRanges = 1ull << 48,     ///< Lists on pages draws write: past the draws' ranges (nx2.h)
     ListWriterWaitSkip = 1ull << 49, ///< Known CPU list pages skip the wait for writers (dma_pusher)
     SemAcquireOnBack = 1ull << 50,   ///< SEM_EXECUTE acquires checked on the back, no drain (puller)

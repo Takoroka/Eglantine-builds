@@ -544,6 +544,10 @@ private:
 
     bool SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size);
 
+    /// MemoryTracker::IsRegionCpuClean, answered from clean_ranges while the range's tracking
+    /// regions saw no change that can dirty a page (A/B bit BufferCheckSkip)
+    bool IsRangeCpuClean(DAddr device_addr, u32 size);
+
     void UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
                       std::span<BufferCopy> copies);
 
@@ -700,6 +704,24 @@ private:
     /// Areas known to hold no range of gpu_modified_ranges (IsRegionGpuModified), round robin
     std::array<std::pair<DAddr, DAddr>, 4> gpu_unmodified_gaps{};
     size_t next_gpu_unmodified_gap = 0;
+
+    /// Ranges spanning several tracking words that were found CPU clean, with the dirty
+    /// generation of their regions then (IsRangeCpuClean); direct mapped by address and size.
+    struct CleanRange {
+        DAddr device_addr{};
+        u64 size{};
+        u64 generation{};
+    };
+    std::array<CleanRange, 512> clean_ranges{};
+    u32 clean_ranges_epoch = 0;
+    struct BufferCheckStats {
+        u64 checks{};    ///< Multi-word clean checks
+        u64 skipped{};   ///< ... answered from clean_ranges
+        u64 mismatches{}; ///< ... where the full check disagreed (EDEN_NX2_BUFCHECK_VERIFY=1)
+        u64 adds{};      ///< Written ranges for the GPU-modified sets
+        u64 covered{};   ///< ... already covered there
+        u32 calls{};
+    } buffer_check_stats;
 
     // Async Buffers
     std::deque<std::optional<Async_Buffer>> async_buffers;

@@ -16,6 +16,7 @@
 #include <vector>
 #include <fmt/ranges.h>
 
+#include "common/nx2_ab.h"
 #include "common/range_sets.inc"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
@@ -1037,6 +1038,14 @@ bool BufferCache<P>::IsRegionGpuModified(DAddr addr, size_t size) {
 
 template <class P>
 void BufferCache<P>::AddGpuModifiedRange(DAddr device_addr, u64 size) {
+    ++buffer_check_stats.adds;
+    // Draws and dispatches write the same ranges over and over: one the set covers already changes
+    // neither the set nor the known gaps (they lie outside it).
+    if (Common::Nx2Ab::On(Common::Nx2Ab::BufferCheckSkip) &&
+        gpu_modified_ranges.Covers(device_addr, size)) {
+        ++buffer_check_stats.covered;
+        return;
+    }
     gpu_modified_ranges.Add(device_addr, size);
     // Ranges only leave the set otherwise: known gaps stay gaps until a range is added in them.
     for (auto& gap : gpu_unmodified_gaps) {
@@ -2048,7 +2057,10 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     MarkVertexBuffersStale(device_addr, size);
     AddGpuModifiedRange(device_addr, size);
     if (DownloadsAtFence(device_addr, size)) {
-        uncommitted_gpu_modified_ranges.Add(device_addr, size);
+        if (!Common::Nx2Ab::On(Common::Nx2Ab::BufferCheckSkip) ||
+            !uncommitted_gpu_modified_ranges.Covers(device_addr, size)) {
+            uncommitted_gpu_modified_ranges.Add(device_addr, size);
+        }
     } else {
         ArmReadTraps(device_addr, size);
     }
@@ -2739,7 +2751,7 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
     // Most binds find nothing to upload. Look at the range's tracking bits first: walking it for
     // upload ranges (and collecting pages to track again) was ~2% of Mario Kart World's split GPU
     // back thread even where nothing changed.
-    if (memory_tracker.IsRegionCpuClean(device_addr, size)) {
+    if (IsRangeCpuClean(device_addr, size)) {
         return true;
     }
     if (use_optimized_vertex_buffers) {
@@ -2799,6 +2811,64 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
         UploadMemory(buffer, total_size_bytes, largest_copy, copies_span);
         return false;
     }
+}
+
+template <class P>
+bool BufferCache<P>::IsRangeCpuClean(DAddr device_addr, u32 size) {
+    // A range inside one tracking word is a single word check already.
+    if (size == 0 || device_addr / BYTES_PER_WORD == (device_addr + size - 1) / BYTES_PER_WORD) {
+        return memory_tracker.IsRegionCpuClean(device_addr, size);
+    }
+    static const bool verify = [] {
+        const char* value = std::getenv("EDEN_NX2_BUFCHECK_VERIFY");
+        return value != nullptr && value[0] == '1';
+    }();
+    static const bool stats = [] {
+        const char* value = std::getenv("EDEN_NX2_BUFCHECK_STATS");
+        return verify || (value != nullptr && value[0] == '1');
+    }();
+    BufferCheckStats& counts = buffer_check_stats;
+    ++counts.checks;
+    if (stats && (++counts.calls & 4095) == 0) {
+        static auto last_log = std::chrono::steady_clock::now();
+        static BufferCheckStats last{};
+        if (const auto now = std::chrono::steady_clock::now();
+            now - last_log >= std::chrono::seconds{30}) {
+            LOG_INFO(HW_GPU,
+                     "nx2 bufcheck (skip {}): last 30 s {} multi-word clean checks, {} from the "
+                     "table, {} verify mismatches; {} written ranges, {} already covered",
+                     Common::Nx2Ab::On(Common::Nx2Ab::BufferCheckSkip) ? "on" : "off",
+                     counts.checks - last.checks, counts.skipped - last.skipped,
+                     counts.mismatches - last.mismatches, counts.adds - last.adds,
+                     counts.covered - last.covered);
+            last = counts;
+            last_log = now;
+        }
+    }
+    if (!Common::Nx2Ab::On(Common::Nx2Ab::BufferCheckSkip)) {
+        return memory_tracker.IsRegionCpuClean(device_addr, size);
+    }
+    if (const u32 epoch = Common::Nx2Ab::Epoch(); epoch != clean_ranges_epoch) {
+        clean_ranges_epoch = epoch;
+        clean_ranges.fill({});
+    }
+    CleanRange& entry =
+        clean_ranges[((device_addr >> 8) ^ (device_addr >> 20) ^ size) % clean_ranges.size()];
+    const u64 generation = memory_tracker.DirtyGeneration(device_addr, size);
+    if (entry.device_addr == device_addr && entry.size == size && entry.generation == generation) {
+        ++counts.skipped;
+        if (verify && !memory_tracker.IsRegionCpuClean(device_addr, size)) {
+            ++counts.mismatches;
+            entry = {};
+            return false;
+        }
+        return true;
+    }
+    if (!memory_tracker.IsRegionCpuClean(device_addr, size)) {
+        return false;
+    }
+    entry = {device_addr, size, generation};
+    return true;
 }
 
 template <class P>
