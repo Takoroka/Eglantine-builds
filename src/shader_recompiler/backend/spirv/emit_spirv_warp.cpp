@@ -90,10 +90,30 @@ Id GuestLane(EmitContext& ctx, Id index) {
     return ctx.OpBitwiseAnd(ctx.U32[1], index, ctx.Const(31U));
 }
 
+bool HasBrokenShuffle(EmitContext& ctx) {
+    if (ctx.profile.has_broken_spirv_subgroup_shuffle) {
+        return true;
+    }
+    // AMD's compiler: the vertex to fragment stages. Compute, task and mesh shuffle correctly.
+    switch (ctx.stage) {
+    case Stage::VertexA:
+    case Stage::VertexB:
+    case Stage::TessellationControl:
+    case Stage::TessellationEval:
+    case Stage::Geometry:
+    case Stage::Fragment:
+        return ctx.profile.has_broken_graphics_subgroup_shuffle;
+    default:
+        return false;
+    }
+}
+
 Id ShuffleAbsolute(EmitContext& ctx, Id value, Id src_thread_id) {
-    if (!ctx.profile.has_broken_spirv_subgroup_shuffle) {
+    if (!HasBrokenShuffle(ctx)) {
         return ctx.OpGroupNonUniformShuffle(ctx.U32[1], SubgroupScope(ctx), value, src_thread_id);
     }
+    // Every host lane is broadcast and the one asked for is selected. The loop covers the
+    // largest subgroup the stage can run with (64 lanes on AMD), so it needs no fixed size.
     Id result{ctx.u32_zero_value};
     for (u32 lane = 0; lane < ctx.profile.max_subgroup_size; ++lane) {
         const Id read{
