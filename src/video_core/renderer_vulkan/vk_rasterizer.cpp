@@ -364,6 +364,12 @@ u32 RasterizerVulkan::RepeatRefusal(bool is_indexed) const {
     const auto& serials = maxwell3d->same_state_serials;
     u32 refusal = repeat.valid ? 0 : RefusalNoPrevious;
     refusal |= serials[Maxwell3D::SameStateOther] != repeat.serials[Maxwell3D::SameStateOther] ? RefusalRegisters : 0;
+    // Values only dynamic states read: a repeat updates those states too (UpdateDynamicStates).
+    if (!Common::Nx2Ab::On(Common::Nx2Ab::DynamicDeltas)) {
+        refusal |= serials[Maxwell3D::SameStateDynamic] != repeat.serials[Maxwell3D::SameStateDynamic]
+                       ? RefusalRegisters
+                       : 0;
+    }
     refusal |= serials[Maxwell3D::SameStateUniforms] != repeat.serials[Maxwell3D::SameStateUniforms] ? RefusalUniforms : 0;
     refusal |= serials[Maxwell3D::SameStateGeometry] != repeat.serials[Maxwell3D::SameStateGeometry] ? RefusalGeometry : 0;
     refusal |= VideoCommon::GpuSplit::Get().BackEvents() != repeat.back_events ? RefusalBackEvents : 0;

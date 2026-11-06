@@ -24,6 +24,9 @@ namespace Common::Nx2Ab {
 enum Feature : u64 {
     // fences (11-05): direct draws with no vertices or no instances skip the draw setup.
     ZeroDrawSkip = 1ull << 40,
+    // hosttime (11-06): writes of values only dynamic states read leave the next draw the repeat
+    // path (Maxwell3D::SameStateDynamic).
+    DynamicDeltas = 1ull << 44,
 };
 
 inline const u64 g_mask = [] {

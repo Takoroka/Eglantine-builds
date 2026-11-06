@@ -94,6 +94,25 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
         set_kind(0x600 / sizeof(u32) + index * 2, 2, SameStateGeometry);
     }
     set_kind(MAXWELL3D_REG_INDEX(index_buffer.start_addr_high), 4, SameStateGeometry);
+    // Values only dynamic states read, on every device: viewport scales and offsets (not their
+    // swizzles, which are in the pipeline key), scissors, depth bias values, blend constants,
+    // stencil references and masks, line widths. Not the depth bounds (in the pipeline key) or
+    // any enable or op (in the key without the extended dynamic states).
+    for (size_t index = 0; index < Regs::NumViewports; ++index) {
+        set_kind(MAXWELL3D_REG_INDEX(viewport_transform) + index * sizeof(Regs::ViewportTransform) / sizeof(u32),
+                 6, SameStateDynamic);
+    }
+    set_kind(MAXWELL3D_REG_INDEX(scissor_test), sizeof(regs.scissor_test) / sizeof(u32), SameStateDynamic);
+    for (const size_t method : {MAXWELL3D_REG_INDEX(depth_bias), MAXWELL3D_REG_INDEX(slope_scale_depth_bias),
+                                MAXWELL3D_REG_INDEX(depth_bias_clamp), MAXWELL3D_REG_INDEX(stencil_front_ref),
+                                MAXWELL3D_REG_INDEX(stencil_front_mask), MAXWELL3D_REG_INDEX(stencil_front_func_mask),
+                                MAXWELL3D_REG_INDEX(stencil_back_ref), MAXWELL3D_REG_INDEX(stencil_back_mask),
+                                MAXWELL3D_REG_INDEX(stencil_back_func_mask),
+                                MAXWELL3D_REG_INDEX(line_width_smooth),
+                                MAXWELL3D_REG_INDEX(line_width_aliased)}) {
+        same_state_kinds[method] = SameStateDynamic;
+    }
+    set_kind(MAXWELL3D_REG_INDEX(blend_color), sizeof(regs.blend_color) / sizeof(u32), SameStateDynamic);
     // State runs from the split's front skip ProcessDirtyRegisters: each carries the kinds its
     // changing writes are, and the back bumps those serials once per run (OnStateRunTags).
     for (size_t method = 0; method < Regs::NUM_REGS; ++method) {
