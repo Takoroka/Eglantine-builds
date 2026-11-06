@@ -1781,16 +1781,29 @@ bool Maxwell3D::FrontIndirectDrawMacro(Core::System& system, VideoCommon::GpuSpl
     // The topology, nothing else, came in the entry before. A macro call sends its first
     // parameter to the macro's even method and the rest to the odd one after it (increment
     // once): the same macro.
-    if (fs.executing_macro < MacroRegistersStart ||
-        (fs.executing_macro - MacroRegistersStart) >> 1 != (method - MacroRegistersStart) >> 1 ||
-        fs.parameters.size() != 1 ||
-        (fs.parameters[0] & ~0xffffU) != 0 ||
-        !IndirectTopologySafe(static_cast<Regs::PrimitiveTopology>(fs.parameters[0]))) {
-        return false;
-    }
     auto& engine = GetNativeMacroEngine();
     const auto positions = GetNativeMacroPositions();
     const u32 start = positions[((method - MacroRegistersStart) >> 1) % positions.size()];
+    // The first few calls turned down, and why.
+    const auto turned_down = [&](const char* why) {
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1) < 16) {
+            LOG_INFO(HW_GPU,
+                     "Indirect draw macro: method {:#x} (start {:#x}) not taken: {}; running "
+                     "macro {:#x}, {} parameters, first {:#x}",
+                     method, start, why, fs.executing_macro, fs.parameters.size(),
+                     fs.parameters.empty() ? 0U : fs.parameters[0]);
+        }
+        return false;
+    };
+    if (fs.executing_macro < MacroRegistersStart ||
+        (fs.executing_macro - MacroRegistersStart) >> 1 != (method - MacroRegistersStart) >> 1) {
+        return turned_down("another macro runs");
+    }
+    if (fs.parameters.size() != 1 || (fs.parameters[0] & ~0xffffU) != 0 ||
+        !IndirectTopologySafe(static_cast<Regs::PrimitiveTopology>(fs.parameters[0]))) {
+        return turned_down("not one parameter with a topology Vulkan draws indirectly");
+    }
     if (fs.indirect_macros_generation != engine.native_code_generation) {
         fs.indirect_macros.clear();
         fs.indirect_macros_generation = engine.native_code_generation;
@@ -1804,7 +1817,7 @@ bool Maxwell3D::FrontIndirectDrawMacro(Core::System& system, VideoCommon::GpuSpl
                                 engine.native_code.begin() + first);
     }
     if (!it->second) {
-        return false;
+        return turned_down("other code");
     }
     if (g_nx2_indirect_macro_verify || !Nx2IndirectDrawMacro()) {
         // Read and run as before; FrontCallMultiMethod checks the words.

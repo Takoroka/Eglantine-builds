@@ -775,13 +775,29 @@ bool DmaPusher::IndirectDrawMacro(const CommandListHeader& header) {
     if (header.size != 5 || dma_state.method_count != 5 || !dma_state.non_incrementing ||
         command_resume_offset != 0 || dma_state.method < MacroRegistersStart ||
         subchannel_type[dma_state.subchannel] != Engines::EngineTypes::Maxwell3D) {
+        // The first few short GPU-written entries this turns down, and why.
+        static std::atomic<u32> logged{};
+        if (header.size <= 8 && logged.fetch_add(1) < 24) {
+            LOG_INFO(HW_GPU,
+                     "Indirect draw macro: entry {:#x} ({} words) not taken: method {:#x}, {} "
+                     "words left, non-incrementing {}, resume offset {}, engine {}",
+                     u64{header.addr}, u64{header.size}, dma_state.method,
+                     dma_state.method_count, dma_state.non_incrementing, command_resume_offset,
+                     static_cast<u32>(subchannel_type[dma_state.subchannel]));
+        }
         return false;
     }
     auto& split = VideoCommon::GpuSplit::Get();
     auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannels[dma_state.subchannel]);
     if (!split.Active() || !split.FrontMacros() || maxwell3d == nullptr ||
-        !maxwell3d->GetNativeMacroEngine().native_turing ||
-        !maxwell3d->FrontIndirectDrawMacro(system, split, dma_state.method, dma_state.dma_get)) {
+        !maxwell3d->GetNativeMacroEngine().native_turing) {
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1) < 4) {
+            LOG_INFO(HW_GPU, "Indirect draw macro: not taken, macros don't run on the front");
+        }
+        return false;
+    }
+    if (!maxwell3d->FrontIndirectDrawMacro(system, split, dma_state.method, dma_state.dma_get)) {
         return false;
     }
     dma_state.method_count = 0;
