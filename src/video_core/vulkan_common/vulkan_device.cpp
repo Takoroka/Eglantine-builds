@@ -24,6 +24,7 @@
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/literals.h"
+#include "common/nx2_ab.h"
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -425,6 +426,16 @@ u64 AllocatedUsage(VkDeviceSize driver_usage, const VmaBudget& vma_budget) {
     return driver_usage - (std::min)(driver_usage, unused);
 }
 
+/// Swapchain::Present may leave the submit lock (A/B bit PresentOwnQueue; off for the whole run,
+/// no second queue either). Not on Android, where nobody has tried it on the drivers there.
+bool WantsOwnPresentQueue() {
+#ifdef __ANDROID__
+    return false;
+#else
+    return Common::Nx2Ab::On(Common::Nx2Ab::PresentOwnQueue);
+#endif
+}
+
 } // Anonymous namespace
 
 void Device::RemoveExtension(bool& extension, const std::string& extension_name) {
@@ -798,6 +809,24 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         Streamline::Stop();
     }
 #endif
+
+    // A present that blocks for a vblank (FIFO) holds the submit lock for as long when it goes to
+    // the graphics queue, and the scheduler's submits and sparse binds wait (Swapchain::Present).
+    // Idea: nemyu-emulator/nemyu 83bb1cf469.
+    if (present_choice.own_queue) {
+        own_present_queue = logical.GetQueue(present_family, present_choice.present_index);
+    }
+    if (HasOwnPresentQueue()) {
+        LOG_INFO(Render_Vulkan, "Presenting on queue {} of family {}, apart from the graphics queue "
+                 "(family {}) and its submit lock (A/B bit PresentOwnQueue)",
+                 present_choice.present_index, present_family, graphics_family);
+    } else {
+        LOG_INFO(Render_Vulkan, "Presenting on queue 0 of family {} under the submit lock: {}",
+                 present_family,
+                 streamline_attached    ? "NVIDIA Streamline hooks the present"
+                 : !WantsOwnPresentQueue() ? "A/B bit PresentOwnQueue is off (or Android)"
+                                           : "the graphics family has a single queue");
+    }
 
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr = dld.vkGetInstanceProcAddr;
@@ -1727,6 +1756,10 @@ void Device::SetupFamilies(VkSurfaceKHR surface) {
     if (present) {
         present_family = *present;
     }
+    // Swapchain::Present (WantsOwnPresentQueue).
+    present_choice = ChoosePresentQueue(graphics_family, present_family,
+                                        queue_family_properties[graphics_family].queueCount,
+                                        WantsOwnPresentQueue());
 }
 
 bool Device::TryReserveCustomBorderColorSamplers(size_t count) const {
@@ -1896,22 +1929,24 @@ void Device::CollectToolingInfo() {
 }
 
 std::vector<VkDeviceQueueCreateInfo> Device::GetDeviceQueueCreateInfos() const {
-    static constexpr float QUEUE_PRIORITY = 1.0f;
+    static constexpr std::array<float, 2> QUEUE_PRIORITIES{1.0f, 1.0f};
 
     ::Common::unordered_set<u32> unique_queue_families{graphics_family, present_family};
     std::vector<VkDeviceQueueCreateInfo> queue_cis;
     queue_cis.reserve(unique_queue_families.size());
 
     for (const u32 queue_family : unique_queue_families) {
+        // The graphics family may get a second queue for presents (present_choice).
         auto& ci = queue_cis.emplace_back(VkDeviceQueueCreateInfo{
             .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
             .pNext = nullptr,
             .flags = 0,
             .queueFamilyIndex = queue_family,
-            .queueCount = 1,
+            .queueCount =
+                queue_family == graphics_family ? present_choice.graphics_queue_count : 1,
             .pQueuePriorities = nullptr,
         });
-        ci.pQueuePriorities = &QUEUE_PRIORITY;
+        ci.pQueuePriorities = QUEUE_PRIORITIES.data();
     }
 
     return queue_cis;
