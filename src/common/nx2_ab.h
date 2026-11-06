@@ -59,6 +59,8 @@ enum Feature : u64 {
     CachedWriteOneLookup = 1ull << 59,
     WaitForIdleBarrier = 1ull << 60, ///< Waits for idle wait (a barrier), compute-to-draw barriers
                                      ///< (RasterizerVulkan::WaitForIdle, Scheduler)
+    PresentOwnQueue = 1ull << 61,    ///< Presents on a queue of their own, not under the scheduler's
+                                     ///< submit lock (Swapchain::Present)
     AcquireNoDrain = 1ull << 62,     ///< Semaphore acquires read ahead of the back, no drain (puller)
 };
 
