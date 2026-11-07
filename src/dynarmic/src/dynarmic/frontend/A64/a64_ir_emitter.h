@@ -205,6 +205,39 @@ public:
         return Inst<IR::U32>(Opcode::A64ExclusiveWriteMemory128, ImmCurrentLocationDescriptor(), vaddr, value, IR::Value{acc_type});
     }
 
+    /// Native LSE read-modify-write of `bytes` (1, 2, 4, 8) bytes; `op` is the o3:opc field of
+    /// LDADD..SWP. Returns the old value (U8..U64).
+    IR::UAny AtomicRMW(size_t bytes, const IR::U64& vaddr, const IR::UAny& operand, u8 op) noexcept {
+        switch (bytes) {
+        case 1:
+            return Inst<IR::U8>(Opcode::A64AtomicRMW8, ImmCurrentLocationDescriptor(), vaddr, operand, Imm8(op));
+        case 2:
+            return Inst<IR::U16>(Opcode::A64AtomicRMW16, ImmCurrentLocationDescriptor(), vaddr, operand, Imm8(op));
+        case 4:
+            return Inst<IR::U32>(Opcode::A64AtomicRMW32, ImmCurrentLocationDescriptor(), vaddr, operand, Imm8(op));
+        default:
+            return Inst<IR::U64>(Opcode::A64AtomicRMW64, ImmCurrentLocationDescriptor(), vaddr, operand, Imm8(op));
+        }
+    }
+
+    /// Native compare-and-swap of `bytes` (1, 2, 4, 8) bytes. Returns the old value.
+    IR::UAny AtomicCAS(size_t bytes, const IR::U64& vaddr, const IR::UAny& expected, const IR::UAny& desired) noexcept {
+        switch (bytes) {
+        case 1:
+            return Inst<IR::U8>(Opcode::A64AtomicCAS8, ImmCurrentLocationDescriptor(), vaddr, expected, desired);
+        case 2:
+            return Inst<IR::U16>(Opcode::A64AtomicCAS16, ImmCurrentLocationDescriptor(), vaddr, expected, desired);
+        case 4:
+            return Inst<IR::U32>(Opcode::A64AtomicCAS32, ImmCurrentLocationDescriptor(), vaddr, expected, desired);
+        default:
+            return Inst<IR::U64>(Opcode::A64AtomicCAS64, ImmCurrentLocationDescriptor(), vaddr, expected, desired);
+        }
+    }
+
+    IR::U128 AtomicCAS128(const IR::U64& vaddr, const IR::U128& expected, const IR::U128& desired) noexcept {
+        return Inst<IR::U128>(Opcode::A64AtomicCAS128, ImmCurrentLocationDescriptor(), vaddr, expected, desired);
+    }
+
     IR::U32 GetW(Reg reg) noexcept {
         if (reg == Reg::ZR)
             return Imm32(0);

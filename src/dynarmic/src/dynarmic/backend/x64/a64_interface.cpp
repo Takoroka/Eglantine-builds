@@ -21,6 +21,7 @@
 #include "dynarmic/backend/x64/a64_jitstate.h"
 #include "dynarmic/backend/x64/block_of_code.h"
 #include "dynarmic/backend/x64/code_cache_flush_log.h"
+#include "dynarmic/backend/x64/lse_atomics_stats.h"
 #include "dynarmic/backend/x64/devirtualize.h"
 #include "dynarmic/backend/x64/jitstate_info.h"
 #include "dynarmic/common/atomic.h"
@@ -90,6 +91,9 @@ public:
         const HaltReason hr = block_of_code.RunCode(&jit_state, current_code_ptr);
         PerformRequestedCacheInvalidation(hr);
         is_executing = false;
+        if (native_lse_atomics && (++runs_since_lse_flush & 255) == 0) {
+            LseStats::Flush(jit_state.lse_native_ops, lse_native_flushed);
+        }
         return hr;
     }
 
@@ -262,7 +266,9 @@ private:
         // LocationDescriptor ctor() does important ops (like tflags) do not skip
         auto const arch_descriptor = A64::LocationDescriptor{descriptor};
         ir_block.Reset(arch_descriptor);
-        A64::Translate(ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+        A64::TranslationOptions options{conf.define_unpredictable_behaviour, conf.wall_clock_cntpct};
+        options.native_lse_atomics = native_lse_atomics;
+        A64::Translate(ir_block, arch_descriptor, get_code, options);
         Optimization::Optimize(ir_block, conf, polyfill_options);
         return emitter.Emit(ir_block).entrypoint;
     }
@@ -302,6 +308,11 @@ private:
     std::mutex invalidation_mutex;
     // Last full clear of the code cache (or creation), for the "JIT code cache full" line.
     std::chrono::steady_clock::time_point cache_cleared_at = std::chrono::steady_clock::now();
+    // UserConfig::native_lse_atomics where it applies: fastmem for exclusives, no memory aborts.
+    const bool native_lse_atomics = conf.native_lse_atomics && conf.fastmem_pointer.has_value() &&
+                                    conf.fastmem_exclusive_access && !conf.check_halt_on_memory_access;
+    u64 runs_since_lse_flush = 0;
+    u64 lse_native_flushed = 0;
 };
 
 Jit::Jit(UserConfig conf)

@@ -56,6 +56,9 @@ struct A64JitState {
     std::array<u64, RSB_SIZE> rsb_location_descriptors;
     std::array<u64, RSB_SIZE> rsb_codeptrs;
 
+    // Native LSE atomics done in JIT code (UserConfig::native_lse_atomics), for LseStats.
+    u64 lse_native_ops = 0;
+
     u32 GetPstate() const {
         return NZCV::FromX64(cpsr_nzcv);
     }

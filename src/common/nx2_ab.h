@@ -55,6 +55,10 @@ enum Feature : u64 {
     // semaphore, instead of a bind and a fence wait each (Scheduler::BindSparse). The bind queue
     // (a transfer queue with sparse binding when there is one) is picked at device creation.
     SparseBindAsync = 1ull << 12,
+    // codegen (11-06, play-dkb7 idea 16): ARMv8.1 LSE atomics (LDADD..SWP, CAS, CASP) as one host
+    // atomic on the fastmem pointer instead of an exclusive load + store pair (Dynarmic
+    // UserConfig::native_lse_atomics). Read when a core's JIT is made.
+    LseAtomics = 1ull << 15,
     // fences (11-05): direct draws with no vertices or no instances skip the draw setup.
     ZeroDrawSkip = 1ull << 40,
     // vkoff (11-05): draws with none of the dynamic states' dirty flags set skip their updates.

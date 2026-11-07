@@ -18,6 +18,7 @@ add_executable(dynarmic_tests
     # A64
     A64/a64.cpp
     A64/fibonacci.cpp
+    A64/lse_atomics.cpp
     A64/fp_min_max.cpp
     A64/misaligned_page_table.cpp
     A64/test_invalidation.cpp

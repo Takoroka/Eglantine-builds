@@ -5,6 +5,8 @@
 
 #include <oaknut/oaknut.hpp>
 
+#include "common/assert.h"
+
 #include "dynarmic/backend/arm64/a64_jitstate.h"
 #include "dynarmic/backend/arm64/abi.h"
 #include "dynarmic/backend/arm64/emit_arm64.h"
@@ -123,6 +125,53 @@ void EmitIR<IR::Opcode::A64ExclusiveWriteMemory64>(oaknut::CodeGenerator& code, 
 template<>
 void EmitIR<IR::Opcode::A64ExclusiveWriteMemory128>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
     EmitExclusiveWriteMemory<128>(code, ctx, inst);
+}
+
+// Native LSE atomics (UserConfig::native_lse_atomics) are x64 only: this backend's frontend
+// options never ask for them.
+template<>
+void EmitIR<IR::Opcode::A64AtomicRMW8>(oaknut::CodeGenerator&, EmitContext&, IR::Inst*) {
+    UNREACHABLE();
+}
+
+template<>
+void EmitIR<IR::Opcode::A64AtomicRMW16>(oaknut::CodeGenerator&, EmitContext&, IR::Inst*) {
+    UNREACHABLE();
+}
+
+template<>
+void EmitIR<IR::Opcode::A64AtomicRMW32>(oaknut::CodeGenerator&, EmitContext&, IR::Inst*) {
+    UNREACHABLE();
+}
+
+template<>
+void EmitIR<IR::Opcode::A64AtomicRMW64>(oaknut::CodeGenerator&, EmitContext&, IR::Inst*) {
+    UNREACHABLE();
+}
+
+template<>
+void EmitIR<IR::Opcode::A64AtomicCAS8>(oaknut::CodeGenerator&, EmitContext&, IR::Inst*) {
+    UNREACHABLE();
+}
+
+template<>
+void EmitIR<IR::Opcode::A64AtomicCAS16>(oaknut::CodeGenerator&, EmitContext&, IR::Inst*) {
+    UNREACHABLE();
+}
+
+template<>
+void EmitIR<IR::Opcode::A64AtomicCAS32>(oaknut::CodeGenerator&, EmitContext&, IR::Inst*) {
+    UNREACHABLE();
+}
+
+template<>
+void EmitIR<IR::Opcode::A64AtomicCAS64>(oaknut::CodeGenerator&, EmitContext&, IR::Inst*) {
+    UNREACHABLE();
+}
+
+template<>
+void EmitIR<IR::Opcode::A64AtomicCAS128>(oaknut::CodeGenerator&, EmitContext&, IR::Inst*) {
+    UNREACHABLE();
 }
 
 }  // namespace Dynarmic::Backend::Arm64

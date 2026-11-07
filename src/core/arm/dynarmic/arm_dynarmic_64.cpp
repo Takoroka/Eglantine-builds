@@ -9,6 +9,7 @@
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
 #endif
+#include "common/nx2_ab.h"
 #include "common/settings.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
@@ -289,6 +290,9 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     // Multi-process state
     config.processor_id = std::uint8_t(m_core_index);
     config.global_monitor = &m_exclusive_monitor.monitor;
+    // ARMv8.1 LSE atomics as one host atomic (A/B bit 15); Dynarmic uses it only with fastmem
+    // exclusives and without memory-abort checks (the debugger).
+    config.native_lse_atomics = Common::Nx2Ab::On(Common::Nx2Ab::LseAtomics);
 
     // System registers
     config.tpidrro_el0 = &m_cb->m_tpidrro_el0;

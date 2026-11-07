@@ -38,6 +38,11 @@ struct TranslationOptions {
     /// If this is false, we treat the instruction as a NOP.
     /// If this is true, we emit an ExceptionRaised instruction.
     bool hook_hint_instructions = true;
+
+    /// If true, the ARMv8.1 LSE atomics (LDADD..SWP, CAS, CASP) are translated to the
+    /// A64AtomicRMW/A64AtomicCAS instructions, which the backend does with one host atomic on
+    /// the fastmem pointer. If false they are built from an exclusive load and store.
+    bool native_lse_atomics = false;
 };
 
 /**

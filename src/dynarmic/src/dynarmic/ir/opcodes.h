@@ -166,14 +166,34 @@ constexpr bool IsExclusiveMemoryWrite(const Opcode op) noexcept {
     }
 }
 
+/// @brief Determines whether or not this instruction is a native atomic read-modify-write
+/// (it reads and writes memory, without the exclusive monitor).
+constexpr bool IsAtomicMemoryOperation(const Opcode op) noexcept {
+    switch (op) {
+    case Opcode::A64AtomicRMW8:
+    case Opcode::A64AtomicRMW16:
+    case Opcode::A64AtomicRMW32:
+    case Opcode::A64AtomicRMW64:
+    case Opcode::A64AtomicCAS8:
+    case Opcode::A64AtomicCAS16:
+    case Opcode::A64AtomicCAS32:
+    case Opcode::A64AtomicCAS64:
+    case Opcode::A64AtomicCAS128:
+        return true;
+
+    default:
+        return false;
+    }
+}
+
 /// @brief Determines whether or not this instruction performs any kind of memory read.
 constexpr bool IsMemoryRead(const Opcode op) noexcept {
-    return IsSharedMemoryRead(op) || IsExclusiveMemoryRead(op);
+    return IsSharedMemoryRead(op) || IsExclusiveMemoryRead(op) || IsAtomicMemoryOperation(op);
 }
 
 /// @brief Determines whether or not this instruction performs any kind of memory write.
 constexpr bool IsMemoryWrite(const Opcode op) noexcept {
-    return IsSharedMemoryWrite(op) || IsExclusiveMemoryWrite(op);
+    return IsSharedMemoryWrite(op) || IsExclusiveMemoryWrite(op) || IsAtomicMemoryOperation(op);
 }
 
 /// @brief Determines whether or not this instruction performs any kind of memory access.
