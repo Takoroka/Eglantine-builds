@@ -16,6 +16,7 @@
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/physical_core.h"
 #include "core/hle/kernel/svc.h"
+#include "core/nx2_cpu_stats.h"
 
 namespace Kernel {
 
@@ -155,7 +156,9 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
         // Handle system calls.
         if (supervisor_call) {
             // Perform call.
-            Svc::Call(system, interface->GetSvcNumber());
+            const u32 svc = interface->GetSvcNumber();
+            Core::Nx2CpuStats::CountSvc(m_core_index, svc);
+            Svc::Call(system, svc);
             return;
         }
 

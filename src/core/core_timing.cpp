@@ -7,7 +7,9 @@
 #include <algorithm>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <tuple>
+#include <vector>
 #include "common/cpu_features.h"
 #include "common/cpu_features.h"
 #include "common/nx2_ab.h"
@@ -16,13 +18,32 @@
 #include "common/windows/timer_resolution.h"
 #endif
 
+#include "common/logging.h"
+#include "common/nx2_counters.h"
 #include "common/settings.h"
 #include "core/core_timing.h"
 #include "core/hardware_properties.h"
+#include "core/nx2_cpu_stats.h"
 
 namespace Core::Timing {
 
 constexpr s64 MAX_SLICE_LENGTH = 10000;
+
+namespace {
+
+/// Every event type CreateEvent made, for the "nx2 timing" line's per-type counts.
+struct EventTypeRegistry {
+    std::mutex mutex;
+    std::vector<std::weak_ptr<EventType>> types;
+};
+
+EventTypeRegistry& EventTypes() {
+    // Never destroyed: event types may be made and dropped while statics go away at exit.
+    static EventTypeRegistry* const registry = new EventTypeRegistry{};
+    return *registry;
+}
+
+} // Anonymous namespace
 
 constexpr u32 CPU_CLOCK_BASE_MHZ = 1020;
 constexpr u32 CPU_CLOCK_BOOST_MHZ = 1734;
@@ -40,7 +61,14 @@ constexpr u32 CpuClockTargetMhz(Settings::CpuClock clock) {
 }
 
 std::shared_ptr<EventType> CreateEvent(std::string name, TimedCallback&& callback) {
-    return std::make_shared<EventType>(std::move(callback), std::move(name));
+    auto type = std::make_shared<EventType>(std::move(callback), std::move(name));
+    auto& registry = EventTypes();
+    std::scoped_lock lock{registry.mutex};
+    std::erase_if(registry.types, [](const std::weak_ptr<EventType>& entry) {
+        return entry.expired();
+    });
+    registry.types.push_back(type);
+    return type;
 }
 
 struct CoreTiming::Event {
@@ -78,27 +106,46 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
             Common::SetCurrentThreadToPerformanceCores();
             on_thread_init();
             has_started = true;
+            thread_stats = ThreadStats{};
+            thread_stats.window_start = GetGlobalTimeNs().count();
 
             // base frequency in MHz: 1ns (10^-9) = 1GHz (10^9)
             while (!stop_token.stop_requested()) {
                 while (!paused && !stop_token.stop_requested()) {
                     paused_set = false;
-                    if (auto const next_time = Advance(); next_time) {
+                    const s64 run_start = GetGlobalTimeNs().count();
+                    auto const next_time = Advance();
+                    s64 now = GetGlobalTimeNs().count();
+                    thread_stats.run_ns += now - run_start;
+                    if (next_time) {
                         // There are more events left in the queue, wait until the next event.
-                        auto const wait_time = *next_time - GetGlobalTimeNs().count();
+                        auto const wait_time = *next_time - now;
                         if (wait_time > 0) {
-                            event.WaitFor(std::chrono::nanoseconds(wait_time));
+                            const bool woken = event.WaitFor(std::chrono::nanoseconds(wait_time));
+                            const s64 waited_until = GetGlobalTimeNs().count();
+                            CountTimedWait(wait_time, woken, waited_until - now,
+                                           waited_until - *next_time);
+                            now = waited_until;
                         }
                     } else {
                         // Queue is empty, wait until another event is scheduled and signals us to
                         // continue.
                         wait_set = true;
                         event.Wait();
+                        const s64 woke = GetGlobalTimeNs().count();
+                        thread_stats.idle_wait_ns += woke - now;
+                        ++thread_stats.idle_waits;
+                        now = woke;
                     }
                     wait_set = false;
+                    if (now - thread_stats.window_start >= Common::Nx2Counters::WINDOW_NS) {
+                        ReportStats(now);
+                    }
                 }
                 paused_set = true;
+                const s64 pause_start = GetGlobalTimeNs().count();
                 pause_event.Wait();
+                thread_stats.paused_ns += GetGlobalTimeNs().count() - pause_start;
             }
         });
     }
@@ -160,6 +207,7 @@ void CoreTiming::ScheduleEvent(std::chrono::nanoseconds ns_into_future,
         (*h).handle = h;
         earliest = event_queue.top().fifo_order == fifo_order;
     }
+    event_type->scheduled.fetch_add(1, std::memory_order_relaxed);
 
     WakeTimerThread(earliest);
 }
@@ -179,6 +227,7 @@ void CoreTiming::ScheduleLoopingEvent(std::chrono::nanoseconds start_time,
         (*h).handle = h;
         earliest = event_queue.top().fifo_order == fifo_order;
     }
+    event_type->scheduled.fetch_add(1, std::memory_order_relaxed);
 
     WakeTimerThread(earliest);
 }
@@ -212,6 +261,9 @@ void CoreTiming::UnscheduleEvent(const std::shared_ptr<EventType>& event_type,
         }
 
         event_type->sequence_number++;
+        unschedule_calls.fetch_add(1, std::memory_order_relaxed);
+        event_type->unscheduled.fetch_add(static_cast<u32>(to_remove.size()),
+                                          std::memory_order_relaxed);
     }
 
     // Force any in-progress events to finish
@@ -271,21 +323,25 @@ std::optional<s64> CoreTiming::Advance() {
         if (const auto event_type{evt.type.lock()}) {
             const auto evt_time = evt.time;
             const auto evt_sequence_num = event_type->sequence_number;
+            event_type->fired.fetch_add(1, std::memory_order_relaxed);
 
             if (evt.reschedule_time == 0) {
                 event_queue.pop();
 
                 basic_lock.unlock();
 
-                event_type->callback(
-                    evt_time, std::chrono::nanoseconds{GetGlobalTimeNs().count() - evt_time});
+                const s64 late = GetGlobalTimeNs().count() - evt_time;
+                CountLate(late);
+                event_type->callback(evt_time, std::chrono::nanoseconds{late});
 
                 basic_lock.lock();
             } else {
                 basic_lock.unlock();
 
-                const auto new_schedule_time{event_type->callback(
-                    evt_time, std::chrono::nanoseconds{GetGlobalTimeNs().count() - evt_time})};
+                const s64 late = GetGlobalTimeNs().count() - evt_time;
+                CountLate(late);
+                const auto new_schedule_time{
+                    event_type->callback(evt_time, std::chrono::nanoseconds{late})};
 
                 basic_lock.lock();
 
@@ -318,6 +374,142 @@ std::optional<s64> CoreTiming::Advance() {
     } else {
         return std::nullopt;
     }
+}
+
+void CoreTiming::CountLate(s64 late) {
+    ++late_count;
+    late_ns += late;
+    late_max_ns = std::max(late_max_ns, late);
+}
+
+void CoreTiming::CountTimedWait(s64 wait_ns, bool woken, s64 waited_ns, s64 overshoot_ns) {
+    ThreadStats& stats = thread_stats;
+    ++stats.timed_waits;
+    stats.timed_wait_ns += waited_ns;
+    if (wait_ns < 50'000) {
+        ++stats.waits_under_50us;
+    } else if (wait_ns < 500'000) {
+        ++stats.waits_under_500us;
+    }
+    if (woken) {
+        ++stats.woken_waits;
+    } else if (overshoot_ns > 0) {
+        ++stats.overshoots;
+        stats.overshoot_ns += overshoot_ns;
+    }
+}
+
+void CoreTiming::ReportStats(s64 now) {
+    using namespace Common::Nx2Counters;
+    const ThreadStats stats = thread_stats;
+    const s64 active = std::max<s64>(now - stats.window_start - stats.paused_ns, 1);
+
+    // Per event type, summed by name (some names have several types).
+    struct Row {
+        std::string name;
+        u64 scheduled;
+        u64 fired;
+        u64 unscheduled;
+    };
+    std::vector<std::weak_ptr<EventType>> types;
+    {
+        auto& registry = EventTypes();
+        std::scoped_lock lock{registry.mutex};
+        types = registry.types;
+    }
+    std::vector<Row> rows;
+    {
+        for (const std::weak_ptr<EventType>& entry : types) {
+            const std::shared_ptr<EventType> type = entry.lock();
+            if (!type) {
+                continue;
+            }
+            const u64 scheduled = type->scheduled.exchange(0, std::memory_order_relaxed);
+            const u64 fired = type->fired.exchange(0, std::memory_order_relaxed);
+            const u64 unscheduled = type->unscheduled.exchange(0, std::memory_order_relaxed);
+            if (scheduled + fired + unscheduled == 0) {
+                continue;
+            }
+            const auto it = std::find_if(rows.begin(), rows.end(),
+                                         [&](const Row& row) { return row.name == type->name; });
+            if (it == rows.end()) {
+                rows.push_back(Row{type->name, scheduled, fired, unscheduled});
+            } else {
+                it->scheduled += scheduled;
+                it->fired += fired;
+                it->unscheduled += unscheduled;
+            }
+        }
+    }
+    Row total{"", 0, 0, 0};
+    for (const Row& row : rows) {
+        total.scheduled += row.scheduled;
+        total.fired += row.fired;
+        total.unscheduled += row.unscheduled;
+    }
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
+        return a.scheduled + a.fired > b.scheduled + b.fired;
+    });
+    std::string top;
+    for (size_t i = 0; i < std::min<size_t>(rows.size(), 10); ++i) {
+        top += fmt::format("{}{} {}/{}/{}", i == 0 ? "" : ", ", rows[i].name,
+                           FormatRate(PerSecond(rows[i].scheduled, active)),
+                           FormatRate(PerSecond(rows[i].fired, active)),
+                           FormatRate(PerSecond(rows[i].unscheduled, active)));
+    }
+    size_t queued{};
+    {
+        std::scoped_lock lock{basic_lock};
+        queued = event_queue.size();
+    }
+
+    // The timed waits keep the thread on its CPU with MWAITX/UMWAIT (Windows on x86), so "on the
+    // CPU" counts them; with "sleep" or "condvar" the thread sleeps in them.
+    const std::string_view method = Common::EventWaitMethod();
+    const bool waits_on_cpu = method == "mwaitx" || method == "umwait";
+    const u64 waits = stats.timed_waits + stats.idle_waits;
+    const auto share = [&](u64 count) {
+        return stats.timed_waits != 0 ? static_cast<double>(count) * 100.0 /
+                                            static_cast<double>(stats.timed_waits)
+                                      : 0.0;
+    };
+    LOG_INFO(Core_Timing,
+             "nx2 timing (last {:.1f} s, paused {:.1f} s): events scheduled {}/s, fired {}/s, "
+             "unscheduled {}/s ({} unschedule calls/s), {} queued, fired late mean {:.1f} us "
+             "max {:.1f} us | HostTiming run {:.1f}%, timed wait {:.1f}% ({}), idle wait "
+             "{:.1f}%, on the CPU {:.1f}% | waits {}/s: timed {}/s (<50 us {:.0f}%, 50-500 us "
+             "{:.0f}%, >=500 us {:.0f}%, ended by a new event {:.0f}%, ran out {:.1f} us late "
+             "on average), idle {}/s | top 10 by scheduled+fired (scheduled/fired/unscheduled "
+             "per s): {}",
+             static_cast<double>(active) / 1e9, static_cast<double>(stats.paused_ns) / 1e9,
+             FormatRate(PerSecond(total.scheduled, active)),
+             FormatRate(PerSecond(total.fired, active)),
+             FormatRate(PerSecond(total.unscheduled, active)),
+             FormatRate(PerSecond(unschedule_calls.exchange(0, std::memory_order_relaxed), active)),
+             queued,
+             late_count != 0 ? static_cast<double>(late_ns) / static_cast<double>(late_count) / 1e3
+                             : 0.0,
+             static_cast<double>(late_max_ns) / 1e3, Percent(stats.run_ns, active),
+             Percent(stats.timed_wait_ns, active), method, Percent(stats.idle_wait_ns, active),
+             Percent(stats.run_ns + (waits_on_cpu ? stats.timed_wait_ns : 0), active),
+             FormatRate(PerSecond(waits, active)),
+             FormatRate(PerSecond(stats.timed_waits, active)), share(stats.waits_under_50us),
+             share(stats.waits_under_500us),
+             share(stats.timed_waits - stats.waits_under_50us - stats.waits_under_500us),
+             share(stats.woken_waits),
+             stats.overshoots != 0 ? static_cast<double>(stats.overshoot_ns) /
+                                         static_cast<double>(stats.overshoots) / 1e3
+                                   : 0.0,
+             FormatRate(PerSecond(stats.idle_waits, active)), top.empty() ? "none" : top);
+
+    // The guest cores' SVC and hint counts, on the same 30 s.
+    Core::Nx2CpuStats::Report(active);
+
+    thread_stats = ThreadStats{};
+    thread_stats.window_start = now;
+    late_count = 0;
+    late_ns = 0;
+    late_max_ns = 0;
 }
 
 void CoreTiming::Reset() {
