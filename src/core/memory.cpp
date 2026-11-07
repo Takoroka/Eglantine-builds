@@ -1198,7 +1198,7 @@ struct Memory::Impl {
             totals.mismatches_older += s.mismatches_older.load(std::memory_order_relaxed);
         }
         totals.non_core = non_core_reads.load(std::memory_order_relaxed);
-        const ReadAreaTotals last = std::exchange(last_read_area_totals, totals);
+        const ReadAreaTotals prev = std::exchange(last_read_area_totals, totals);
         const s64 start = std::exchange(last_read_area_log, now);
         if (start == 0) {
             return; // The first window starts here.
@@ -1210,20 +1210,20 @@ struct Memory::Impl {
         std::string verify;
         if (read_area_verify) {
             verify = fmt::format("; verify: {} checked, {} needed a flush ({} newest area, {} older)",
-                                 totals.verified - last.verified,
-                                 (totals.mismatches_newest - last.mismatches_newest) +
-                                     (totals.mismatches_older - last.mismatches_older),
-                                 totals.mismatches_newest - last.mismatches_newest,
-                                 totals.mismatches_older - last.mismatches_older);
+                                 totals.verified - prev.verified,
+                                 (totals.mismatches_newest - prev.mismatches_newest) +
+                                     (totals.mismatches_older - prev.mismatches_older),
+                                 totals.mismatches_newest - prev.mismatches_newest,
+                                 totals.mismatches_older - prev.mismatches_older);
         }
         LOG_INFO(HW_Memory,
                  "Guest read areas (bit 3 {}) {:.0f} s: {:.0f}/s answered by a remembered area "
                  "({:.0f}/s by an older one), {:.0f}/s missed (GetFlushArea), {:.0f}/s from "
                  "threads that are not cores{}",
                  Common::Nx2Ab::On(Common::Nx2Ab::GuestReadAreas) ? "on" : "off", seconds,
-                 rate(totals.hits_newest + totals.hits_older, last.hits_newest + last.hits_older),
-                 rate(totals.hits_older, last.hits_older), rate(totals.misses, last.misses),
-                 rate(totals.non_core, last.non_core), verify);
+                 rate(totals.hits_newest + totals.hits_older, prev.hits_newest + prev.hits_older),
+                 rate(totals.hits_older, prev.hits_older), rate(totals.misses, prev.misses),
+                 rate(totals.non_core, prev.non_core), verify);
         // A/B bit 18 FastmemRestore, same window.
         const auto load = [](const std::atomic<u64>& counter) {
             return counter.load(std::memory_order_relaxed);
