@@ -129,6 +129,8 @@ add_library(
     thread_queue_list.h
     thread_worker.h
     threadsafe_queue.h
+    timed_sleeper.cpp
+    timed_sleeper.h
     time_zone.cpp
     time_zone.h
     tiny_mt.h

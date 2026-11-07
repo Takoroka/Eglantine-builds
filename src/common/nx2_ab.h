@@ -116,6 +116,11 @@ enum Feature : u64 {
     // still holds, also under the GPU split (VideoCommon::FlushQueryResults). Idea:
     // zortos293/lichii 7ae3e7401.
     MacroReadQueryWait = 1ull << 9,
+    // hosttime (11-06, play-dkb7 idea 1b): where the timed wait keeps the thread on its CPU
+    // (MWAITX/UMWAIT), the host timing thread sleeps on a high-resolution timer until a measured
+    // margin before the next event and waits precisely only for the rest
+    // (CoreTiming::WaitForNextEvent, Common::TimedSleeper). Idea: Eglantine PR #538 (pretend7979).
+    TimingWaitCheap = 1ull << 14,
 };
 
 inline const u64 g_mask = [] {

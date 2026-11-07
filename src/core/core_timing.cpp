@@ -108,6 +108,35 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
             has_started = true;
             thread_stats = ThreadStats{};
             thread_stats.window_start = GetGlobalTimeNs().count();
+            {
+                // The cheap wait is for hosts where the precise wait keeps the thread on its CPU;
+                // elsewhere (sleep, condvar) the timed wait already sleeps.
+                const std::string_view method = Common::EventWaitMethod();
+                const bool waits_on_cpu = method == "mwaitx" || method == "umwait";
+                cheap_wait_supported = waits_on_cpu && sleeper.IsAvailable();
+                if (cheap_wait_supported) {
+                    // Measure the timer's lateness before the first real sleep, so the margin
+                    // isn't the cautious default until enough long waits come along (a few ms
+                    // at boot; the margin then follows the real sleeps).
+                    static constexpr s64 PROBE_NS = 200'000;
+                    for (u32 probe = 0; probe < Common::SleepMargin::WARMUP; ++probe) {
+                        const s64 start = GetGlobalTimeNs().count();
+                        if (sleeper.SleepFor(std::chrono::nanoseconds{PROBE_NS}) !=
+                            Common::TimedSleeper::Result::TimedOut) {
+                            break;
+                        }
+                        sleep_margin.AddOvershoot(GetGlobalTimeNs().count() - start - PROBE_NS);
+                    }
+                }
+                LOG_INFO(Core_Timing,
+                         "nx2 timing wait: precise wait {}, high-resolution sleep {}: cheap wait "
+                         "(A/B bit TimingWaitCheap) {}, margin {:.0f} us",
+                         method, sleeper.IsAvailable() ? "available" : "unavailable",
+                         cheap_wait_supported ? "used while the bit is on"
+                                              : "not used (the timed wait already sleeps or no "
+                                                "timer)",
+                         static_cast<double>(sleep_margin.Margin()) / 1e3);
+            }
 
             // base frequency in MHz: 1ns (10^-9) = 1GHz (10^9)
             while (!stop_token.stop_requested()) {
@@ -121,7 +150,7 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
                         // There are more events left in the queue, wait until the next event.
                         auto const wait_time = *next_time - now;
                         if (wait_time > 0) {
-                            const bool woken = event.WaitFor(std::chrono::nanoseconds(wait_time));
+                            const bool woken = WaitForNextEvent(now, *next_time);
                             const s64 waited_until = GetGlobalTimeNs().count();
                             CountTimedWait(wait_time, woken, waited_until - now,
                                            waited_until - *next_time);
@@ -155,6 +184,7 @@ void CoreTiming::ClearPendingEvents() {
     std::scoped_lock lock{advance_lock, basic_lock};
     event_queue.clear();
     event.Set();
+    WakeSleepingTimer();
 }
 
 void CoreTiming::Pause(bool is_paused) {
@@ -177,6 +207,7 @@ void CoreTiming::SyncPause(bool is_paused) {
             pause_event.Set();
         }
         event.Set();
+        WakeSleepingTimer();
         while (paused_set != is_paused)
             ;
     }
@@ -240,7 +271,70 @@ void CoreTiming::WakeTimerThread(bool earliest) {
     // Idea: MythosOfs/Orchid 6e14af2079.
     if (earliest || !Common::Nx2Ab::On(Common::Nx2Ab::TimingWakeEarliest)) {
         event.Set();
+        WakeSleepingTimer();
     }
+}
+
+void CoreTiming::WakeSleepingTimer() {
+    // Pairs with WaitForNextEvent: it marks itself sleeping, then looks at the event; this sets
+    // the event (event.Set), then looks at the mark. Both sequentially consistent, so either the
+    // sleep is skipped or it is woken. A wake that finds no sleep left ends a later one early.
+    if (timer_sleeping.load()) {
+        sleeper.Wake();
+    }
+}
+
+bool CoreTiming::WaitForNextEvent(s64 now, s64 next_time) {
+    // A sleep must be worth its two system calls.
+    static constexpr s64 MIN_SLEEP_NS = 100'000;
+    s64 wait = next_time - now;
+    if (cheap_wait_supported && Common::Nx2Ab::On(Common::Nx2Ab::TimingWaitCheap)) {
+        const s64 margin = sleep_margin.Margin();
+        if (wait <= margin + MIN_SLEEP_NS) {
+            ++thread_stats.short_waits;
+        } else {
+            const s64 sleep_for = wait - margin;
+            timer_sleeping.store(true);
+            const bool already_set = event.IsSet();
+            const auto result = already_set
+                                    ? Common::TimedSleeper::Result::Woken
+                                    : sleeper.SleepFor(std::chrono::nanoseconds{sleep_for});
+            timer_sleeping.store(false);
+            const s64 after = GetGlobalTimeNs().count();
+            ThreadStats& stats = thread_stats;
+            switch (result) {
+            case Common::TimedSleeper::Result::Woken:
+                // A new earliest event (or a pause, a stop): take the event's signal, as the
+                // precise wait would have, and let Advance read the queue again.
+                event.Reset();
+                if (!already_set) {
+                    ++stats.sleeps;
+                    ++stats.sleeps_woken;
+                    stats.sleep_ns += after - now;
+                }
+                return true;
+            case Common::TimedSleeper::Result::TimedOut: {
+                const s64 overshoot = after - (now + sleep_for);
+                sleep_margin.AddOvershoot(overshoot);
+                stats.sleep_overshoot.Add(overshoot);
+                ++stats.sleeps;
+                stats.sleep_ns += after - now;
+                if (after >= next_time) {
+                    ++stats.sleeps_past_event;
+                }
+                break;
+            }
+            case Common::TimedSleeper::Result::Failed:
+                ++stats.sleep_failures;
+                break;
+            }
+            wait = next_time - after;
+            if (wait <= 0) {
+                return false;
+            }
+        }
+    }
+    return event.WaitFor(std::chrono::nanoseconds{wait});
 }
 
 void CoreTiming::UnscheduleEvent(const std::shared_ptr<EventType>& event_type,
@@ -380,6 +474,7 @@ void CoreTiming::CountLate(s64 late) {
     ++late_count;
     late_ns += late;
     late_max_ns = std::max(late_max_ns, late);
+    late_histogram.Add(late);
 }
 
 void CoreTiming::CountTimedWait(s64 wait_ns, bool woken, s64 waited_ns, s64 overshoot_ns) {
@@ -475,9 +570,10 @@ void CoreTiming::ReportStats(s64 now) {
     };
     LOG_INFO(Core_Timing,
              "nx2 timing (last {:.1f} s, paused {:.1f} s): events scheduled {}/s, fired {}/s, "
-             "unscheduled {}/s ({} unschedule calls/s), {} queued, fired late mean {:.1f} us "
-             "max {:.1f} us | HostTiming run {:.1f}%, timed wait {:.1f}% ({}), idle wait "
-             "{:.1f}%, on the CPU {:.1f}% | waits {}/s: timed {}/s (<50 us {:.0f}%, 50-500 us "
+             "unscheduled {}/s ({} unschedule calls/s), {} queued, fired late p50 {:.1f} us "
+             "p99 {:.1f} us mean {:.1f} us max {:.1f} us | HostTiming run {:.1f}%, timed wait "
+             "{:.1f}% ({}, slept {:.1f}%), idle wait {:.1f}%, on the CPU {:.1f}% | waits {}/s: "
+             "timed {}/s (<50 us {:.0f}%, 50-500 us "
              "{:.0f}%, >=500 us {:.0f}%, ended by a new event {:.0f}%, ran out {:.1f} us late "
              "on average), idle {}/s | top 10 by scheduled+fired (scheduled/fired/unscheduled "
              "per s): {}",
@@ -486,12 +582,15 @@ void CoreTiming::ReportStats(s64 now) {
              FormatRate(PerSecond(total.fired, active)),
              FormatRate(PerSecond(total.unscheduled, active)),
              FormatRate(PerSecond(unschedule_calls.exchange(0, std::memory_order_relaxed), active)),
-             queued,
+             queued, static_cast<double>(late_histogram.Percentile(0.5)) / 1e3,
+             static_cast<double>(late_histogram.Percentile(0.99)) / 1e3,
              late_count != 0 ? static_cast<double>(late_ns) / static_cast<double>(late_count) / 1e3
                              : 0.0,
              static_cast<double>(late_max_ns) / 1e3, Percent(stats.run_ns, active),
-             Percent(stats.timed_wait_ns, active), method, Percent(stats.idle_wait_ns, active),
-             Percent(stats.run_ns + (waits_on_cpu ? stats.timed_wait_ns : 0), active),
+             Percent(stats.timed_wait_ns, active), method, Percent(stats.sleep_ns, active),
+             Percent(stats.idle_wait_ns, active),
+             Percent(stats.run_ns + (waits_on_cpu ? stats.timed_wait_ns - stats.sleep_ns : 0),
+                     active),
              FormatRate(PerSecond(waits, active)),
              FormatRate(PerSecond(stats.timed_waits, active)), share(stats.waits_under_50us),
              share(stats.waits_under_500us),
@@ -502,6 +601,32 @@ void CoreTiming::ReportStats(s64 now) {
                                    : 0.0,
              FormatRate(PerSecond(stats.idle_waits, active)), top.empty() ? "none" : top);
 
+    // The cheap wait (A/B bit TimingWaitCheap): how often it slept, and how close to the events
+    // the sleeps ended. "past the event" = the sleep alone overran the event's time (it fired late).
+    if (cheap_wait_supported) {
+        const auto per_timed = [&](u64 count) {
+            return stats.timed_waits != 0 ? static_cast<double>(count) * 100.0 /
+                                                static_cast<double>(stats.timed_waits)
+                                          : 0.0;
+        };
+        LOG_INFO(Core_Timing,
+                 "nx2 timing wait (A/B bit TimingWaitCheap {}): slept {:.1f}% of the time in "
+                 "{}/s sleeps ({:.0f}% of timed waits; {:.0f}% ended by a new event), timer late "
+                 "p50 {:.1f} us p99 {:.1f} us, margin now {:.0f} us, {} sleeps past their event, "
+                 "{}/s waits too short to sleep ({:.0f}%), {} timer failures",
+                 Common::Nx2Ab::On(Common::Nx2Ab::TimingWaitCheap) ? "on" : "off",
+                 Percent(stats.sleep_ns, active), FormatRate(PerSecond(stats.sleeps, active)),
+                 per_timed(stats.sleeps),
+                 stats.sleeps != 0 ? static_cast<double>(stats.sleeps_woken) * 100.0 /
+                                         static_cast<double>(stats.sleeps)
+                                   : 0.0,
+                 static_cast<double>(stats.sleep_overshoot.Percentile(0.5)) / 1e3,
+                 static_cast<double>(stats.sleep_overshoot.Percentile(0.99)) / 1e3,
+                 static_cast<double>(sleep_margin.Margin()) / 1e3, stats.sleeps_past_event,
+                 FormatRate(PerSecond(stats.short_waits, active)), per_timed(stats.short_waits),
+                 stats.sleep_failures);
+    }
+
     // The guest cores' SVC and hint counts, on the same 30 s.
     Core::Nx2CpuStats::Report(active);
 
@@ -510,6 +635,7 @@ void CoreTiming::ReportStats(s64 now) {
     late_count = 0;
     late_ns = 0;
     late_max_ns = 0;
+    late_histogram.Clear();
 }
 
 void CoreTiming::Reset() {
@@ -522,6 +648,7 @@ void CoreTiming::Reset() {
     }
     pause_event.Set();
     event.Set();
+    sleeper.Wake();
     if (timer_thread.joinable()) {
         timer_thread.join();
     }
