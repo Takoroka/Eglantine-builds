@@ -130,6 +130,9 @@ enum Feature : u64 {
     // margin before the next event and waits precisely only for the rest
     // (CoreTiming::WaitForNextEvent, Common::TimedSleeper). Idea: Eglantine PR #538 (pretend7979).
     TimingWaitCheap = 1ull << 14,
+    // switchbrew (11-06): VK_EXT_host_image_copy for the first upload of CPU-produced textures:
+    // the CPU writes them into the image (Image::HostUpload), no staging copy on the GPU.
+    HostImageCopy = 1ull << 16,
 };
 
 inline const u64 g_mask = [] {

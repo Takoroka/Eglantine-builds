@@ -68,6 +68,7 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE(EXT, ExtendedDynamicState2, EXTENDED_DYNAMIC_STATE_2, extended_dynamic_state2)         \
     FEATURE(EXT, ExtendedDynamicState3, EXTENDED_DYNAMIC_STATE_3, extended_dynamic_state3)         \
     FEATURE(EXT, 4444Formats, 4444_FORMATS, format_a4b4g4r4)                                       \
+    FEATURE(EXT, HostImageCopy, HOST_IMAGE_COPY, host_image_copy)                                  \
     FEATURE(EXT, IndexTypeUint8, INDEX_TYPE_UINT8, index_type_uint8)                               \
     FEATURE(EXT, LineRasterization, LINE_RASTERIZATION, line_rasterization)                        \
     FEATURE(EXT, MeshShader, MESH_SHADER, mesh_shader)                                             \
@@ -831,6 +832,28 @@ FN_MAX_LIMIT_LIST
         }
     }
 
+    /// VK_EXT_host_image_copy is enabled (A/B bit HostImageCopy), with the general layout among
+    /// its copy destination layouts: the texture cache can write uploads into images from the host.
+    bool IsHostImageCopySupported() const {
+        return extensions.host_image_copy && dld.vkCopyMemoryToImageEXT != nullptr &&
+               dld.vkTransitionImageLayoutEXT != nullptr;
+    }
+
+    /// Whether an image made as `ci` can take VK_IMAGE_USAGE_HOST_TRANSFER_BIT without the device
+    /// accessing it slower (VkHostImageCopyDevicePerformanceQuery), for its format's host
+    /// transfers. Cached per format, type, usage and flags.
+    bool IsHostTransferOptimal(const VkImageCreateInfo& ci) const;
+
+    /// vkTransitionImageLayoutEXT for one transition (host side).
+    VkResult TransitionImageLayoutOnHost(const VkHostImageLayoutTransitionInfoEXT& info) const {
+        return dld.vkTransitionImageLayoutEXT(*logical, 1, &info);
+    }
+
+    /// vkCopyMemoryToImageEXT (host side).
+    VkResult CopyMemoryToImageOnHost(const VkCopyMemoryToImageInfoEXT& info) const {
+        return dld.vkCopyMemoryToImageEXT(*logical, &info);
+    }
+
     /// Returns true if the device supports VK_EXT_transform_feedback.
     bool IsExtTransformFeedbackSupported() const {
         return extensions.transform_feedback;
@@ -1308,6 +1331,9 @@ private:
     VmaAllocator allocator{};    ///< VMA allocator.
     mutable std::mutex separate_pools_mutex;
     mutable std::array<std::array<VmaPool, VK_MAX_MEMORY_TYPES>, 2> separate_pools{};
+    /// IsHostTransferOptimal's answers, by format, type, usage and flags.
+    mutable std::mutex host_transfer_mutex;
+    mutable ::Common::unordered_map<u64, bool> host_transfer_optimal;
     vk::DeviceDispatch dld;      ///< Device function pointers.
     vk::PhysicalDevice physical; ///< Physical device.
     vk::Device logical;          ///< Logical device.

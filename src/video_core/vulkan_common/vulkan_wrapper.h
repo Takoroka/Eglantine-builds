@@ -181,6 +181,7 @@ struct InstanceDispatch {
     PFN_vkGetPhysicalDeviceFeatures2 vkGetPhysicalDeviceFeatures2{};
     PFN_vkGetPhysicalDeviceFormatProperties vkGetPhysicalDeviceFormatProperties{};
     PFN_vkGetPhysicalDeviceFormatProperties2 vkGetPhysicalDeviceFormatProperties2{};
+    PFN_vkGetPhysicalDeviceImageFormatProperties2 vkGetPhysicalDeviceImageFormatProperties2{};
     PFN_vkGetPhysicalDeviceMemoryProperties vkGetPhysicalDeviceMemoryProperties{};
     PFN_vkGetPhysicalDeviceMemoryProperties2 vkGetPhysicalDeviceMemoryProperties2{};
     PFN_vkGetPhysicalDeviceProperties vkGetPhysicalDeviceProperties{};
@@ -356,6 +357,8 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkSetDebugUtilsObjectNameEXT vkSetDebugUtilsObjectNameEXT{};
     PFN_vkSetDebugUtilsObjectTagEXT vkSetDebugUtilsObjectTagEXT{};
     PFN_vkSetDeviceMemoryPriorityEXT vkSetDeviceMemoryPriorityEXT{};
+    PFN_vkCopyMemoryToImageEXT vkCopyMemoryToImageEXT{};
+    PFN_vkTransitionImageLayoutEXT vkTransitionImageLayoutEXT{};
     PFN_vkUnmapMemory vkUnmapMemory{};
     PFN_vkUpdateDescriptorSetWithTemplate vkUpdateDescriptorSetWithTemplate{};
     PFN_vkGetBufferDeviceAddress vkGetBufferDeviceAddress{};
@@ -1218,6 +1221,10 @@ public:
     VkFormatProperties GetFormatProperties(VkFormat) const noexcept;
 
     VkFormatProperties3 GetFormatProperties3(VkFormat) const noexcept;
+
+    /// vkGetPhysicalDeviceImageFormatProperties2; VK_ERROR_FEATURE_NOT_PRESENT when not loaded.
+    VkResult GetImageFormatProperties2(const VkPhysicalDeviceImageFormatInfo2&,
+                                       VkImageFormatProperties2&) const noexcept;
 
     std::vector<VkExtensionProperties> EnumerateDeviceExtensionProperties() const;
 

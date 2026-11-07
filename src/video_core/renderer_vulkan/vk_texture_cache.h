@@ -66,6 +66,11 @@ public:
 
     StagingBufferRef UploadStagingBuffer(size_t size, bool deferred = false);
 
+    /// For a first upload Image::HostUpload can write (A/B bit HostImageCopy): cached host memory
+    /// to decode into instead of staging, which the CPU would read back slowly. Its ref has no
+    /// buffer; it holds until the next call. Nothing for other uploads.
+    std::optional<StagingBufferRef> HostUploadBuffer(const Image& image, size_t size);
+
     StagingBufferRef DownloadStagingBuffer(size_t size, bool deferred = false);
 
     void FreeDeferredStagingBuffer(StagingBufferRef& ref);
@@ -254,6 +259,7 @@ public:
     Scheduler& scheduler;
     MemoryAllocator& memory_allocator;
     StagingBufferPool& staging_buffer_pool;
+    Common::ScratchBuffer<u8> host_upload_buffer; ///< HostUploadBuffer's memory
     BlitImageHelper& blit_image_helper;
     RenderPassCache& render_pass_cache;
     DescriptorPool& descriptor_pool;
@@ -502,6 +508,12 @@ public:
     void UploadMemory(const StagingBufferRef& map,
                       std::span<const VideoCommon::BufferImageCopy> copies);
 
+    /// Whether the next upload can be written from the host (A/B bit HostImageCopy): the image
+    /// took VK_IMAGE_USAGE_HOST_TRANSFER_BIT, nothing has been uploaded into it and no command can
+    /// have used it yet (never prepared for use, Handle() never given out), so no device access
+    /// races the copy.
+    [[nodiscard]] bool CanHostUpload() const noexcept;
+
     void DownloadMemory(VkBuffer buffer, size_t offset,
                         std::span<const VideoCommon::BufferImageCopy> copies);
 
@@ -514,7 +526,19 @@ public:
     void AllocateComputeUnswizzleImage();
 
     [[nodiscard]] VkImage Handle() const noexcept {
+        handle_given = true;
         return *(this->*current_image);
+    }
+
+    /// Handle() for making an image view: a view doesn't use the image yet, and the texture cache
+    /// prepares an image before any command uses its views (NoteDeviceUse).
+    [[nodiscard]] VkImage ViewHandle() const noexcept {
+        return *(this->*current_image);
+    }
+
+    /// TextureCache::PrepareImage: commands may use the image from now on.
+    void NoteDeviceUse() noexcept {
+        handle_given = true;
     }
 
     [[nodiscard]] VkImageAspectFlags AspectMask() const noexcept {
@@ -684,6 +708,11 @@ private:
     /// Records a clear of the whole image to zero.
     void ClearTiles();
 
+    /// Writes `copies` of `data` into the image from the host, the whole image moved to the
+    /// general layout first (vkTransitionImageLayoutEXT, vkCopyMemoryToImageEXT). False when it
+    /// can't (CanHostUpload) or the driver failed: nothing was written then.
+    bool HostUpload(std::span<const u8> data, std::span<const VideoCommon::BufferImageCopy> copies);
+
     vk::Image original_image;
     vk::Image scaled_image;
     /// original_image's memory, which stays where it was put: asked of VMA once rather than for
@@ -706,6 +735,9 @@ private:
     std::vector<vk::ImageView> storage_layer_views; ///< By host level * layers + layer
     VkImageAspectFlags aspect_mask = 0;
     bool initialized = false;
+    /// Handle() was given out, the cache prepared the image for use (NoteDeviceUse) or its own
+    /// commands used it: device work may reach it (CanHostUpload).
+    mutable bool handle_given = false;
 
     std::optional<Framebuffer> scale_framebuffer;
     std::optional<Framebuffer> normal_framebuffer;
