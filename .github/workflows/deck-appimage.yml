@@ -190,7 +190,7 @@ jobs:
       - name: Build
         shell: bash
         run: |
-          cmake --build build/release --target yuzu yuzu-cmd --parallel -- -k ${{ inputs.keep_going && 0 || 1 }}
+          cmake --build build/release --target yuzu yuzu-cmd --parallel -- -k ${{ inputs.keep_going && '0' || '1' }}
           ccache --show-stats
 
       # Plain tar.gz with the two programs. GitHub artifacts drop the executable bit, so a tar is
