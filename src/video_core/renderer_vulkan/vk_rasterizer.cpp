@@ -777,8 +777,8 @@ void RasterizerVulkan::CountMergeRun(bool repeat_draw, bool refresh, u32 refusal
         return;
     }
     const double seconds = static_cast<double>(now - merge_runs_log_ns) / 1e9;
-    const auto& last = merge_runs_last;
-    const double draws = static_cast<double>(totals.draws - last.draws);
+    const auto& prev = merge_runs_last;
+    const double draws = static_cast<double>(totals.draws - prev.draws);
     const auto per_s = [seconds](u64 value, u64 before) {
         return static_cast<double>(value - before) / seconds;
     };
@@ -791,16 +791,16 @@ void RasterizerVulkan::CountMergeRun(bool repeat_draw, bool refresh, u32 refusal
              "runs of 2: {:.0f}/s, 3-4: {:.0f}/s, 5-8: {:.0f}/s, 9-16: {:.0f}/s, 17+: {:.0f}/s); "
              "runs of repeats alone (a multi-draw with no shader change) {:.0f}/s holding "
              "{:.0f} draws/s ({:.1f}%)",
-             seconds, draws / seconds, per_s(totals.patch_runs, last.patch_runs),
-             per_s(totals.patch_draws, last.patch_draws),
-             share(totals.patch_draws, last.patch_draws),
-             per_s(totals.patch_lengths[0], last.patch_lengths[0]),
-             per_s(totals.patch_lengths[1], last.patch_lengths[1]),
-             per_s(totals.patch_lengths[2], last.patch_lengths[2]),
-             per_s(totals.patch_lengths[3], last.patch_lengths[3]),
-             per_s(totals.patch_lengths[4], last.patch_lengths[4]),
-             per_s(totals.plain_runs, last.plain_runs), per_s(totals.plain_draws, last.plain_draws),
-             share(totals.plain_draws, last.plain_draws));
+             seconds, draws / seconds, per_s(totals.patch_runs, prev.patch_runs),
+             per_s(totals.patch_draws, prev.patch_draws),
+             share(totals.patch_draws, prev.patch_draws),
+             per_s(totals.patch_lengths[0], prev.patch_lengths[0]),
+             per_s(totals.patch_lengths[1], prev.patch_lengths[1]),
+             per_s(totals.patch_lengths[2], prev.patch_lengths[2]),
+             per_s(totals.patch_lengths[3], prev.patch_lengths[3]),
+             per_s(totals.patch_lengths[4], prev.patch_lengths[4]),
+             per_s(totals.plain_runs, prev.plain_runs), per_s(totals.plain_draws, prev.plain_draws),
+             share(totals.plain_draws, prev.plain_draws));
     merge_runs_log_ns = now;
     merge_runs_last = totals;
 }
@@ -1903,6 +1903,10 @@ const std::string* RasterizerVulkan::DispatchCompute() {
 
     ComputePipeline* const pipeline{pipeline_cache.CurrentComputePipeline()};
     if (!pipeline) {
+        if (pipeline_cache.ComputeDispatchDeferred()) {
+            // Its pipeline is still being prebuilt (A/B bit AsyncComputePrebuild): skipped.
+            return nullptr;
+        }
         if (const std::string* const rejection = pipeline_cache.ComputeRejection()) {
             return rejection;
         }

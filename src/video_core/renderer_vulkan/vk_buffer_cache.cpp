@@ -785,7 +785,7 @@ void BufferCacheRuntime::MaybeLogReadbacks() {
         .verified = load(readback_stats.verified),
         .mismatched = load(readback_stats.mismatched),
     };
-    const ReadbackTotals last = std::exchange(readback_last, totals);
+    const ReadbackTotals prev = std::exchange(readback_last, totals);
     const s64 start = std::exchange(readback_last_log, now);
     if (start == 0) {
         return; // The first window starts here.
@@ -800,8 +800,8 @@ void BufferCacheRuntime::MaybeLogReadbacks() {
     };
     std::string verify;
     if (readback_verify) {
-        verify = fmt::format("; verify: {} compared, {} differed", totals.verified - last.verified,
-                             totals.mismatched - last.mismatched);
+        verify = fmt::format("; verify: {} compared, {} differed", totals.verified - prev.verified,
+                             totals.mismatched - prev.mismatched);
     }
     LOG_INFO(Render_Vulkan,
              "Readback queue (bit 11 {}) {:.0f} s: {:.0f}/s copied on the readback queue (mean "
@@ -809,11 +809,11 @@ void BufferCacheRuntime::MaybeLogReadbacks() {
              "with a source in the recording command buffer, {:.0f}/s without a readback "
              "queue){}",
              Common::Nx2Ab::On(Common::Nx2Ab::ReadbackQueue) ? "on" : "off", seconds,
-             rate(totals.copies, last.copies),
-             mean_us(totals.copy_ns, last.copy_ns, totals.copies, last.copies),
-             rate(totals.bytes, last.bytes) / 1024.0, rate(totals.finishes, last.finishes),
-             mean_us(totals.finish_ns, last.finish_ns, totals.finishes, last.finishes),
-             rate(totals.recording, last.recording), rate(totals.no_queue, last.no_queue), verify);
+             rate(totals.copies, prev.copies),
+             mean_us(totals.copy_ns, prev.copy_ns, totals.copies, prev.copies),
+             rate(totals.bytes, prev.bytes) / 1024.0, rate(totals.finishes, prev.finishes),
+             mean_us(totals.finish_ns, prev.finish_ns, totals.finishes, prev.finishes),
+             rate(totals.recording, prev.recording), rate(totals.no_queue, prev.no_queue), verify);
 }
 
 void BufferCacheRuntime::ClearBuffer(VkBuffer dest_buffer, u32 offset, size_t size, u32 value) {
