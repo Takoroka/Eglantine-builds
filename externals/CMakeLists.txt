@@ -249,6 +249,27 @@ if (YUZU_TESTS OR DYNARMIC_TESTS)
     AddJsonPackage(catch2)
 endif()
 
+# mimalloc: the Qt frontend's process allocator (YUZU_USE_MIMALLOC; src/yuzu links it)
+if (YUZU_USE_MIMALLOC)
+    if (WIN32 AND MSVC)
+        # mimalloc.dll with mimalloc-redirect.dll beside it: the CRT heap of every module (Qt,
+        # SDL, drivers) goes to mimalloc, so memory may change hands between modules.
+        set(MI_BUILD_SHARED ON CACHE BOOL "" FORCE)
+        set(MI_BUILD_STATIC OFF CACHE BOOL "" FORCE)
+        set(MI_BUILD_OBJECT OFF CACHE BOOL "" FORCE)
+        set(MI_WIN_REDIRECT ON CACHE BOOL "" FORCE)
+    elseif (LINUX)
+        # One object file linked into the executable: its malloc/free interpose for the whole
+        # process.
+        set(MI_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+        set(MI_BUILD_STATIC OFF CACHE BOOL "" FORCE)
+        set(MI_BUILD_OBJECT ON CACHE BOOL "" FORCE)
+    else()
+        message(FATAL_ERROR "YUZU_USE_MIMALLOC: supported on Windows with MSVC or clang-cl and on Linux")
+    endif()
+    AddJsonPackage(mimalloc)
+endif()
+
 # getopt
 if (MSVC)
     add_subdirectory(getopt)

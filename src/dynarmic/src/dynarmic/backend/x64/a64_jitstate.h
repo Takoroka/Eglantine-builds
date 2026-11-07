@@ -58,6 +58,10 @@ struct A64JitState {
 
     // Native LSE atomics done in JIT code (UserConfig::native_lse_atomics), for LseStats.
     u64 lse_native_ops = 0;
+    // Exclusive stores on the lockless monitor path (UserConfig::lockless_exclusive_monitor)
+    // and how many failed, for LseStats.
+    u64 exclusive_stores = 0;
+    u64 exclusive_store_failures = 0;
 
     u32 GetPstate() const {
         return NZCV::FromX64(cpsr_nzcv);

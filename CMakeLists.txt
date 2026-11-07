@@ -288,6 +288,9 @@ cmake_dependent_option(YUZU_CMD "Compile the eden-cli executable" ON "NOT ANDROI
 
 cmake_dependent_option(YUZU_CRASH_DUMPS "Compile crash dump (Minidump) support" OFF "WIN32 OR LINUX" OFF)
 
+# Downloads mimalloc (cpmfile.json) only when ON. The Qt executable is then eglantine-mimalloc.
+option(YUZU_USE_MIMALLOC "Use mimalloc as the process allocator of the Qt frontend (Windows MSVC/clang-cl, Linux)" OFF)
+
 option(YUZU_DOWNLOAD_TIME_ZONE_DATA "Always download time zone binaries" ON)
 set(YUZU_TZDB_PATH "" CACHE STRING "Path to a pre-downloaded timezone database")
 

@@ -205,6 +205,8 @@ public:
 
 // Eden's Auto CPU accuracy runs exclusives with Unsafe_IgnoreGlobalMonitor.
 bool g_ignore_global_monitor = false;
+// UserConfig::lockless_exclusive_monitor (Eden A/B bit 25).
+bool g_lockless_monitor = false;
 
 A64::UserConfig MakeConfig(LseEnv& env, ExclusiveMonitor& monitor, bool native, size_t processor_id = 0) {
     A64::UserConfig conf{};
@@ -222,8 +224,23 @@ A64::UserConfig MakeConfig(LseEnv& env, ExclusiveMonitor& monitor, bool native, 
     conf.global_monitor = &monitor;
     conf.processor_id = static_cast<std::uint8_t>(processor_id);
     conf.native_lse_atomics = native;
+    conf.lockless_exclusive_monitor = g_lockless_monitor;
     return conf;
 }
+
+// Sets the two monitor modes for the JITs made in its scope.
+struct MonitorMode {
+    MonitorMode(bool ignore_global_monitor, bool lockless) {
+        g_ignore_global_monitor = ignore_global_monitor;
+        g_lockless_monitor = lockless;
+    }
+    ~MonitorMode() {
+        g_ignore_global_monitor = false;
+        g_lockless_monitor = false;
+    }
+    MonitorMode(const MonitorMode&) = delete;
+    MonitorMode& operator=(const MonitorMode&) = delete;
+};
 
 // Encodings
 u32 Lse(u32 size, bool A, bool R, u32 Rs, u32 op, u32 Rn, u32 Rt) {
@@ -293,9 +310,15 @@ struct State {
     }
 };
 
+A64::UserConfig MakeConfigWith(LseEnv& env, ExclusiveMonitor& monitor, bool native, bool lockless_monitor) {
+    A64::UserConfig conf = MakeConfig(env, monitor, native);
+    conf.lockless_exclusive_monitor = lockless_monitor;
+    return conf;
+}
+
 struct Machine {
-    explicit Machine(bool native_)
-            : native(native_), env(arena), monitor(1), jit(MakeConfig(env, monitor, native_)) {
+    explicit Machine(bool native_, bool lockless_monitor = false)
+            : native(native_), env(arena), monitor(1), jit(MakeConfigWith(env, monitor, native_, lockless_monitor)) {
         env.jit = &jit;
     }
     bool native;
@@ -469,6 +492,7 @@ u64 Interesting(std::mt19937_64& rng) {
 TEST_CASE("A64: LSE atomics native vs exclusive pair", "[a64][lse]") {
     Machine native{true};
     Machine reference{false};
+    Machine reference_lockless{false, true};  // the exclusive pair on the lockless monitor (bit 25)
     std::mt19937_64 rng{0x15E'A7'0111C5ull};
     const auto encodings = AllEncodings();
 
@@ -530,6 +554,8 @@ TEST_CASE("A64: LSE atomics native vs exclusive pair", "[a64][lse]") {
                     std::fflush(stderr);
                 }
                 const State want = Execute(reference, slot, c);
+                const State want_lockless = Execute(reference_lockless, slot, c);
+                REQUIRE(want_lockless == want);
                 REQUIRE(got.regs == want.regs);
                 REQUIRE(got.data == want.data);
                 REQUIRE(got.slow == want.slow);
@@ -714,17 +740,19 @@ TEST_CASE("A64: LSE atomics with four cores", "[a64][lse]") {
             BCond(cond_ne, 10, 5),           // 10: B.NE 5
             svc0,                            // 11
         };
-        for (const bool ignore_global_monitor : {false, true}) {
-            INFO("Unsafe_IgnoreGlobalMonitor " << ignore_global_monitor);
-            g_ignore_global_monitor = ignore_global_monitor;
+        for (const int mode : {0, 1, 2, 3}) {
+            const bool ignore_global_monitor = (mode & 1) != 0, lockless = (mode & 2) != 0;
+            INFO("Unsafe_IgnoreGlobalMonitor " << ignore_global_monitor << " lockless " << lockless);
             std::memset(arena.base + data_base, 0, 8);
-            RunCores(arena, true, code, [](A64::Jit& jit, size_t core) {
-                jit.SetRegister(0, data_base);
-                jit.SetRegister(1, 1);
-                jit.SetRegister(3, iterations);
-                jit.SetRegister(9, core >= 2 ? 1 : 0);
-            });
-            g_ignore_global_monitor = false;
+            {
+                MonitorMode monitor_mode{ignore_global_monitor, lockless};
+                RunCores(arena, true, code, [](A64::Jit& jit, size_t core) {
+                    jit.SetRegister(0, data_base);
+                    jit.SetRegister(1, 1);
+                    jit.SetRegister(3, iterations);
+                    jit.SetRegister(9, core >= 2 ? 1 : 0);
+                });
+            }
             u64 total{};
             std::memcpy(&total, arena.base + data_base, 8);
             REQUIRE(total == 4 * iterations);
@@ -733,4 +761,97 @@ TEST_CASE("A64: LSE atomics with four cores", "[a64][lse]") {
 
     // All of it ran aligned in a normal page: the host atomics, never the slow path.
     REQUIRE(Backend::X64::LseStats::g_fallback.load() == fallbacks_before);
+}
+
+TEST_CASE("A64: exclusive monitor with and without its lock, four cores", "[a64][lse][monitor]") {
+    // UserConfig::lockless_exclusive_monitor (Eglantine #717, Eden A/B bit 25) against the
+    // locked monitor, each also with Unsafe_IgnoreGlobalMonitor (Auto accuracy).
+    constexpr u64 iterations = 100'000;
+    Arena arena;
+
+    const auto for_each_mode = [&](auto&& run) {
+        for (const int mode : {0, 1, 2, 3}) {
+            const bool ignore_global_monitor = (mode & 1) != 0, lockless = (mode & 2) != 0;
+            INFO("Unsafe_IgnoreGlobalMonitor " << ignore_global_monitor << " lockless " << lockless);
+            std::memset(arena.base + data_base, 0, 128);
+            MonitorMode monitor_mode{ignore_global_monitor, lockless};
+            run();
+        }
+    };
+
+    SECTION("LDAXR/STLXR counter") {
+        const std::vector<u32> code{
+            0xC85FFC02u,            // 0: LDAXR X2, [X0]
+            0x8B010042u,            // 1: ADD X2, X2, X1
+            0xC804FC02u,            // 2: STLXR W4, X2, [X0]
+            Cbnz32(4, 3, 0),        // 3: CBNZ W4, 0
+            0xF1000463u,            // 4: SUBS X3, X3, #1
+            BCond(cond_ne, 5, 0),   // 5: B.NE 0
+            svc0,                   // 6
+        };
+        for_each_mode([&] {
+            RunCores(arena, false, code, [](A64::Jit& jit, size_t) {
+                jit.SetRegister(0, data_base);
+                jit.SetRegister(1, 1);
+                jit.SetRegister(3, iterations);
+            });
+            u64 total{};
+            std::memcpy(&total, arena.base + data_base, 8);
+            REQUIRE(total == 4 * iterations);
+        });
+    }
+
+    SECTION("LDAXR/STXR spinlock around a plain counter") {
+        // Two cores inside the lock at once (a double claim) lose plain increments.
+        const std::vector<u32> code{
+            0x885FFC02u,            // 0: LDAXR W2, [X0]
+            Cbnz32(2, 1, 0),        // 1: CBNZ W2, 0 (held)
+            0x88037C01u,            // 2: STXR W3, W1, [X0]
+            Cbnz32(3, 3, 0),        // 3: CBNZ W3, 0
+            0xF94000A4u,            // 4: LDR X4, [X5]
+            0x91000484u,            // 5: ADD X4, X4, #1
+            0xF90000A4u,            // 6: STR X4, [X5]
+            0x889FFC1Fu,            // 7: STLR WZR, [X0]
+            0xF1000508u,            // 8: SUBS X8, X8, #1
+            BCond(cond_ne, 9, 0),   // 9: B.NE 0
+            svc0,                   // 10
+        };
+        for_each_mode([&] {
+            RunCores(arena, false, code, [](A64::Jit& jit, size_t) {
+                jit.SetRegister(0, data_base);
+                jit.SetRegister(1, 1);
+                jit.SetRegister(5, data_base + 64);
+                jit.SetRegister(8, iterations);
+            });
+            u64 total{};
+            std::memcpy(&total, arena.base + data_base + 64, 8);
+            REQUIRE(total == 4 * iterations);
+            u32 lock{};
+            std::memcpy(&lock, arena.base + data_base, 4);
+            REQUIRE(lock == 0);
+        });
+    }
+
+    SECTION("LDAXP/STLXP pair counter") {
+        const std::vector<u32> code{
+            0xC87F8C02u,            // 0: LDAXP X2, X3, [X0]
+            0x91000442u,            // 1: ADD X2, X2, #1
+            0x91000463u,            // 2: ADD X3, X3, #1
+            0xC8248C02u,            // 3: STLXP W4, X2, X3, [X0]
+            Cbnz32(4, 4, 0),        // 4: CBNZ W4, 0
+            0xF1000508u,            // 5: SUBS X8, X8, #1
+            BCond(cond_ne, 6, 0),   // 6: B.NE 0
+            svc0,                   // 7
+        };
+        for_each_mode([&] {
+            RunCores(arena, false, code, [](A64::Jit& jit, size_t) {
+                jit.SetRegister(0, data_base);
+                jit.SetRegister(8, iterations);
+            });
+            std::array<u64, 2> pair{};
+            std::memcpy(pair.data(), arena.base + data_base, 16);
+            REQUIRE(pair[0] == 4 * iterations);
+            REQUIRE(pair[1] == 4 * iterations);
+        });
+    }
 }

@@ -282,6 +282,10 @@ struct UserConfig {
     /// recompilation of that block with fastmem disabled. Recompiled code will use memory
     /// callbacks.
     bool recompile_on_exclusive_fastmem_failure = true;
+    /// x64, fastmem exclusives: exclusive loads and stores without the global monitor's lock
+    /// (the load comes before the reservation is published; other cores' reservations are
+    /// cleared with lock cmpxchg). False: every exclusive takes the monitor lock.
+    bool lockless_exclusive_monitor = false;
 
     /// Determines if the ARMv8.1 LSE atomics (LDADD/LDCLR/LDEOR/LDSET/LD{S,U}{MAX,MIN}/SWP,
     /// CAS, CASP) are done with one host atomic (lock xadd/xchg/cmpxchg/cmpxchg16b) on the

@@ -57,6 +57,11 @@ struct A32JitState {
     std::array<u64, RSB_SIZE> rsb_location_descriptors;
     std::array<u64, RSB_SIZE> rsb_codeptrs;
 
+    // Exclusive stores on the lockless monitor path (UserConfig::lockless_exclusive_monitor)
+    // and how many failed; written by JIT code (the A64 JIT logs them, see LseStats).
+    u64 exclusive_stores = 0;
+    u64 exclusive_store_failures = 0;
+
     u32 Cpsr() const;
     void SetCpsr(u32 cpsr);
 

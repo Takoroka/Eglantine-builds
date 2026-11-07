@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/nx2_ab.h"
 #include "common/settings.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_32.h"
@@ -184,6 +185,8 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
     // Multi-process state
     config.processor_id = std::uint8_t(m_core_index);
     config.global_monitor = &m_exclusive_monitor.monitor;
+    // Exclusives without the global monitor's lock (A/B bit 25; Eglantine #717).
+    config.lockless_exclusive_monitor = Common::Nx2Ab::On(Common::Nx2Ab::LockFreeMonitor);
 
     // Timing
     config.wall_clock_cntpct = m_uses_wall_clock;

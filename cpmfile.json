@@ -169,6 +169,16 @@
         "source_subdir": "build/cmake",
         "version": "ebb370ca83"
     },
+    "mimalloc": {
+        "bundled": true,
+        "hash": "c5031a268fd41cfd3b1f0f5a156d7c0923f37f3276511a1794dcc50bd6347eaa04be335600fcbd678783a8c820f09b9d118f23b9d724805532174dacf1cba57c",
+        "options": [
+            "MI_BUILD_TESTS OFF",
+            "MI_OVERRIDE ON"
+        ],
+        "repo": "microsoft/mimalloc",
+        "version": "v2.5.2"
+    },
     "moltenvk": {
         "artifact": "MoltenVK-macOS.tar",
         "bundled": true,
