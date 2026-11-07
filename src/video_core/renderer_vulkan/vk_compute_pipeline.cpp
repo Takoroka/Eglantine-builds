@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <vector>
 
 #include <boost/container/small_vector.hpp>
@@ -25,6 +26,7 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 
 namespace Vulkan {
@@ -83,7 +85,21 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         }
     }
 
-    auto func{[this, shader_notify, pipeline_statistics] {
+    auto func{[this, shader_notify, pipeline_statistics,
+                created = std::chrono::steady_clock::now()] {
+        SCOPE_EXIT {
+            if (skip_until_built) {
+                // How long its dispatches got the stand-in or were skipped (A/B bits
+                // DeferredMatrixPipelines, TensorStandIn).
+                LOG_INFO(Render_Vulkan,
+                         "Compute shader {:016X} (software matrix) built in the background after "
+                         "{:.1f} s{}",
+                         shader_hash,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - created)
+                             .count(),
+                         pipeline ? "" : " (failed: its dispatches stay skipped)");
+            }
+        };
         const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
             .pNext = nullptr,

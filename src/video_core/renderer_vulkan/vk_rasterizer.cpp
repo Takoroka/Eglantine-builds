@@ -1860,8 +1860,12 @@ const std::string* RasterizerVulkan::DispatchCompute() {
         return nullptr;
     }
     if (pipeline->SkipsDispatches()) {
-        // A software matrix pipeline AMD's compiler is still building where nothing waits for it
-        // (A/B bit DeferredMatrixPipelines): its dispatches are skipped until it exists.
+        // A software matrix pipeline still building where nothing waits for it (A/B bits
+        // DeferredMatrixPipelines, TensorStandIn): its dispatches are skipped until it exists,
+        // with TensorStandIn given the stand-in a rejected matrix program gets.
+        if (Common::Nx2Ab::On(Common::Nx2Ab::TensorStandIn)) {
+            return &VideoCore::MatrixPipelineBuildingText();
+        }
         return nullptr;
     }
     std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};
