@@ -60,6 +60,11 @@ DrawLoopKind ClassifyDrawLoop(MacroEngine& engine, u32 start);
 /// A call; `parameters` are the topology and the five arguments, if they were read.
 void CountDrawLoop(DrawLoopKind kind, DrawLoopSource source, u32 start,
                    std::span<const u32> parameters);
+/// A/B bit DrawLoopOneDraw: what a draw-loop call does about its instances. Hold: the first one
+/// waits for the loop's batch (DrawManager::BeginOneDraw); Verify: EDEN_NX2_DRAW_LOOP_VERIFY's
+/// every n-th call, drawn as before and recorded.
+enum class OneDrawUse : u8 { None, Hold, Verify };
+OneDrawUse OneDrawFor(DrawLoopKind kind, std::span<const u32> parameters);
 } // Anonymous namespace
 
 Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
@@ -546,15 +551,30 @@ void Maxwell3D::CallMacroMethod(Core::System& system, u32 method, std::span<cons
     const u32 entry =
         ((method - MacroRegistersStart) >> 1) % static_cast<u32>(GetNativeMacroPositions().size());
     const u32 start = GetNativeMacroPositions()[entry];
-    if (const DrawLoopKind kind = ClassifyDrawLoop(GetNativeMacroEngine(), start);
-        kind != NotDrawLoop) {
+    const DrawLoopKind kind = ClassifyDrawLoop(GetNativeMacroEngine(), start);
+    if (kind != NotDrawLoop) {
         CountDrawLoop(kind, g_nx2_gpu_written_entry ? GpuWrittenRead : CpuWrittenArguments, start,
                       parameters);
+    }
+    const OneDrawUse one_draw = OneDrawFor(kind, parameters);
+    if (one_draw != OneDrawUse::None) {
+        draw_manager.BeginOneDraw(parameters.first<6>(), one_draw == OneDrawUse::Verify);
     }
 
     // Execute the current macro.
     GetNativeMacroEngine().Execute(system, *this, start, parameters);
     draw_manager.DrawDeferred(*this);
+    if (one_draw != OneDrawUse::None) {
+        EndDrawLoopOneDraw(system);
+    }
+}
+
+void Maxwell3D::EndDrawLoopOneDraw(Core::System& system) {
+    if (draw_manager.EndOneDraw()) {
+        // Still held (the macro ended without the write that ends its loop): as FinishFrontMacro.
+        ConsumeSink(system);
+        draw_manager.DrawDeferred(*this);
+    }
 }
 
 // EDEN_NX2_3D_METHODS: log the first write to each 3D register (finds methods Eden doesn't model).
@@ -1724,9 +1744,20 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     auto& engine = GetNativeMacroEngine();
     const auto positions = GetNativeMacroPositions();
     const u32 start = positions[((method - MacroRegistersStart) >> 1) % positions.size()];
-    if (const DrawLoopKind kind = ClassifyDrawLoop(engine, start); kind != NotDrawLoop) {
+    const DrawLoopKind kind = ClassifyDrawLoop(engine, start);
+    if (kind != NotDrawLoop) {
         CountDrawLoop(kind, g_nx2_gpu_written_entry ? GpuWrittenRead : CpuWrittenArguments, start,
                       fs.parameters);
+    }
+    // A/B bit DrawLoopOneDraw: the back's draw manager expects this call's instances before the
+    // macro's writes reach it.
+    const OneDrawUse one_draw = OneDrawFor(kind, fs.parameters);
+    if (one_draw != OneDrawUse::None) {
+        std::array<u32, 6> parameters{};
+        std::copy_n(fs.parameters.begin(), parameters.size(), parameters.begin());
+        split.DeferEngineWork([this, parameters, verify = one_draw == OneDrawUse::Verify] {
+            draw_manager.BeginOneDraw(parameters, verify);
+        });
     }
     {
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
@@ -1760,6 +1791,9 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     if (fs.draw_pending) {
         fs.draw_pending = false;
         split.DeferEngineWork([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); });
+    }
+    if (one_draw != OneDrawUse::None) {
+        split.DeferEngineWork([this, system_ptr = &system] { EndDrawLoopOneDraw(*system_ptr); });
     }
     if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
         FrontVerify(split, fs);
@@ -2106,6 +2140,28 @@ void CountDrawLoop(DrawLoopKind kind, DrawLoopSource source, u32 start,
                            std::memory_order_relaxed)) {
         ReportDrawLoops(now);
     }
+}
+
+OneDrawUse OneDrawFor(DrawLoopKind kind, std::span<const u32> parameters) {
+    // Topology, index count, instances, first index, base vertex, base instance: a call that
+    // draws two or more instances, all of its parameters in hand (macro code matched exactly).
+    if (kind == NotDrawLoop || parameters.size() != 6 || parameters[2] < 2 ||
+        !Common::Nx2Ab::On(Common::Nx2Ab::DrawLoopOneDraw)) {
+        return OneDrawUse::None;
+    }
+    // EDEN_NX2_DRAW_LOOP_VERIFY=<n>: every n-th such call draws as before, recorded and compared
+    // with what the one draw would be (DrawManager::EndOneDraw).
+    static const u32 verify_every = [] {
+        const char* value = std::getenv("EDEN_NX2_DRAW_LOOP_VERIFY");
+        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
+    }();
+    if (verify_every != 0) {
+        static std::atomic<u32> calls{};
+        if (calls.fetch_add(1, std::memory_order_relaxed) % verify_every == 0) {
+            return OneDrawUse::Verify;
+        }
+    }
+    return OneDrawUse::Hold;
 }
 
 } // Anonymous namespace

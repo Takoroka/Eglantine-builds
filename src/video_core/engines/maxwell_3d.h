@@ -24,6 +24,7 @@
 #include "video_core/engines/const_buffer_info.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/engine_upload.h"
+#include "video_core/engines/instance_loop_hold.h"
 #include "video_core/gpu.h"
 #include "video_core/macro.h"
 #include "video_core/textures/texture.h"
@@ -3105,10 +3106,19 @@ public:
         void Clear(Maxwell3D& maxwell3d, u32 layer_count);
         /// Draws the waiting instances. loop_continues is set when the loop goes on afterwards.
         void DrawDeferred(Maxwell3D& maxwell3d, bool loop_continues = false);
-        /// Instances after the first wait to be drawn together (DrawDeferred).
+        /// Instances after the first wait to be drawn together (DrawDeferred), or the first one
+        /// waits for them (A/B bit DrawLoopOneDraw, loop_hold).
         [[nodiscard]] bool HasDeferredDraw() const noexcept {
-            return draw_state.draw_mode == DrawMode::Instance && draw_state.instance_count != 0;
+            return loop_hold.Held() ||
+                   (draw_state.draw_mode == DrawMode::Instance && draw_state.instance_count != 0);
         }
+        /// A/B bit DrawLoopOneDraw: a draw-loop macro call is about to draw parameters[2] >= 2
+        /// instances (Maxwell3D::BeginDrawLoopOneDraw); with `verify`, its draws are recorded
+        /// instead (EDEN_NX2_DRAW_LOOP_VERIFY) and compared at EndOneDraw.
+        void BeginOneDraw(std::span<const u32, 6> parameters, bool verify);
+        /// After the macro, once DrawDeferred ran: forgets the expectation and checks a recorded
+        /// call. True when a held instance is still waiting (the caller draws it).
+        [[nodiscard]] bool EndOneDraw();
         /// Methods an instance loop writes between its draws; any other write ends the loop.
         [[nodiscard]] static bool IsInstanceLoopMethod(u32 method) noexcept;
         void DrawArray(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 vertex_first, u32 vertex_count, u32 base_instance, u32 num_instances);
@@ -3128,6 +3138,12 @@ public:
         State draw_state{};
         DrawTextureState draw_texture_state{};
         IndirectParams indirect_state{};
+        InstanceLoopHold loop_hold{};
+        /// EDEN_NX2_DRAW_LOOP_VERIFY: the draws of a recorded call and its parameters.
+        bool recording{};
+        u32 recorded_count{};
+        std::array<RecordedDraw, 4> recorded{};
+        std::array<u32, 6> record_parameters{};
     };
 
     Regs regs{};
@@ -3475,6 +3491,10 @@ private:
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 count);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
+    /// A/B bit DrawLoopOneDraw, where the 3D engine runs (the back with the split): after a
+    /// draw-loop macro call that expected its instances (DrawManager::BeginOneDraw), draws an
+    /// instance still held, as FinishFrontMacro would, and forgets the expectation.
+    void EndDrawLoopOneDraw(Core::System& system);
     /// FrontIndirectDrawMacro's draw: the back's part, then the macro's last writes. `expected`
     /// (the re-check arm): the five words as the front read them, for the back to compare.
     void FrontQueueIndirectDraw(Core::System& system, VideoCommon::GpuSplit& split,

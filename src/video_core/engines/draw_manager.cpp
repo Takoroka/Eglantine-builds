@@ -4,14 +4,61 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 
+#include "common/logging.h"
+#include "common/nx2_ab.h"
 #include "common/settings.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Tegra::Engines {
+
+namespace {
+
+// A/B bit DrawLoopOneDraw (InstanceLoopHold): calls whose first instance the batch covered, calls
+// that held it for nothing (drawn alone after all), EDEN_NX2_DRAW_LOOP_VERIFY's compared and
+// different calls. One line per 30 s ("Draw-loop calls per second").
+struct OneDrawStats {
+    std::atomic<u64> collapsed{};
+    std::atomic<u64> unused{};
+    std::atomic<u64> compared{};
+    std::atomic<u64> different{};
+    std::atomic<s64> window_start{};
+};
+OneDrawStats g_one_draw;
+
+void ReportOneDraw() {
+    using namespace std::chrono;
+    const s64 now = duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+    s64 start = g_one_draw.window_start.load(std::memory_order_relaxed);
+    if (start == 0) {
+        g_one_draw.window_start.store(now, std::memory_order_relaxed);
+        return;
+    }
+    const s64 window = now - start;
+    if (window < duration_cast<nanoseconds>(30s).count() ||
+        !g_one_draw.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed)) {
+        return;
+    }
+    const double seconds = static_cast<double>(window) / 1e9;
+    const auto rate = [seconds](std::atomic<u64>& counter) {
+        return static_cast<double>(counter.exchange(0, std::memory_order_relaxed)) / seconds;
+    };
+    const double collapsed = rate(g_one_draw.collapsed);
+    LOG_INFO(HW_GPU,
+             "Draw-loop calls per second (bit 17 {}): {:.0f} drawn in one draw ({:.0f} draws saved), "
+             "{:.0f} held their first instance for nothing; verify {:.0f} compared, {:.0f} different",
+             Common::Nx2Ab::On(Common::Nx2Ab::DrawLoopOneDraw) ? "on" : "off", collapsed,
+             collapsed, rate(g_one_draw.unused), rate(g_one_draw.compared),
+             rate(g_one_draw.different));
+}
+
+} // Anonymous namespace
 
 void Maxwell3D::DrawManager::ProcessMethodCall(Maxwell3D& maxwell3d, u32 method, u32 argument) {
     switch (method) {
@@ -74,10 +121,20 @@ void Maxwell3D::DrawManager::Clear(Maxwell3D& maxwell3d, u32 layer_count) {
 
 void Maxwell3D::DrawManager::DrawDeferred(Maxwell3D& maxwell3d, bool loop_continues) {
     if (draw_state.draw_mode != DrawMode::Instance || draw_state.instance_count == 0) {
+        if (loop_hold.OnFlushWithoutBatch()) {
+            // A held first instance with no other after it: drawn now, as its End would have
+            // (this runs before the write that ends the loop changes anything).
+            g_one_draw.unused.fetch_add(1, std::memory_order_relaxed);
+            DrawEnd(maxwell3d, 1, true);
+        }
         if (!loop_continues) {
             draw_state.drawn_instances = 0;
         }
         return;
+    }
+    if (loop_hold.OnBatch()) {
+        // The batch below covers the held first instance: one draw instead of two.
+        g_one_draw.collapsed.fetch_add(1, std::memory_order_relaxed);
     }
     // The first draw of a batch also covers the loop's first instance; a batch that continues a
     // loop split by a register write draws only the instances after the ones already drawn.
@@ -228,6 +285,10 @@ void Maxwell3D::DrawManager::DrawEnd(Maxwell3D& maxwell3d, u32 instance_count, b
         }
         [[fallthrough]];
     case DrawMode::General:
+        if (!force_draw && loop_hold.HoldFirst(draw_state.drawn_instances)) {
+            // A/B bit DrawLoopOneDraw: the batch of this loop's other instances draws it.
+            break;
+        }
         draw_state.base_instance = maxwell3d.regs.global_base_instance_index;
         if (draw_state.draw_mode == DrawMode::Instance && draw_state.drawn_instances != 0) {
             draw_state.base_instance += draw_state.drawn_instances + 1;
@@ -312,7 +373,61 @@ void Maxwell3D::DrawManager::UpdateTopology(Maxwell3D& maxwell3d) {
     }
 }
 
+void Maxwell3D::DrawManager::BeginOneDraw(std::span<const u32, 6> parameters, bool verify) {
+    if (verify) {
+        recording = true;
+        recorded_count = 0;
+        std::copy(parameters.begin(), parameters.end(), record_parameters.begin());
+        return;
+    }
+    loop_hold.Expect(parameters[2]);
+}
+
+bool Maxwell3D::DrawManager::EndOneDraw() {
+    loop_hold.Forget();
+    if (recording) {
+        recording = false;
+        g_one_draw.compared.fetch_add(1, std::memory_order_relaxed);
+        const std::span<const RecordedDraw> draws{recorded.data(),
+                                                  (std::min)(recorded_count, static_cast<u32>(recorded.size()))};
+        if (recorded_count > recorded.size() ||
+            !MacroDrawsMatchOneDraw(draws, std::span<const u32, 6>{record_parameters})) {
+            g_one_draw.different.fetch_add(1, std::memory_order_relaxed);
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                const RecordedDraw last = draws.empty() ? RecordedDraw{} : draws.back();
+                LOG_WARNING(HW_GPU,
+                            "Draw-loop call drew {} draws, not the first instance + one draw of "
+                            "all: parameters {:#x} {} {} {} {} {}; last draw indexed {} topology "
+                            "{:#x} indices {}+{} base vertex {} base instance {} instances {}",
+                            recorded_count, record_parameters[0], record_parameters[1],
+                            record_parameters[2], record_parameters[3], record_parameters[4],
+                            record_parameters[5], last.indexed, last.topology, last.first_index,
+                            last.index_count, last.base_vertex, last.base_instance,
+                            last.instances);
+            }
+        }
+    }
+    ReportOneDraw();
+    return loop_hold.Held();
+}
+
 void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed, u32 instance_count) {
+    if (recording) [[unlikely]] {
+        // As the draw is asked for, before the separate topology state applies.
+        if (recorded_count < recorded.size()) {
+            recorded[recorded_count] = RecordedDraw{
+                .indexed = draw_indexed,
+                .topology = static_cast<u32>(draw_state.topology),
+                .first_index = draw_state.index_buffer.first,
+                .index_count = draw_state.index_buffer.count,
+                .base_vertex = draw_state.base_index,
+                .base_instance = draw_state.base_instance,
+                .instances = instance_count,
+            };
+        }
+        ++recorded_count;
+    }
     draw_state.draw_element_count =
         draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
     LOG_TRACE(HW_GPU, "called, topology={}, count={}", draw_state.topology, draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count);
