@@ -27,6 +27,10 @@ on:
       nightly:
         type: boolean
         default: true
+      keep_going:
+        description: keep compiling after errors (lists every error in one run)
+        type: boolean
+        default: false
       pgo:
         description: none or both
         type: string
@@ -186,7 +190,7 @@ jobs:
       - name: Build
         shell: bash
         run: |
-          cmake --build build/release --target yuzu yuzu-cmd --parallel
+          cmake --build build/release --target yuzu yuzu-cmd --parallel -- -k ${{ inputs.keep_going && 0 || 1 }}
           ccache --show-stats
 
       # Plain tar.gz with the two programs. GitHub artifacts drop the executable bit, so a tar is
