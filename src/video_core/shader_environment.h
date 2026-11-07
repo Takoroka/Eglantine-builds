@@ -367,9 +367,29 @@ void SerializePipeline(const Key& key, const Envs& envs, const std::filesystem::
                       with_mesh_state);
 }
 
+/// A pipeline cache version bump that changed only how pipeline keys are laid out (the pipeline
+/// state in them), not the environments. An older file's entries, the guest programs and what
+/// their translation read, are kept with their keys converted, so its pipelines are built again
+/// at boot instead of one by one in game; only the driver's own cache is dropped.
+struct PipelineKeyMigration {
+    u32 from_version{};
+    size_t compute_key_size{};  ///< Bytes of a compute key in that version's files
+    size_t graphics_key_size{}; ///< Bytes of a graphics key in that version's files
+    /// Fill `new_key` with the current key for one of that version's; false drops the entry.
+    bool (*convert_compute)(std::span<const char> old_key, std::vector<char>& new_key){};
+    bool (*convert_graphics)(std::span<const char> old_key, std::vector<char>& new_key){};
+};
+
+/// Rewrites `filename`, a cache of version `from_version`, as version `to_version` with the
+/// migration for that version: entries are copied as they are, their keys converted. False when
+/// there is none for that version or the file can't be read (it is then left as it was).
+bool MigratePipelineCache(const std::filesystem::path& filename, u32 from_version, u32 to_version,
+                          std::span<const PipelineKeyMigration> migrations, bool with_mesh_state);
+
+/// A file of another version is deleted, unless `migrations` converts it first.
 void LoadPipelines(std::stop_token stop_loading, const std::filesystem::path& filename, u32 expected_cache_version,
     Common::UniqueFunction<void, std::ifstream&, FileEnvironment> load_compute,
     Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>> load_graphics,
-    bool with_mesh_state = false);
+    bool with_mesh_state = false, std::span<const PipelineKeyMigration> migrations = {});
 
 } // namespace VideoCommon

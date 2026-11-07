@@ -1247,11 +1247,101 @@ void SerializePipeline(std::span<const char> key, std::span<const GenericEnviron
     }
 }
 
+bool MigratePipelineCache(const std::filesystem::path& filename, u32 from_version, u32 to_version,
+                          std::span<const PipelineKeyMigration> migrations, bool with_mesh_state) {
+    const auto migration{std::ranges::find(migrations, from_version,
+                                           &PipelineKeyMigration::from_version)};
+    if (migration == migrations.end()) {
+        return false;
+    }
+    std::filesystem::path temporary{filename};
+    temporary += ".migrating";
+    size_t kept{};
+    size_t dropped{};
+    try {
+        std::ifstream in(filename, std::ios::binary | std::ios::ate);
+        if (!in.is_open()) {
+            return false;
+        }
+        in.exceptions(std::ifstream::failbit);
+        const std::streamoff end{in.tellg()};
+        const std::streamoff header{static_cast<std::streamoff>(MAGIC_NUMBER.size() + sizeof(u32))};
+        in.seekg(header, std::ios::beg);
+        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+        out.exceptions(std::ofstream::failbit);
+        out.write(MAGIC_NUMBER.data(), MAGIC_NUMBER.size())
+            .write(reinterpret_cast<const char*>(&to_version), sizeof(to_version));
+        std::vector<char> environments;
+        std::vector<char> old_key;
+        std::vector<char> new_key;
+        std::streamoff position{header};
+        while (position != end) {
+            // An entry: its environments (copied as they are), then its key (converted).
+            std::streamoff keys_start{};
+            bool compute{};
+            try {
+                u32 num_envs{};
+                in.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+                if (num_envs == 0) {
+                    break;
+                }
+                for (u32 index = 0; index < num_envs; ++index) {
+                    FileEnvironment env;
+                    env.Deserialize(in, with_mesh_state);
+                    if (index == 0) {
+                        compute = env.ShaderStage() == Shader::Stage::Compute;
+                    }
+                }
+                keys_start = in.tellg();
+                old_key.resize(compute ? migration->compute_key_size
+                                       : migration->graphics_key_size);
+                in.read(old_key.data(), static_cast<std::streamsize>(old_key.size()));
+            } catch (const std::ios_base::failure&) {
+                // A partly written last entry (the emulator stopped while appending it).
+                break;
+            }
+            const std::streamoff next{in.tellg()};
+            const auto convert{compute ? migration->convert_compute : migration->convert_graphics};
+            new_key.clear();
+            if (convert != nullptr && convert(old_key, new_key)) {
+                environments.resize(static_cast<size_t>(keys_start - position));
+                in.seekg(position, std::ios::beg);
+                in.read(environments.data(), static_cast<std::streamsize>(environments.size()));
+                out.write(environments.data(), static_cast<std::streamsize>(environments.size()))
+                    .write(new_key.data(), static_cast<std::streamsize>(new_key.size()));
+                ++kept;
+            } else {
+                ++dropped;
+            }
+            in.seekg(next, std::ios::beg);
+            position = next;
+        }
+    } catch (const std::exception& error) {
+        LOG_ERROR(Common_Filesystem, "Pipeline cache migration failed: {}", error.what());
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        return false;
+    }
+    std::error_code error;
+    std::filesystem::rename(temporary, filename, error);
+    if (error) {
+        LOG_ERROR(Common_Filesystem, "Pipeline cache migration failed: {}", error.message());
+        std::filesystem::remove(temporary, error);
+        return false;
+    }
+    LOG_INFO(Common_Filesystem,
+             "Pipeline cache {} kept across version {} -> {}: {} entries with their keys "
+             "converted, {} dropped",
+             Common::FS::PathToUTF8String(filename.filename()), from_version, to_version, kept,
+             dropped);
+    return true;
+}
+
 void LoadPipelines(
     std::stop_token stop_loading, const std::filesystem::path& filename, u32 expected_cache_version,
     Common::UniqueFunction<void, std::ifstream&, FileEnvironment> load_compute,
     Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>> load_graphics,
-    bool with_mesh_state) {
+    bool with_mesh_state, std::span<const PipelineKeyMigration> migrations) {
     std::ifstream file(filename, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
         return;
@@ -1268,6 +1358,13 @@ void LoadPipelines(
             .read(reinterpret_cast<char*>(&cache_version), sizeof(cache_version));
         if (magic_number != MAGIC_NUMBER || cache_version != expected_cache_version) {
             file.close();
+            if (magic_number == MAGIC_NUMBER &&
+                MigratePipelineCache(filename, cache_version, expected_cache_version, migrations,
+                                     with_mesh_state)) {
+                LoadPipelines(stop_loading, filename, expected_cache_version,
+                              std::move(load_compute), std::move(load_graphics), with_mesh_state);
+                return;
+            }
             if (Common::FS::RemoveFile(filename)) {
                 if (magic_number != MAGIC_NUMBER) {
                     LOG_ERROR(Common_Filesystem, "Invalid pipeline cache file");

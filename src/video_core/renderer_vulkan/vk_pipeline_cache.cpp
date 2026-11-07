@@ -74,6 +74,19 @@ using VideoCommon::GenericEnvironment;
 using VideoCommon::GraphicsEnvironment;
 
 constexpr u32 CACHE_VERSION = 30;
+// A CACHE_VERSION bump that changes only how the pipeline keys are laid out lists the version it
+// replaces here, with its key sizes and converters: the users' own cache files (the guest
+// programs and what their translation read) are then kept, their keys converted, and their
+// pipelines built at boot, instead of being deleted and built one by one in game. The driver's
+// cache (LoadVulkanPipelineCache) is still dropped. None yet. A/B bit PipelinePrebuild.
+constexpr std::array<VideoCommon::PipelineKeyMigration, 0> KEY_MIGRATIONS{};
+
+std::span<const VideoCommon::PipelineKeyMigration> KeyMigrations() {
+    if (!Common::Nx2Ab::On(Common::Nx2Ab::PipelinePrebuild)) {
+        return {};
+    }
+    return KEY_MIGRATIONS;
+}
 constexpr size_t VULKAN_CACHE_FLUSH_PIPELINES = 128;
 constexpr size_t VULKAN_CACHE_FLUSH_MIN_SECONDS = 30;
 constexpr std::array<char, 8> VULKAN_CACHE_MAGIC_NUMBER{'y', 'u', 'z', 'u', 'v', 'k', 'c', 'h'};
@@ -1212,11 +1225,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         ++state.total;
     }};
     VideoCommon::LoadPipelines(stop_loading, pipeline_cache_filename, CACHE_VERSION, load_compute,
-                               load_graphics);
+                               load_graphics, false, KeyMigrations());
     if (device.IsExtMeshShaderSupported()) {
         loading_mesh_file = true;
         VideoCommon::LoadPipelines(stop_loading, mesh_pipeline_cache_filename, CACHE_VERSION,
-                                   load_compute, load_graphics, true);
+                                   load_compute, load_graphics, true, KeyMigrations());
     }
 
     LOG_INFO(Render_Vulkan, "Total Pipeline Count: {}", state.total);
