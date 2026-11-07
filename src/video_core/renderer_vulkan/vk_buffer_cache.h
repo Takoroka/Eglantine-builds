@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <limits>
+#include <memory>
 #include <span>
 #include <utility>
 
@@ -20,6 +21,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_multi_range_buffer.h"
+#include "video_core/renderer_vulkan/vk_readback_queue.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/surface.h"
@@ -179,6 +181,18 @@ public:
     /// to the host before the submission's fence (A/B bit 54).
     void HostReadBarrier();
 
+    /// A/B bit 11 ReadbackQueue: copies `copies` (source buffer -> `staging`, destination offsets
+    /// in staging.buffer) on the readback queue once the GPU is done with the sources' last use
+    /// (Buffer::LastUsageTick, GpuWriteTick), and waits for those copies alone. False, with
+    /// nothing recorded, when it can't (bit off, no readback queue, a source used in the command
+    /// buffer still recording): the caller copies and waits (FinishReadback) as before.
+    /// EDEN_NX2_READBACK_VERIFY=1: also copies them the old way and compares.
+    bool ReadbackCopies(const StagingBufferRef& staging,
+                        std::span<const std::pair<Buffer*, VideoCommon::BufferCopy>> copies);
+
+    /// Finish() for a download ReadbackCopies didn't take (timed for the "Readback queue" line).
+    void FinishReadback();
+
     void ClearBuffer(VkBuffer dest_buffer, u32 offset, size_t size, u32 value);
 
     void BindIndexBuffer(PrimitiveTopology topology, IndexFormat index_format, u32 num_indices,
@@ -311,11 +325,39 @@ private:
     void ReserveNullBuffer();
     vk::Buffer CreateNullBuffer();
 
+    /// EDEN_NX2_READBACK_VERIFY: the copies ReadbackCopies made, again with Finish(), compared;
+    /// a mismatch keeps the Finish() bytes.
+    void VerifyReadback(const StagingBufferRef& staging,
+                        std::span<const std::pair<Buffer*, VideoCommon::BufferCopy>> copies);
+    void MaybeLogReadbacks();
+
     const Device& device;
     MemoryAllocator& memory_allocator;
     Scheduler& scheduler;
     StagingBufferPool& staging_pool;
     GuestDescriptorQueue& guest_descriptor_queue;
+
+    /// A/B bit 11 ReadbackQueue (null without a readback queue) and its counters.
+    std::unique_ptr<ReadbackQueue> readback_queue;
+    struct ReadbackStats {
+        std::atomic<u64> copies{};     ///< ReadbackCopies calls done on the readback queue
+        std::atomic<u64> copy_ns{};    ///< ... the host's wait for them
+        std::atomic<u64> bytes{};
+        std::atomic<u64> finishes{};   ///< Downloads through Finish() (FinishReadback)
+        std::atomic<u64> finish_ns{};
+        std::atomic<u64> recording{};  ///< ... a source used in the recording command buffer
+        std::atomic<u64> no_queue{};   ///< ... the bit on, but no readback queue
+        std::atomic<u64> verified{};   ///< EDEN_NX2_READBACK_VERIFY: calls compared
+        std::atomic<u64> mismatched{}; ///< ... with bytes that differ from the Finish() copy
+        std::atomic<s64> next_log{};
+    };
+    struct ReadbackTotals {
+        u64 copies{}, copy_ns{}, bytes{}, finishes{}, finish_ns{}, recording{}, no_queue{},
+            verified{}, mismatched{};
+    };
+    ReadbackStats readback_stats;
+    ReadbackTotals readback_last{};
+    s64 readback_last_log{}; ///< Written by the thread whose MaybeLogReadbacks took the window
 
     std::shared_ptr<QuadArrayIndexBuffer> quad_array_index_buffer;
     std::shared_ptr<QuadStripIndexBuffer> quad_strip_index_buffer;

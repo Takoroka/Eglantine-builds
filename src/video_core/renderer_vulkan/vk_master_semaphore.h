@@ -33,6 +33,12 @@ public:
         return current_tick.load(std::memory_order_acquire);
     }
 
+    /// The timeline semaphore each submission signals with its tick (null without timeline
+    /// semaphores: fences instead). Other queues' submissions may wait on it (ReadbackQueue).
+    [[nodiscard]] VkSemaphore Timeline() const noexcept {
+        return semaphore ? *semaphore : VK_NULL_HANDLE;
+    }
+
     /// Returns the last known GPU tick.
     [[nodiscard]] u64 KnownGpuTick() const noexcept {
         return gpu_tick.load(std::memory_order_acquire);

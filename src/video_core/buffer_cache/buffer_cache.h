@@ -2150,9 +2150,11 @@ template <class P>
 void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync) {
     ++nx2_gpu_write_serial;
     if constexpr (!IS_OPENGL) {
+        Buffer& buffer = slot_buffers[buffer_id];
+        const u64 tick = runtime.CurrentTick();
+        buffer.NoteGpuWrite(tick);
         if (needs_sync) {
-            Buffer& buffer = slot_buffers[buffer_id];
-            buffer.setWriteTick(runtime.CurrentTick());
+            buffer.setWriteTick(tick);
         }
     }
     // The downloads already taken over this range hold older bytes: when their fences pop
@@ -2626,10 +2628,13 @@ bool BufferCache<P>::Nx2ReadBack(DAddr device_addr, std::span<u8> out) {
             .dst_offset = staging.offset,
             .size = size,
         };
-        buffer.MarkUsage(copy.src_offset, copy.size);
-        runtime.CopyBuffer(staging.buffer, buffer, std::span{&copy, 1}, true);
-        runtime.HostReadBarrier();
-        runtime.Finish();
+        const std::pair<Buffer*, BufferCopy> readback{&buffer, copy};
+        if (!ReadbackOnOwnQueue(staging, std::span{&readback, 1})) {
+            buffer.MarkUsage(copy.src_offset, copy.size);
+            runtime.CopyBuffer(staging.buffer, buffer, std::span{&copy, 1}, true);
+            runtime.HostReadBarrier();
+            FinishReadback();
+        }
         std::memcpy(out.data(), staging.mapped_span.data(), size);
         return true;
     }
@@ -3170,14 +3175,20 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
         return;
     }
     auto download_staging = runtime.DownloadStagingBuffer(total_size_bytes);
+    boost::container::small_vector<std::pair<Buffer*, BufferCopy>, 16> readbacks;
     for (Download& download : downloads) {
         download.copy.dst_offset += download_staging.offset;
-        Buffer& buffer = slot_buffers[download.buffer_id];
-        buffer.MarkUsage(download.copy.src_offset, download.copy.size);
-        runtime.CopyBuffer(download_staging.buffer, buffer, std::span{&download.copy, 1}, true);
+        readbacks.emplace_back(&slot_buffers[download.buffer_id], download.copy);
     }
-    runtime.HostReadBarrier();
-    runtime.Finish();
+    if (!ReadbackOnOwnQueue(download_staging, readbacks)) {
+        for (Download& download : downloads) {
+            Buffer& buffer = slot_buffers[download.buffer_id];
+            buffer.MarkUsage(download.copy.src_offset, download.copy.size);
+            runtime.CopyBuffer(download_staging.buffer, buffer, std::span{&download.copy, 1}, true);
+        }
+        runtime.HostReadBarrier();
+        FinishReadback();
+    }
     const u8* const mapped_memory = download_staging.mapped_span.data();
     const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
     for (const Download& download : downloads) {
@@ -3229,14 +3240,21 @@ void BufferCache<P>::DownloadRanges(const Common::RangeSet<DAddr>& ranges) {
             return;
         }
         auto download_staging = runtime.DownloadStagingBuffer(total_size_bytes);
+        boost::container::small_vector<std::pair<Buffer*, BufferCopy>, 16> readbacks;
         for (Download& download : downloads) {
             download.copy.dst_offset += download_staging.offset;
-            Buffer& buffer = slot_buffers[download.buffer_id];
-            buffer.MarkUsage(download.copy.src_offset, download.copy.size);
-            runtime.CopyBuffer(download_staging.buffer, buffer, std::span{&download.copy, 1}, true);
+            readbacks.emplace_back(&slot_buffers[download.buffer_id], download.copy);
         }
-        runtime.HostReadBarrier();
-        runtime.Finish();
+        if (!ReadbackOnOwnQueue(download_staging, readbacks)) {
+            for (Download& download : downloads) {
+                Buffer& buffer = slot_buffers[download.buffer_id];
+                buffer.MarkUsage(download.copy.src_offset, download.copy.size);
+                runtime.CopyBuffer(download_staging.buffer, buffer,
+                                   std::span{&download.copy, 1}, true);
+            }
+            runtime.HostReadBarrier();
+            FinishReadback();
+        }
         const u8* const mapped_memory = download_staging.mapped_span.data();
         for (const Download& download : downloads) {
             const DAddr device_addr =
@@ -3296,14 +3314,20 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
         auto download_staging = runtime.DownloadStagingBuffer(total_size_bytes);
         const u8* const mapped_memory = download_staging.mapped_span.data();
         const std::span<BufferCopy> copies_span(copies.data(), copies.data() + copies.size());
+        boost::container::small_vector<std::pair<Buffer*, BufferCopy>, 16> readbacks;
         for (BufferCopy& copy : copies) {
             // Modify copies to have the staging offset in mind
             copy.dst_offset += download_staging.offset;
-            buffer.MarkUsage(copy.src_offset, copy.size);
+            readbacks.emplace_back(&buffer, copy);
         }
-        runtime.CopyBuffer(download_staging.buffer, buffer, copies_span, true);
-        runtime.HostReadBarrier();
-        runtime.Finish();
+        if (!ReadbackOnOwnQueue(download_staging, readbacks)) {
+            for (const BufferCopy& copy : copies) {
+                buffer.MarkUsage(copy.src_offset, copy.size);
+            }
+            runtime.CopyBuffer(download_staging.buffer, buffer, copies_span, true);
+            runtime.HostReadBarrier();
+            FinishReadback();
+        }
         for (const BufferCopy& copy : copies) {
             const DAddr copy_device_addr = buffer.CpuAddr() + copy.src_offset;
             // Undo the modified offset

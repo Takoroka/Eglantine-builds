@@ -133,6 +133,10 @@ enum Feature : u64 {
     // switchbrew (11-06): VK_EXT_host_image_copy for the first upload of CPU-produced textures:
     // the CPU writes them into the image (Image::HostUpload), no staging copy on the GPU.
     HostImageCopy = 1ull << 16,
+    // backperf (11-06, play-dkb7 idea 32): buffer downloads copy on a graphics-family queue of
+    // their own (Vulkan::ReadbackQueue) after the GPU tick of the source's last use, and wait for
+    // that copy alone instead of Finish() (the whole graphics queue).
+    ReadbackQueue = 1ull << 11,
 };
 
 inline const u64 g_mask = [] {

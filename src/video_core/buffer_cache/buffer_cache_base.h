@@ -615,6 +615,28 @@ private:
     /// Downloads the GPU-written bytes in these ranges with one copy batch and one wait.
     void DownloadRanges(const Common::RangeSet<DAddr>& ranges);
 
+    /// A download's copies into `staging` (destination offsets in its buffer) done and waited
+    /// for on the runtime's readback queue (A/B bit 11, ReadbackCopies), if it has one and can:
+    /// false, with nothing recorded, otherwise.
+    template <typename Staging>
+    bool ReadbackOnOwnQueue(const Staging& staging,
+                            std::span<const std::pair<Buffer*, BufferCopy>> copies) {
+        if constexpr (requires { runtime.ReadbackCopies(staging, copies); }) {
+            return runtime.ReadbackCopies(staging, copies);
+        } else {
+            return false;
+        }
+    }
+
+    /// The wait of a download that ReadbackOnOwnQueue didn't take.
+    void FinishReadback() {
+        if constexpr (requires { runtime.FinishReadback(); }) {
+            runtime.FinishReadback();
+        } else {
+            runtime.Finish();
+        }
+    }
+
     /// Marks a written compute binding: its first written_size bytes, and past them (a native
     /// binding sized from the mapping) the pages known to be GPU output (see native_tail_output).
     void MarkWrittenComputeStorage(const Binding& binding,

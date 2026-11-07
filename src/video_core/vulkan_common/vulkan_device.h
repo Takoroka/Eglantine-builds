@@ -330,6 +330,17 @@ public:
         return own_present_queue_mutex;
     }
 
+    /// Whether download copies have a graphics-family queue of their own (A/B bit 11
+    /// ReadbackQueue, ChooseReadbackQueue): no submit and no present uses it.
+    bool HasReadbackQueue() const {
+        return readback_choice.available;
+    }
+
+    /// Returns that queue (HasReadbackQueue). Its user (Vulkan::ReadbackQueue) locks it.
+    vk::Queue GetReadbackQueue() const {
+        return readback_queue;
+    }
+
     /// Returns main graphics queue family index.
     u32 GetGraphicsFamily() const {
         return graphics_family;
@@ -1342,6 +1353,8 @@ private:
     vk::Queue own_present_queue; ///< Present queue apart from the graphics queue, if any.
     mutable std::mutex own_present_queue_mutex;
     PresentQueueChoice present_choice{1, 0, false}; ///< SetupFamilies
+    vk::Queue readback_queue;                         ///< Download copies' queue, if any
+    ReadbackQueueChoice readback_choice{1, 0, false}; ///< SetupFamilies
     vk::PipelineCache static_pipeline_cache;
     bool owns_static_pipeline_cache{};
     u32 instance_version{};      ///< Vulkan instance version.
