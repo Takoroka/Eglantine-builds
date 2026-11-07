@@ -17,6 +17,7 @@
 
 #include "common/cityhash.h"
 #include "common/logging.h"
+#include "common/nx2_ab.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
@@ -57,6 +58,20 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
 
     AcquireNewChunk();
     AllocateWorkerCommandBuffer();
+    if (master_semaphore->IsTimeline() && device.IsSparseBindingSupported()) {
+        // A/B bit SparseBindAsync: queued sparse binds signal this; submissions wait for it.
+        static constexpr VkSemaphoreTypeCreateInfo semaphore_type_ci{
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+            .pNext = nullptr,
+            .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+            .initialValue = 0,
+        };
+        sparse_timeline = device.GetLogical().CreateSemaphore(VkSemaphoreCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+            .pNext = &semaphore_type_ci,
+            .flags = 0,
+        });
+    }
     worker_thread = std::jthread([this](std::stop_token token) { WorkerThread(token); });
 }
 
@@ -455,9 +470,18 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     }
     InvalidateState();
 
+    // The sparse binds queued since the last submission go to the queue right before it.
+    std::unique_ptr<SparseBindBatch> sparse;
+    if (!pending_sparse.Empty()) {
+        sparse = std::make_unique<SparseBindBatch>();
+        sparse->Append(std::move(pending_sparse));
+        pending_sparse_serial.store(0, std::memory_order_relaxed);
+        ++sparse_handed;
+    }
     const u64 signal_value = master_semaphore->NextTick();
-    RecordImpl([signal_semaphore, wait_semaphore, signal_value,
-                this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
+    RecordImpl([signal_semaphore, wait_semaphore, signal_value, this,
+                sparse = std::move(sparse)](vk::CommandBuffer cmdbuf,
+                                            vk::CommandBuffer upload_cmdbuf) {
         static constexpr VkMemoryBarrier WRITE_BARRIER{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .pNext = nullptr,
@@ -473,8 +497,17 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         }
 
         std::scoped_lock lock{submit_mutex};
+        u64 sparse_value = 0;
+        if (sparse) {
+            sparse_value = SubmitSparse(*sparse);
+            sparse_bound.fetch_add(1, std::memory_order_release);
+        }
+        if (sparse_timeline) {
+            TickSparse();
+        }
         switch (const VkResult result = master_semaphore->SubmitQueue(
-                    cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
+                    cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value,
+                    sparse_value != 0 ? *sparse_timeline : VK_NULL_HANDLE, sparse_value)) {
         case VK_SUCCESS:
             // Log successful queue submission
             if (GPU::Logging::IsActive() &&
@@ -766,6 +799,176 @@ void Scheduler::TimeFrameEnd() {
         // The render pass goes on into the next frame: its rest is a segment of that frame.
         OpenTimed(timed_pass, timed_pass_key, false);
     }
+}
+
+bool Scheduler::BindSparse(SparseBindBatch&& binds, bool now) {
+    if (binds.Empty()) {
+        return true;
+    }
+    sparse_stats.binds.fetch_add(binds.Binds(), std::memory_order_relaxed);
+    binds.CountRequest();
+    if (!now && sparse_timeline && Common::Nx2Ab::On(Common::Nx2Ab::SparseBindAsync)) {
+        sparse_stats.queued.fetch_add(1, std::memory_order_relaxed);
+        if (pending_sparse.Empty()) {
+            pending_sparse_serial.store(++sparse_serials, std::memory_order_relaxed);
+        }
+        pending_sparse.Append(std::move(binds));
+        return true;
+    }
+    sparse_stats.now.fetch_add(1, std::memory_order_relaxed);
+    return BindSparseNow(std::move(binds));
+}
+
+bool Scheduler::BindSparseNow(SparseBindBatch&& binds) {
+    // What was queued goes with it (other blocks: each is bound once and never rebound), so that
+    // nothing queued is left for a submission after memory the caller frees.
+    SparseBindBatch batch;
+    if (!pending_sparse.Empty()) {
+        batch.Append(std::move(pending_sparse));
+        pending_sparse_serial.store(0, std::memory_order_relaxed);
+    }
+    batch.Append(std::move(binds));
+    if (batch.Empty()) {
+        return true;
+    }
+    // Batches given to submissions the worker hasn't made yet go to the queue first; this bind
+    // then waits for them (the caller may free memory they rebind blocks away from).
+    if (sparse_handed != sparse_bound.load(std::memory_order_acquire)) {
+        WaitWorker();
+    }
+    VkBindSparseInfo info = batch.Info();
+    vk::Fence fence = device.GetLogical().CreateFence(VkFenceCreateInfo{
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+    });
+    const auto start = std::chrono::steady_clock::now();
+    VkResult result;
+    {
+        std::scoped_lock lock{submit_mutex};
+        // With the bit off, the graphics queue as before.
+        const vk::Queue bind_queue = Common::Nx2Ab::On(Common::Nx2Ab::SparseBindAsync)
+                                         ? device.GetSparseQueue()
+                                         : device.GetGraphicsQueue();
+        const VkSemaphore semaphore = sparse_timeline ? *sparse_timeline : VK_NULL_HANDLE;
+        const u64 wait_value = sparse_timeline_value;
+        const VkTimelineSemaphoreSubmitInfo timeline_info{
+            .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+            .pNext = nullptr,
+            .waitSemaphoreValueCount = 1,
+            .pWaitSemaphoreValues = &wait_value,
+            .signalSemaphoreValueCount = 0,
+            .pSignalSemaphoreValues = nullptr,
+        };
+        if (semaphore != VK_NULL_HANDLE && wait_value != 0) {
+            info.pNext = &timeline_info;
+            info.waitSemaphoreCount = 1;
+            info.pWaitSemaphores = &semaphore;
+        }
+        result = bind_queue.BindSparse(info, *fence);
+    }
+    if (result != VK_SUCCESS) {
+        sparse_stats.failed.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    fence.Wait();
+    sparse_stats.waited_ns.fetch_add(
+        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count()),
+        std::memory_order_relaxed);
+    return true;
+}
+
+void Scheduler::FlushSparseBinds(u64 serial) {
+    if (serial == 0 || pending_sparse_serial.load(std::memory_order_relaxed) != serial) {
+        return;
+    }
+    if (!BindSparseNow(SparseBindBatch{})) {
+        LOG_ERROR(Render_Vulkan, "Sparse binds queued for a destroyed resource failed to bind");
+    }
+}
+
+u64 Scheduler::SubmitSparse(SparseBindBatch& batch) {
+    const u64 value = sparse_timeline_value + 1;
+    const u64 wait_value = sparse_timeline_value;
+    const VkSemaphore semaphore = *sparse_timeline;
+    // Each batch also waits for the one before it: batches stay in order.
+    const VkTimelineSemaphoreSubmitInfo timeline_info{
+        .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+        .pNext = nullptr,
+        .waitSemaphoreValueCount = wait_value != 0 ? 1U : 0U,
+        .pWaitSemaphoreValues = wait_value != 0 ? &wait_value : nullptr,
+        .signalSemaphoreValueCount = 1,
+        .pSignalSemaphoreValues = &value,
+    };
+    VkBindSparseInfo info = batch.Info();
+    info.pNext = &timeline_info;
+    info.waitSemaphoreCount = wait_value != 0 ? 1U : 0U;
+    info.pWaitSemaphores = wait_value != 0 ? &semaphore : nullptr;
+    info.signalSemaphoreCount = 1;
+    info.pSignalSemaphores = &semaphore;
+    const VkResult result = device.GetSparseQueue().BindSparse(info, VK_NULL_HANDLE);
+    if (result != VK_SUCCESS) {
+        // The submission runs without them: the blocks read as unbound.
+        if (sparse_stats.failed.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_ERROR(Render_Vulkan, "Sparse binds: {} requests ({} binds) failed to bind ({})",
+                      batch.Requests(), batch.Binds(), static_cast<int>(result));
+        }
+        if (result == VK_ERROR_DEVICE_LOST) {
+            device.ReportLoss();
+        }
+        return 0;
+    }
+    sparse_timeline_value = value;
+    sparse_stats.batches.fetch_add(1, std::memory_order_relaxed);
+    sparse_in_flight.emplace_back(value, std::chrono::steady_clock::now());
+    return value;
+}
+
+void Scheduler::TickSparse() {
+    const auto now = std::chrono::steady_clock::now();
+    if (!sparse_in_flight.empty()) {
+        // What a fence wait per batch would have cost the recording thread, at most (seen done
+        // at a later submission).
+        const u64 done = sparse_timeline.GetCounter();
+        while (!sparse_in_flight.empty() && sparse_in_flight.front().first <= done) {
+            sparse_stats.unwaited_ns.fetch_add(
+                static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     now - sparse_in_flight.front().second)
+                                     .count()),
+                std::memory_order_relaxed);
+            sparse_in_flight.pop_front();
+        }
+    }
+    if (sparse_next_log == std::chrono::steady_clock::time_point{}) {
+        sparse_next_log = now + std::chrono::seconds{30};
+        return;
+    }
+    if (now < sparse_next_log) {
+        return;
+    }
+    sparse_next_log = now + std::chrono::seconds{30};
+    const u64 queued = sparse_stats.queued.exchange(0, std::memory_order_relaxed);
+    const u64 at_once = sparse_stats.now.exchange(0, std::memory_order_relaxed);
+    const u64 binds = sparse_stats.binds.exchange(0, std::memory_order_relaxed);
+    const u64 batches = sparse_stats.batches.exchange(0, std::memory_order_relaxed);
+    const u64 failed = sparse_stats.failed.exchange(0, std::memory_order_relaxed);
+    const u64 waited_ns = sparse_stats.waited_ns.exchange(0, std::memory_order_relaxed);
+    const u64 unwaited_ns = sparse_stats.unwaited_ns.exchange(0, std::memory_order_relaxed);
+    if (queued + at_once + failed == 0) {
+        return;
+    }
+    // grep "Sparse binds last 30 s"
+    LOG_INFO(Render_Vulkan,
+             "Sparse binds last 30 s (A/B bit SparseBindAsync {}, {} queue): {} requests ({:.1f}/s, "
+             "{} memory binds): {} queued in {} batches ({:.1f}/s), {} bound at once (fence waits "
+             "{:.1f} ms); queued batches' GPU time nothing waited for: {:.1f} ms (at most); {} failed",
+             Common::Nx2Ab::On(Common::Nx2Ab::SparseBindAsync) ? "on" : "off",
+             device.HasOwnSparseQueue() ? "own" : "graphics", queued + at_once,
+             static_cast<double>(queued + at_once) / 30.0, binds, queued, batches,
+             static_cast<double>(batches) / 30.0, at_once, static_cast<double>(waited_ns) / 1e6,
+             static_cast<double>(unwaited_ns) / 1e6, failed);
 }
 
 void Scheduler::AcquireNewChunk() {

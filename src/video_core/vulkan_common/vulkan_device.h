@@ -341,6 +341,18 @@ public:
         return readback_queue;
     }
 
+    /// The queue sparse binds go to (A/B bit SparseBindAsync): a queue of a family of its own
+    /// (a transfer queue with sparse binding; HasOwnSparseQueue), or the graphics queue. Only the
+    /// scheduler uses it, under its submit lock.
+    vk::Queue GetSparseQueue() const {
+        return has_own_sparse_queue ? sparse_queue : graphics_queue;
+    }
+
+    /// Sparse binds have a queue apart from the graphics queue (GetSparseQueue).
+    bool HasOwnSparseQueue() const {
+        return has_own_sparse_queue;
+    }
+
     /// Returns main graphics queue family index.
     u32 GetGraphicsFamily() const {
         return graphics_family;
@@ -1361,6 +1373,9 @@ private:
     u32 graphics_family{};       ///< Main graphics queue family index.
     u32 present_family{};        ///< Main present queue family index.
     bool graphics_family_sparse_binding{};
+    vk::Queue sparse_queue;       ///< Sparse binds (HasOwnSparseQueue)
+    u32 sparse_family{};          ///< Its family (SetupFamilies)
+    bool has_own_sparse_queue{};
 
     struct Extensions {
 #define EXTENSION(prefix, macro_name, var_name) bool var_name{};

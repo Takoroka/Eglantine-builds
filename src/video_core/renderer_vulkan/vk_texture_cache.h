@@ -574,8 +574,9 @@ public:
     std::vector<u32> BindLayers(std::span<const u32> layers);
 
     /// SparseTiles images: gives the host sparse blocks under `rects` (and the mip tail, for
-    /// levels in it) device memory where they have none yet. False if that failed.
-    bool BindTiles(std::span<const VideoCommon::LevelRect> rects);
+    /// levels in it) device memory where they have none yet. False if that failed. The binds go
+    /// with the next submission (Scheduler::BindSparse); `now` binds them before returning.
+    bool BindTiles(std::span<const VideoCommon::LevelRect> rects, bool now = false);
 
     /// SparseTiles images: the host sparse block, in texels, and the first level of the mip tail.
     u32 SparseTileWidth() const noexcept {
@@ -695,6 +696,8 @@ private:
         bool warned{};
     };
     SparseLayerMemory sparse_layers;
+    /// Scheduler::PendingSparseSerial of the image's last queued binds (0: none).
+    u64 sparse_serial = 0;
 
     /// Reads the image's sparse requirements; false when it can't be bound by layer.
     bool InitSparseLayers();
