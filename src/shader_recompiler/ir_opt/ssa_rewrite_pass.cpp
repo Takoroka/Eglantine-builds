@@ -54,74 +54,91 @@ struct IndirectBranchVariable {
 };
 
 using Variant = std::variant<IR::Reg, IR::Pred, ZeroFlagTag, SignFlagTag, CarryFlagTag, OverflowFlagTag, GotoVariable, IndirectBranchVariable>;
-// TODO: majority of these require stable iterators, test with XC beforehand
-using ValueMap = std::unordered_map<IR::Block*, IR::Value>;
 
+// Block::SsaVariableValue indices of the fixed-count variables other than registers.
+constexpr size_t ZERO_FLAG_INDEX = IR::NUM_USER_PREDS;
+constexpr size_t SIGN_FLAG_INDEX = ZERO_FLAG_INDEX + 1;
+constexpr size_t CARRY_FLAG_INDEX = ZERO_FLAG_INDEX + 2;
+constexpr size_t OVERFLOW_FLAG_INDEX = ZERO_FLAG_INDEX + 3;
+constexpr size_t INDIRECT_BRANCH_INDEX = ZERO_FLAG_INDEX + 4;
+static_assert(INDIRECT_BRANCH_INDEX < IR::Block::NUM_SSA_VARIABLES);
+
+struct GotoKey {
+    IR::Block* block;
+    u32 index;
+
+    bool operator==(const GotoKey&) const noexcept = default;
+};
+
+struct GotoKeyHash {
+    size_t operator()(const GotoKey& key) const noexcept {
+        return std::hash<IR::Block*>{}(key.block) ^
+               (static_cast<size_t>(key.index) * 0x9e3779b97f4a7c15ULL);
+    }
+};
+
+// Registers, predicates, flags and the indirect branch variable are stored in the blocks: the
+// reads walk back through blocks and look up a definition in each, which hash maps keyed by
+// block made a large part of the pass. Goto variables are not a fixed count.
 struct DefTable {
-    const IR::Value& Def(IR::Block* block, IR::Reg variable) {
+    IR::Value Def(IR::Block* block, IR::Reg variable) {
         return block->SsaRegValue(variable);
     }
     void SetDef(IR::Block* block, IR::Reg variable, const IR::Value& value) {
         block->SetSsaRegValue(variable, value);
     }
 
-    const IR::Value& Def(IR::Block* block, IR::Pred variable) {
-        return preds[IR::PredIndex(variable)][block];
+    IR::Value Def(IR::Block* block, IR::Pred variable) {
+        return block->SsaVariableValue(IR::PredIndex(variable));
     }
     void SetDef(IR::Block* block, IR::Pred variable, const IR::Value& value) {
-        preds[IR::PredIndex(variable)].insert_or_assign(block, value);
+        block->SetSsaVariableValue(IR::PredIndex(variable), value);
     }
 
-    const IR::Value& Def(IR::Block* block, GotoVariable variable) {
-        return goto_vars[variable.index][block];
+    IR::Value Def(IR::Block* block, GotoVariable variable) {
+        const auto it{goto_vars.find(GotoKey{block, variable.index})};
+        return it != goto_vars.end() ? it->second : IR::Value{};
     }
     void SetDef(IR::Block* block, GotoVariable variable, const IR::Value& value) {
-        goto_vars[variable.index].insert_or_assign(block, value);
+        goto_vars.insert_or_assign(GotoKey{block, variable.index}, value);
     }
 
-    const IR::Value& Def(IR::Block* block, IndirectBranchVariable) {
-        return indirect_branch_var[block];
+    IR::Value Def(IR::Block* block, IndirectBranchVariable) {
+        return block->SsaVariableValue(INDIRECT_BRANCH_INDEX);
     }
     void SetDef(IR::Block* block, IndirectBranchVariable, const IR::Value& value) {
-        indirect_branch_var.insert_or_assign(block, value);
+        block->SetSsaVariableValue(INDIRECT_BRANCH_INDEX, value);
     }
 
-    const IR::Value& Def(IR::Block* block, ZeroFlagTag) {
-        return zero_flag[block];
+    IR::Value Def(IR::Block* block, ZeroFlagTag) {
+        return block->SsaVariableValue(ZERO_FLAG_INDEX);
     }
     void SetDef(IR::Block* block, ZeroFlagTag, const IR::Value& value) {
-        zero_flag.insert_or_assign(block, value);
+        block->SetSsaVariableValue(ZERO_FLAG_INDEX, value);
     }
 
-    const IR::Value& Def(IR::Block* block, SignFlagTag) {
-        return sign_flag[block];
+    IR::Value Def(IR::Block* block, SignFlagTag) {
+        return block->SsaVariableValue(SIGN_FLAG_INDEX);
     }
     void SetDef(IR::Block* block, SignFlagTag, const IR::Value& value) {
-        sign_flag.insert_or_assign(block, value);
+        block->SetSsaVariableValue(SIGN_FLAG_INDEX, value);
     }
 
-    const IR::Value& Def(IR::Block* block, CarryFlagTag) {
-        return carry_flag[block];
+    IR::Value Def(IR::Block* block, CarryFlagTag) {
+        return block->SsaVariableValue(CARRY_FLAG_INDEX);
     }
     void SetDef(IR::Block* block, CarryFlagTag, const IR::Value& value) {
-        carry_flag.insert_or_assign(block, value);
+        block->SetSsaVariableValue(CARRY_FLAG_INDEX, value);
     }
 
-    const IR::Value& Def(IR::Block* block, OverflowFlagTag) {
-        return overflow_flag[block];
+    IR::Value Def(IR::Block* block, OverflowFlagTag) {
+        return block->SsaVariableValue(OVERFLOW_FLAG_INDEX);
     }
     void SetDef(IR::Block* block, OverflowFlagTag, const IR::Value& value) {
-        overflow_flag.insert_or_assign(block, value);
+        block->SetSsaVariableValue(OVERFLOW_FLAG_INDEX, value);
     }
 
-    std::array<ValueMap, IR::NUM_USER_PREDS> preds;
-    // TODO: Requires stable iterators
-    std::unordered_map<u32, ValueMap> goto_vars;
-    ValueMap indirect_branch_var;
-    ValueMap zero_flag;
-    ValueMap sign_flag;
-    ValueMap carry_flag;
-    ValueMap overflow_flag;
+    ::Common::unordered_map<GotoKey, IR::Value, GotoKeyHash> goto_vars;
 };
 
 IR::Opcode UndefOpcode(IR::Reg) noexcept {
@@ -192,7 +209,7 @@ public:
             IR::Block* const block{stack.back().block};
             switch (stack.back().pc) {
             case Status::Start: {
-                if (const IR::Value& def = current_def.Def(block, variable); !def.IsEmpty()) {
+                if (const IR::Value def = current_def.Def(block, variable); !def.IsEmpty()) {
                     stack.back().result = def;
                 } else if (!block->IsSsaSealed()) {
                     // Incomplete CFG
