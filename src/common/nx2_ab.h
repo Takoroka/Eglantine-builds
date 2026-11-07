@@ -78,6 +78,10 @@ enum Feature : u64 {
     // un-inset endpoints too and keeps the pair with less error: two-colour blocks (text, UI,
     // decals) 32 -> 42 dB, like the CPU encoder (BcEncoderPass::Encode).
     GpuBcEncodeEndpoints = 1ull << 26,
+    // frontprep (11-07, crash 1 of the play-dkb8 sessions): nx2:vi2's 4 s wait for a presented
+    // frame's fence counts only time the split's back is idle, up to 30 s in all
+    // (Service::Nx2::PresentDeadline).
+    PresentWaitBusyBack = 1ull << 27,
     // fences (11-05): direct draws with no vertices or no instances skip the draw setup.
     ZeroDrawSkip = 1ull << 40,
     // vkoff (11-05): draws with none of the dynamic states' dirty flags set skip their updates.
