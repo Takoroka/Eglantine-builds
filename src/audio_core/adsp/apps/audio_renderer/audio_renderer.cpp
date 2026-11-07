@@ -171,6 +171,7 @@ void AudioRenderer::Main(std::stop_token stop_token) {
             }
             last_pass_start = pass_start;
             counters.passes.fetch_add(1, std::memory_order_relaxed);
+            counters.pass_index.fetch_add(1, std::memory_order_relaxed);
             if (command_buffers[0].buffer != 0 && streams[0]->GetQueueSize() == 0) {
                 counters.empty_at_start.fetch_add(1, std::memory_order_relaxed);
             }
@@ -219,7 +220,7 @@ void AudioRenderer::Main(std::stop_token stop_token) {
                         const s64 wait_start = Nx2AudioStats::NowNs();
                         streams[index]->WaitFreeSpace(stop_token);
                         waited_ns = Nx2AudioStats::NowNs() - wait_start;
-                        if (streams[index]->GetQueueSize() >= 4) {
+                        if (streams[index]->GetQueueSize() >= streams[index]->QueueTarget()) {
                             counters.full_after_wait.fetch_add(1, std::memory_order_relaxed);
                         }
                     }

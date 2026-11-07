@@ -152,6 +152,11 @@ public:
         device_volume = volume_;
     }
 
+    /// This stream's name (as the sink opened it).
+    const std::string& GetName() const {
+        return name;
+    }
+
     /**
      * Get the number of queued audio buffers.
      *
@@ -167,6 +172,13 @@ public:
     void SetRingSize(u32 ring_size) {
         max_queue_size = ring_size;
     }
+
+    /// The queue size the renderer keeps (WaitFreeSpace). With A/B bit AudioQueueFollowsDevice,
+    /// a render stream keeps enough 5 ms buffers for the device's largest recent request plus
+    /// two, never fewer than the ring size: a device that asks 480 frames per callback keeps 4,
+    /// one that now and then asks for far more (clock drift catch-up on USB/wireless audio)
+    /// gets a deeper queue instead of an underrun each time.
+    u32 QueueTarget() const;
 
     /**
      * Append a new buffer and its samples to a waiting queue to play.
@@ -252,6 +264,12 @@ private:
     /// TEMP: this stream's "nx2 audio" counters (looked up by name on first use).
     std::atomic<Nx2AudioStats::StreamCounters*> stats{};
     Nx2AudioStats::StreamCounters& Stats();
+    /// The device's largest request (frames) over the last two windows of callbacks, for
+    /// QueueTarget; the window state belongs to the device callback.
+    std::atomic<u32> request_max_frames{};
+    u32 request_window_max{};
+    u32 request_previous_max{};
+    u32 request_window_callbacks{};
     /// Number of buffers waiting to be played
     std::atomic<u32> queued_buffers{};
     /// The ring size for audio out buffers (usually 4, rarely 2 or 8)

@@ -12,6 +12,7 @@ add_executable(tests
     common/fibers.cpp
     common/nx2_counters.cpp
     common/timed_sleeper.cpp
+    audio_core/nx2_queue_target.cpp
     common/game_presets.cpp
     common/host_memory.cpp
     common/page_table.cpp

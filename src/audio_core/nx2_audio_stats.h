@@ -24,6 +24,14 @@ inline s64 NowNs() {
         .count();
 }
 
+/// A/B bit AudioQueueFollowsDevice: the buffers (of buffer_frames) a render stream keeps for a
+/// device whose largest recent request was request_frames: enough for it plus two, never fewer
+/// than ring_size.
+constexpr u32 QueueTargetFor(u32 ring_size, u32 request_frames, u32 buffer_frames) {
+    const u32 needed = (request_frames + buffer_frames - 1) / buffer_frames + 2;
+    return needed > ring_size ? needed : ring_size;
+}
+
 inline void AddMax(std::atomic<u64>& max, u64 value) {
     u64 current = max.load(std::memory_order_relaxed);
     while (value > current &&
@@ -53,6 +61,7 @@ struct StreamCounters {
     std::atomic<u64> appended{};              ///< Buffers appended (rendered)
     std::atomic<u64> dropped_samples{};       ///< Samples the full ring didn't take
     std::atomic<u64> paused_callbacks{};      ///< Callbacks while the system was paused
+    std::atomic<u64> queue_target_max{};      ///< Largest queue target the renderer kept
 };
 
 constexpr size_t MAX_STREAMS = 6;
@@ -77,6 +86,14 @@ struct RenderCounters {
     std::atomic<u64> lock_wait_ns_max{};   ///< SendCommandToDsp waiting for the session lock
     std::atomic<u64> generate_ns_max{};    ///< SendCommandToDsp's whole time
     std::atomic<u64> voices_starved{};     ///< Voice decodes that ran out of wave buffers
+    /// Voices that starved and got data again within 200 ms (a gap in a continuing stream, not
+    /// a sound that ended), the gaps' summed and longest length in passes (5 ms each), and the
+    /// sample format of the voices that starved (index = SampleFormat).
+    std::atomic<u64> starved_resumed{};
+    std::atomic<u64> resumed_gap_passes{};
+    std::atomic<u64> resumed_gap_passes_max{};
+    std::array<std::atomic<u64>, 8> starved_by_format{};
+    std::atomic<u64> pass_index{};         ///< Monotonic ADSP pass count (never reset)
 };
 
 inline RenderCounters g_render{};
@@ -86,5 +103,13 @@ StreamCounters& Stream(std::string_view name);
 
 /// Logs the line when 10 s have passed since the last one (any thread; one wins).
 void MaybeReport();
+
+/// A voice decode ended (the ADSP thread): starved or not, for the resumed-gap counters.
+/// voice: the voice channel's state (its identity), format: the SampleFormat value.
+void CountVoiceDecode(const void* voice, u32 format, bool starved);
+
+/// EDEN_NX2_AUDIO_DUMP=<dir>: appends a render session's final mix (before volume, so a muted
+/// run still has it) to <dir>/<stream name>.pcm as interleaved s16. The ADSP thread only.
+void DumpMix(std::string_view stream_name, const s16* samples, size_t count, u32 channels);
 
 } // namespace AudioCore::Nx2AudioStats
