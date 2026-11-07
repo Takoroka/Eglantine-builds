@@ -39,6 +39,12 @@ struct EventType {
     /// A monotonic sequence number, incremented when this event is
     /// changed externally.
     size_t sequence_number;
+
+    // TEMP (measurement aid): counts for the "nx2 timing" log line, relaxed; the timing thread
+    // takes and resets them every 30 s.
+    std::atomic<u32> scheduled{0};   ///< ScheduleEvent / ScheduleLoopingEvent calls
+    std::atomic<u32> fired{0};       ///< Callbacks run
+    std::atomic<u32> unscheduled{0}; ///< Queued events UnscheduleEvent removed
 };
 
 enum class UnscheduleEventType {
@@ -143,6 +149,32 @@ public:
     void Reset();
     /// Wakes the timing thread after an event was scheduled; earliest: it became the next one.
     void WakeTimerThread(bool earliest);
+
+    /// TEMP (measurement aid): where the timing thread's time goes, for the "nx2 timing" line
+    /// (that thread only; ReportStats logs and resets it every 30 s).
+    struct ThreadStats {
+        s64 window_start{};
+        s64 run_ns{};        ///< In Advance: the queue and the callbacks
+        s64 timed_wait_ns{}; ///< In event.WaitFor until the next event
+        s64 idle_wait_ns{};  ///< In event.Wait with nothing queued
+        s64 paused_ns{};     ///< Paused (left out of the rates)
+        u64 timed_waits{};
+        u64 woken_waits{}; ///< Timed waits a new earliest event ended (event.Set)
+        u64 waits_under_50us{};
+        u64 waits_under_500us{}; ///< 50-500 us: shorter than a Windows timer tick
+        u64 idle_waits{};
+        u64 overshoots{};   ///< Timed waits that ran out
+        s64 overshoot_ns{}; ///< How long after the event's time those returned
+    };
+    void CountTimedWait(s64 wait_ns, bool woken, s64 waited_ns, s64 overshoot_ns);
+    void CountLate(s64 late);
+    void ReportStats(s64 now);
+    ThreadStats thread_stats{};
+    /// Lateness of the callbacks Advance ran (the timing thread's when multicore).
+    u64 late_count{};
+    s64 late_ns{};
+    s64 late_max_ns{};
+    std::atomic<u32> unschedule_calls{0}; ///< UnscheduleEvent calls (each walks the queue)
 
     using heap_t = boost::heap::fibonacci_heap<CoreTiming::Event, boost::heap::compare<std::greater<>>>;
     heap_t event_queue;

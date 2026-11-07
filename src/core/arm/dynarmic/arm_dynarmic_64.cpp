@@ -15,11 +15,32 @@
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/nx2_cpu_stats.h"
 #include "dynarmic/interface/A64/config.h"
 
 namespace Core {
 
 using namespace Common::Literals;
+
+namespace {
+
+/// The hint instruction a hint exception stands for (the five ExceptionRaised ignores).
+Nx2CpuStats::Hint HintOf(Dynarmic::A64::Exception exception) {
+    switch (exception) {
+    case Dynarmic::A64::Exception::WaitForInterrupt:
+        return Nx2CpuStats::Hint::WaitForInterrupt;
+    case Dynarmic::A64::Exception::WaitForEvent:
+        return Nx2CpuStats::Hint::WaitForEvent;
+    case Dynarmic::A64::Exception::SendEvent:
+        return Nx2CpuStats::Hint::SendEvent;
+    case Dynarmic::A64::Exception::SendEventLocal:
+        return Nx2CpuStats::Hint::SendEventLocal;
+    default:
+        return Nx2CpuStats::Hint::Yield;
+    }
+}
+
+} // Anonymous namespace
 
 DynarmicCallbacks64::DynarmicCallbacks64(ArmDynarmic64& parent, Kernel::KProcess* process)
     : m_parent{parent}, m_memory(process->GetMemory())
@@ -130,6 +151,11 @@ void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception excep
     case Dynarmic::A64::Exception::SendEvent:
     case Dynarmic::A64::Exception::SendEventLocal:
     case Dynarmic::A64::Exception::Yield:
+        // The A64 translator raises every hint instruction (its TranslationOptions default
+        // hook_hint_instructions to true and the backends don't pass the config's flag), so
+        // each one already ends its block here. Counted for the "nx2 CPU hints" line, then
+        // ignored as before.
+        Nx2CpuStats::CountHint(m_parent.m_core_index, HintOf(exception));
         LOG_TRACE(Core_ARM, "ExceptionRaised(exception = {}, pc = {:08X}, code = {:08X}, cached = {:08X})", std::size_t(exception), pc, m_memory.Read32(pc), MemoryReadCode(pc).value_or(0));
         return;
     case Dynarmic::A64::Exception::NoExecuteFault:

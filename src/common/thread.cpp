@@ -712,6 +712,20 @@ bool Event::WaitFor(const std::chrono::nanoseconds time) {
     return true;
 #endif
 }
+
+const char* EventWaitMethod() {
+#ifdef _WIN32
+    if (Common::g_cpu_caps.monitorx) {
+        return "mwaitx";
+    }
+    if (Common::g_cpu_caps.waitpkg) {
+        return "umwait";
+    }
+    return "sleep";
+#else
+    return "condvar";
+#endif
+}
 #else
 bool Event::WaitFor(const std::chrono::nanoseconds time) {
 #ifdef _WIN32
@@ -730,6 +744,14 @@ bool Event::WaitFor(const std::chrono::nanoseconds time) {
         return false;
     is_set = false;
     return true;
+#endif
+}
+
+const char* EventWaitMethod() {
+#ifdef _WIN32
+    return "sleep";
+#else
+    return "condvar";
 #endif
 }
 #endif

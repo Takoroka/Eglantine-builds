@@ -115,4 +115,8 @@ void SetCurrentThreadToAllCores();
 void RefreshThreadPolicies();
 void PollThreadPolicies();
 
+/// How Event::WaitFor waits on this host: "mwaitx" or "umwait" (the thread stays on its CPU
+/// until the deadline or the Set), "sleep" (timer ticks) or "condvar".
+[[nodiscard]] const char* EventWaitMethod();
+
 } // namespace Common
