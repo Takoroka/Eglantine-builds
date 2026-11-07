@@ -44,6 +44,7 @@
 #include "video_core/page_occupancy.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view_base.h"
+#include "video_core/texture_cache/memory_limit.h"
 #include "video_core/texture_cache/render_targets.h"
 #include "video_core/texture_cache/types.h"
 #include "video_core/textures/texture.h"
@@ -149,11 +150,17 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 pressure_margin{};        ///< Extra room under the budget after images did not fit
     u64 pressure_quiet_frames{};  ///< Frames since the last such image
     u64 slack_margin{};           ///< Extra room for allocator block space the driver counts as used
-    u64 budget_critical_memory{}; ///< The thresholds by the budget alone, before MaxCriticalMemory
+    u64 budget_critical_memory{}; ///< The thresholds by the budget and the memory limit alone
     u64 budget_expected_memory{};
     bool thresholds_overridden{}; ///< EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB set
     u64 gc_expected_memory{};     ///< The thresholds of the collector pass (RunGarbageCollector)
     u64 gc_critical_memory{};
+    /// The Texture Cache Memory Limit setting as resolved for this device (ResolveMemoryLimit),
+    /// re-resolved every 30 frames so Auto follows the budget. limit 0: no device memory info.
+    TextureCacheMemoryLimit memory_limit{};
+    u64 limit_check_frames{};
+    u64 base_expected_memory{}; ///< The thresholds before the cap (ApplyThresholdOverrides)
+    u64 base_critical_memory{};
     u64 astc_opaque_images{};
     u64 astc_alpha_images{};
     std::vector<u8> astc_scan_buffer;
@@ -164,8 +171,9 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     static constexpr s64 DEFAULT_EXPECTED_MEMORY = 1_GiB + 125_MiB;
     static constexpr s64 DEFAULT_CRITICAL_MEMORY = 1_GiB + 625_MiB;
     /// The most device memory the collector lets the cache fill before it collects in earnest,
-    /// on every GPU (ApplyThresholdOverrides).
-    static constexpr u64 MaxCriticalMemory = 5_GiB;
+    /// on every GPU (ApplyThresholdOverrides), while the Texture Cache Memory Limit is off
+    /// (EDEN_NX2_AB_OFF TcMemoryLimit) or there is no device memory information.
+    static constexpr u64 MaxCriticalMemory = FixedTextureCacheCriticalCap;
     static constexpr size_t GC_EMERGENCY_COUNTS = 2;
 
     using Runtime = typename P::Runtime;
@@ -630,8 +638,17 @@ private:
 
     DAddr virtual_invalid_space{};
 
-    /// Applies EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB and logs the thresholds.
+    /// Caps the thresholds (base_*) at CriticalMemoryCap(), applies EDEN_NX2_TC_EXPECTED_MIB /
+    /// EDEN_NX2_TC_CRITICAL_MIB and logs the thresholds.
     void ApplyThresholdOverrides(bool log = true);
+
+    /// Resolves the Texture Cache Memory Limit setting against the device's current budget.
+    /// Returns true when the limit changed.
+    bool ResolveMemoryLimit(bool log);
+
+    /// What the collector's critical threshold stays under: the memory limit, or
+    /// MaxCriticalMemory while it is off or unknown.
+    u64 CriticalMemoryCap() const;
 
     /// True when the collector follows the driver's budget past MaxCriticalMemory (discrete GPU,
     /// a budget read, no threshold override).

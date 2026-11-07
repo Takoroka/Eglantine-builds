@@ -45,8 +45,8 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
       debug_tab_tab{std::make_unique<ConfigureDebugTab>(system_, this)},
       filesystem_tab{std::make_unique<ConfigureFilesystem>(this)},
       general_tab{std::make_unique<ConfigureGeneral>(system_, nullptr, *builder, this)},
-      graphics_advanced_tab{
-          std::make_unique<ConfigureGraphicsAdvanced>(system_, nullptr, *builder, this)},
+      graphics_advanced_tab{std::make_unique<ConfigureGraphicsAdvanced>(
+          system_, vk_device_records, nullptr, *builder, this)},
       graphics_extensions_tab{
           std::make_unique<ConfigureGraphicsExtensions>(system_, nullptr, *builder, this)},
       ui_tab{std::make_unique<ConfigureUi>(system_, this)},

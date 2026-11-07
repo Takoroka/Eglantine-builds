@@ -53,6 +53,7 @@ add_executable(tests
     video_core/indirect_reset.cpp
     video_core/fragment_barrier_defer.cpp
     video_core/present_queue.cpp
+    video_core/texture_cache_memory_limit.cpp
     input_common/calibration_configuration_job.cpp
 )
 

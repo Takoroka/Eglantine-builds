@@ -22,6 +22,9 @@ namespace Common::Nx2Ab {
 
 // The registry of bits in use is C:\dev\nx2work\rounds\AB-BITS.md (bits 32 and up: 1ull << n).
 enum Feature : u64 {
+    // texlookup (11-06): the Texture Cache Memory Limit setting caps the collector's thresholds
+    // (TextureCache::ApplyThresholdOverrides) in place of MaxCriticalMemory.
+    TcMemoryLimit = 1ull << 1,
     // fences (11-05): direct draws with no vertices or no instances skip the draw setup.
     ZeroDrawSkip = 1ull << 40,
     // vkoff (11-05): draws with none of the dynamic states' dirty flags set skip their updates.

@@ -95,6 +95,8 @@ public:
 
     u64 GetDeviceMemoryBudget() const;
 
+    u64 GetDeviceLocalHeapSize() const;
+
     u64 GetDeviceMemorySlack() const;
 
     /// Device memory is the system's RAM (the collector keeps its fixed cap there).
