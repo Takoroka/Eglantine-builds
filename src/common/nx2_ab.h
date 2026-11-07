@@ -63,6 +63,10 @@ enum Feature : u64 {
     // hosttime (11-06): buffer downloads the CPU reads end with a transfer -> host read barrier
     // (BufferCacheRuntime::HostReadBarrier). Idea: zortos293/lichii aa3173300.
     HostReadBarrier = 1ull << 54,
+    // hosttime (11-06): on AMD's own drivers, software HMMA compute pipelines build where nothing
+    // waits for them; their dispatches are skipped until built (PipelineCache::matrix_workers).
+    // Idea: zortos293/lichii PR #300 (ctgl1987 54a45b5774).
+    DeferredMatrixPipelines = 1ull << 0,
     WaitForIdleBarrier = 1ull << 60, ///< Waits for idle wait (a barrier), compute-to-draw barriers
                                      ///< (RasterizerVulkan::WaitForIdle, Scheduler)
     AcquireNoDrain = 1ull << 62,     ///< Semaphore acquires read ahead of the back, no drain (puller)
