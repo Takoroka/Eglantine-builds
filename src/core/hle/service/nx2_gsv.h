@@ -3670,6 +3670,9 @@ public:
              "CalculateDecoderImagePoolBuffer"},
             {901, &INx2GraphicsSystemSession::Stub, "CreateVideoDecoderContext"},
             {902, &INx2GraphicsSystemSession::OpenVideoSession, "InitializeVideoDecoderContext"},
+            // No input or output (Switchbrew). Titles send it after a decoder session's stop
+            // (207) and finalize (115); 901 keeps no state, so it only answers.
+            {903, &INx2GraphicsSystemSession::Stub, "DestroyVideoDecoderContext"},
             {905, &INx2GraphicsSystemSession::OpenVideoSession, "InitializeVideoDecoderContext2"},
             {906, &INx2GraphicsSystemSession::OpenVideoSession, "OpenVideoDecoderSessionWithVersion"},
             {1001, &INx2GraphicsSystemSession::Stub, "CreateVideoEncoderContext"},
