@@ -96,6 +96,10 @@ enum Feature : u64 {
     // The same PR's ring rescue: an AcquireEqual 100 ms short of a target at most 0x40 ahead
     // writes the target itself.
     SemaphoreRingRescue = 1ull << 8,
+    // switchbrew (11-06): macro DMA reads of report memory wait for the reports the query cache
+    // still holds, also under the GPU split (VideoCommon::FlushQueryResults). Idea:
+    // zortos293/lichii 7ae3e7401.
+    MacroReadQueryWait = 1ull << 9,
 };
 
 inline const u64 g_mask = [] {

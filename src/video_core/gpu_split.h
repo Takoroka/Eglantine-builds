@@ -12,6 +12,7 @@
 #include <memory>
 #include <thread>
 #include <type_traits>
+#include <unordered_set>
 #include <vector>
 
 #include "common/common_types.h"
@@ -281,6 +282,12 @@ public:
     void NoteUnplacedWrite() {
         last_unplaced_write = write_position;
     }
+    /// A counter report (not a payload) was sent for `address`: its value lands only once a later
+    /// fence pops, after the back ran it, so the queued writes can't tell when.
+    void NoteCounterReport(const Tegra::MemoryManager& memory, GPUVAddr address);
+    /// Whether [address, address + size) touches a page counter reports were sent to.
+    [[nodiscard]] bool TouchesReportPages(const Tegra::MemoryManager& memory, GPUVAddr address,
+                                          size_t size) const;
     /// Reads `count` words at `address` as the back will see them once it has run everything
     /// sent so far. False when the front can't tell (pages the GPU writes, whose newest words may
     /// be in the back's caches; releases applied late): the caller drains and reads itself.
@@ -404,6 +411,8 @@ private:
     size_t prune_at{};
     size_t prune_data_at{};
     u64 last_unplaced_write{};
+    /// Device pages (address >> 12) counter reports were sent to (NoteCounterReport).
+    std::unordered_set<u64> report_pages;
     /// Writes for front_engine not sent yet (StateWrite, or DataWrite when run_data), and the
     /// dirty flags the state writes set.
     u32 run_count{};

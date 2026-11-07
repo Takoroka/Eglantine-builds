@@ -26,11 +26,13 @@
 #include "common/fs/path_util.h"
 #include "common/settings.h"
 #include "common/container_hash.h"
+#include "common/nx2_ab.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
+#include "video_core/query_reads.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/macro.h"
 
@@ -1443,7 +1445,15 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                     // Accurate GPU mode holds report and semaphore writes in the query cache until a
                     // fence: write them out, or occlusion predicates read stale values. The split only
                     // runs with immediate payload writes, and the query cache belongs to its back.
-                    if (!VideoCommon::GpuSplit::Get().Active()) {
+                    // Counter reports still land only once a later fence pops: wait for them where
+                    // the caches are this thread's (QueryReads).
+                    if (Common::Nx2Ab::On(Common::Nx2Ab::MacroReadQueryWait)) {
+                        if (!VideoCommon::GpuSplit::Get().Active() ||
+                            VideoCommon::GpuSplit::OnBackThread()) {
+                            VideoCommon::QueryReads::Flush(memory, maxwell3d.Rasterizer(), source,
+                                                           read_bytes);
+                        }
+                    } else if (!VideoCommon::GpuSplit::Get().Active()) {
                         memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::QueryCache);
                     }
                     static u32 dma_logs{};

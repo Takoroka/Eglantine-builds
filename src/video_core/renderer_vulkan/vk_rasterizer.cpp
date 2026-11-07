@@ -8,6 +8,7 @@
 #include <array>
 #include <bit>
 #include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <string>
 #include <typeinfo>
@@ -38,6 +39,7 @@
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/native_query_trace.h"
+#include "video_core/query_reads.h"
 #include "video_core/indirect_reset.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/kepler_compute.h"
@@ -2323,6 +2325,40 @@ void RasterizerVulkan::ReleaseFences(bool force) {
         NoteSetupChange();
     };
     fence_manager.WaitPendingFences(force);
+}
+
+void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
+    if (addr == 0 || size == 0 || !query_cache.SemiFlushRegion(addr, size)) {
+        return;
+    }
+    // Some reports still wait for host results, written by operations the next fence runs. Below
+    // High GPU accuracy a fence runs its own callback at once: wait for an operation queued
+    // behind theirs instead. On the split's back the fence's submission may be deferred, and
+    // nothing else submits it while this thread waits. The state outlives a wait that gives up.
+    struct Wait {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool written{};
+    };
+    const auto wait = std::make_shared<Wait>();
+    SyncOperation([wait] {
+        std::scoped_lock lock{wait->mutex};
+        wait->written = true;
+        wait->cv.notify_all();
+    });
+    SignalFence([] {});
+    scheduler.FlushDeferred();
+    const auto start = std::chrono::steady_clock::now();
+    bool written;
+    {
+        std::unique_lock lock{wait->mutex};
+        written = wait->cv.wait_for(lock, std::chrono::milliseconds{100},
+                                    [&wait] { return wait->written; });
+    }
+    VideoCommon::QueryReads::CountWait(
+        written, static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now() - start)
+                                      .count()));
 }
 
 void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
