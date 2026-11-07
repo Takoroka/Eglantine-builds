@@ -549,6 +549,18 @@ struct Values {
                                                            "vram_usage_mode",
                                                            Category::RendererAdvanced};
 
+    // MiB the texture cache's collector keeps device memory under, 0 = Auto (three quarters of
+    // the GPU's memory budget). See VideoCommon::ResolveTextureCacheMemoryLimit.
+    SwitchableSetting<u32, true> texture_cache_memory_limit{linkage,
+                                                            0,
+                                                            0,
+                                                            65536,
+                                                            "texture_cache_memory_limit",
+                                                            Category::RendererAdvanced,
+                                                            Specialization::Countable,
+                                                            true,
+                                                            true};
+
     SwitchableSetting<NvdecEmulation> nvdec_emulation{linkage, NvdecEmulation::Cpu,
                                                       "nvdec_emulation", Category::RendererAdvanced};
 

@@ -85,18 +85,19 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
         const s64 mem_threshold = (std::min)(device_local_memory, TARGET_THRESHOLD);
         const s64 min_vacancy_expected = (6 * mem_threshold) / 10;
         const s64 min_vacancy_critical = (2 * mem_threshold) / 10;
-        expected_memory = static_cast<u64>(
+        base_expected_memory = static_cast<u64>(
             (std::max)((std::min)(device_local_memory - min_vacancy_expected, min_spacing_expected),
                      DEFAULT_EXPECTED_MEMORY));
-        critical_memory = static_cast<u64>(
+        base_critical_memory = static_cast<u64>(
             (std::max)((std::min)(device_local_memory - min_vacancy_critical, min_spacing_critical),
                      DEFAULT_CRITICAL_MEMORY));
         minimum_memory = static_cast<u64>((device_local_memory - mem_threshold) / 2);
     } else {
-        expected_memory = DEFAULT_EXPECTED_MEMORY + 512_MiB;
-        critical_memory = DEFAULT_CRITICAL_MEMORY + 1_GiB;
+        base_expected_memory = DEFAULT_EXPECTED_MEMORY + 512_MiB;
+        base_critical_memory = DEFAULT_CRITICAL_MEMORY + 1_GiB;
         minimum_memory = 0;
     }
+    ResolveMemoryLimit(true);
     ApplyThresholdOverrides();
 
     const bool gpu_unswizzle_enabled = Settings::values.gpu_unswizzle_enabled.GetValue();
@@ -323,13 +324,77 @@ bool TextureCache<P>::UseBudgetThresholds() const {
 }
 
 template <class P>
+bool TextureCache<P>::ResolveMemoryLimit(bool log) {
+    u64 budget = 0;
+    u64 heap_size = 0;
+    if constexpr (HAS_DEVICE_MEMORY_INFO) {
+        if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
+            budget = runtime.GetDeviceMemoryBudget();
+        }
+        if (budget == 0) {
+            budget = runtime.GetDeviceLocalMemory();
+        }
+        if constexpr (requires { runtime.GetDeviceLocalHeapSize(); }) {
+            heap_size = runtime.GetDeviceLocalHeapSize();
+        }
+    }
+    const u32 setting = Settings::values.texture_cache_memory_limit.GetValue();
+    // Without device memory information Auto has nothing to follow: MaxCriticalMemory stays.
+    const TextureCacheMemoryLimit resolved =
+        budget != 0 || setting != 0 ? ResolveTextureCacheMemoryLimit(setting, budget, heap_size)
+                                    : TextureCacheMemoryLimit{.automatic = true};
+    const bool changed = resolved.limit != memory_limit.limit;
+    // Log the first value and real changes (the budget moves by a few MiB all the time).
+    const u64 change = resolved.limit > memory_limit.limit ? resolved.limit - memory_limit.limit
+                                                           : memory_limit.limit - resolved.limit;
+    if (log || change >= 256_MiB || resolved.automatic != memory_limit.automatic) {
+        if (!Common::Nx2Ab::On(Common::Nx2Ab::TcMemoryLimit)) {
+            LOG_INFO(HW_GPU, "Texture cache memory limit off (EDEN_NX2_AB_OFF): the collector "
+                             "stays under {} MiB as before", MaxCriticalMemory >> 20);
+        } else if (resolved.limit == 0) {
+            LOG_INFO(HW_GPU, "Texture cache memory limit: Auto, no device memory information: "
+                             "{} MiB", MaxCriticalMemory >> 20);
+        } else {
+            LOG_INFO(HW_GPU,
+                     "Texture cache memory limit: {} MiB ({}{}{}); budget {} MiB, device memory "
+                     "{} MiB, recommended {} MiB; collector cap {} MiB, {}",
+                     resolved.limit >> 20, resolved.automatic ? "Auto" : "set",
+                     resolved.raised ? ", raised to the smallest limit" : "",
+                     resolved.clamped ? ", lowered to the device memory" : "", budget >> 20,
+                     heap_size >> 20, resolved.recommended >> 20,
+                     TextureCacheCriticalCap(resolved, MaxCriticalMemory) >> 20,
+                     TextureCacheLimitCapsBudget(resolved) ? "also over the budget thresholds"
+                                                           : "budget thresholds as they are");
+            if (resolved.BelowRecommended()) {
+                LOG_WARNING(HW_GPU,
+                            "Texture cache memory limit {} MiB is below the recommended {} MiB: "
+                            "textures are evicted and decoded again sooner (stutter)",
+                            resolved.limit >> 20, resolved.recommended >> 20);
+            }
+        }
+    }
+    memory_limit = resolved;
+    return changed;
+}
+
+template <class P>
+u64 TextureCache<P>::CriticalMemoryCap() const {
+    if (!Common::Nx2Ab::On(Common::Nx2Ab::TcMemoryLimit)) {
+        return MaxCriticalMemory;
+    }
+    return TextureCacheCriticalCap(memory_limit, MaxCriticalMemory);
+}
+
+template <class P>
 void TextureCache<P>::ApplyThresholdOverrides(bool log) {
     // On every GPU: past what a frame needs, more device memory only keeps the textures of earlier
     // scenes (title 1 filled 6.7 GB of an 8 GB card and draws its races in ~5 GB), so collect from
-    // MaxCriticalMemory on rather than near the card's budget.
-    critical_memory = (std::min)(critical_memory, MaxCriticalMemory);
-    expected_memory =
-        (std::min)(expected_memory, critical_memory - (std::min)(critical_memory, u64{768_MiB}));
+    // the Texture Cache Memory Limit on (Auto: 3/4 of the budget, at least MaxCriticalMemory)
+    // rather than near the card's budget. The thresholds are worked out from base_* each time, so
+    // a limit that grows again gives them back.
+    critical_memory = (std::min)(base_critical_memory, CriticalMemoryCap());
+    expected_memory = (std::min)(base_expected_memory,
+                                 critical_memory - (std::min)(critical_memory, u64{768_MiB}));
     minimum_memory =
         (std::min)(minimum_memory, expected_memory - (std::min)(expected_memory, u64{1_GiB}));
     // EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB override the collector's thresholds.
@@ -357,6 +422,11 @@ void TextureCache<P>::TickFrame() {
         }
     }
     if constexpr (HAS_DEVICE_MEMORY_INFO) {
+        // The memory limit follows the budget (Auto) and the setting (it can change in game). The
+        // budget thresholds below take it at their next 30-frame check.
+        if (limit_check_frames++ % 30 == 0 && ResolveMemoryLimit(false)) {
+            ApplyThresholdOverrides(false);
+        }
         // Switch 2 titles (native tiling) stream far more texture data than Eden's thresholds
         // were tuned for: title 1's attract loop alone keeps ~5.3 GB resident, so the collector
         // sat in aggressive mode evicting decoded ASTC (and decoding it again). Total use is
@@ -364,8 +434,8 @@ void TextureCache<P>::TickFrame() {
         if (!native_thresholds_applied && gpu_memory != nullptr && gpu_memory->UsesNativeTiling()) {
             native_thresholds_applied = true;
             const u64 device_local = runtime.GetDeviceLocalMemory();
-            critical_memory = (std::max)(critical_memory, device_local - 256_MiB);
-            expected_memory = (std::max)(expected_memory, device_local - 1280_MiB);
+            base_critical_memory = (std::max)(base_critical_memory, device_local - 256_MiB);
+            base_expected_memory = (std::max)(base_expected_memory, device_local - 1280_MiB);
             ApplyThresholdOverrides();
             native_critical_memory = critical_memory;
             native_expected_memory = expected_memory;
@@ -415,11 +485,21 @@ void TextureCache<P>::TickFrame() {
                                            ? slack
                                            : slack_margin - (std::min)(slack_margin - slack, 16_MiB);
                     }
-                    critical_memory =
+                    base_critical_memory =
                         budget - (std::min)(margin + pressure_margin + slack_margin, budget / 2);
-                    expected_memory = critical_memory - (std::min)(margin, critical_memory / 2);
-                    budget_critical_memory = critical_memory;
-                    budget_expected_memory = expected_memory;
+                    base_expected_memory =
+                        base_critical_memory - (std::min)(margin, base_critical_memory / 2);
+                    budget_critical_memory = base_critical_memory;
+                    budget_expected_memory = base_expected_memory;
+                    if (TextureCacheLimitCapsBudget(memory_limit) &&
+                        Common::Nx2Ab::On(Common::Nx2Ab::TcMemoryLimit) &&
+                        budget_critical_memory > memory_limit.limit) {
+                        // An explicit memory limit caps these too (Auto leaves them: see
+                        // TextureCacheLimitCapsBudget); expected keeps its margin under it.
+                        budget_critical_memory = memory_limit.limit;
+                        budget_expected_memory =
+                            budget_critical_memory - (std::min)(margin, budget_critical_memory / 2);
+                    }
                     ApplyThresholdOverrides(false);
                     // Log the first values and real changes (the budget moves by a few MiB all
                     // the time). Compared once capped: a budget far over MaxCriticalMemory is
@@ -464,6 +544,23 @@ void TextureCache<P>::TickFrame() {
         // Freed images still with the deleter thread count as freed too.
         if constexpr (requires { runtime.PendingDestroyBytes(); }) {
             total_used_memory -= (std::min)(total_used_memory, runtime.PendingDestroyBytes());
+        }
+    }
+    // Every 600 frames, in every log: device memory in use against the memory limit and the
+    // collector's thresholds.
+    if constexpr (HAS_DEVICE_MEMORY_INFO) {
+        if (frame_tick % 600 == 0) {
+            const bool budget_thresholds = UseBudgetThresholds();
+            const char* const mode = !Common::Nx2Ab::On(Common::Nx2Ab::TcMemoryLimit) ? "off"
+                                     : memory_limit.automatic                         ? "Auto"
+                                                                                      : "set";
+            LOG_INFO(HW_GPU,
+                     "Texture cache memory: {} MiB in use, limit {} MiB ({}), collector expected "
+                     "{} MiB, critical {} MiB ({})",
+                     total_used_memory >> 20, CriticalMemoryCap() >> 20, mode,
+                     (budget_thresholds ? budget_expected_memory : expected_memory) >> 20,
+                     (budget_thresholds ? budget_critical_memory : critical_memory) >> 20,
+                     budget_thresholds ? "by the budget" : "capped");
         }
     }
     // Every 600 frames: device memory in use against the collector's thresholds.

@@ -23,8 +23,9 @@ class QWindow;
 
 namespace VkDeviceInfo {
 Record::Record(std::string_view name_, const std::vector<VkPresentModeKHR>& vsync_modes_,
-               bool has_broken_compute_)
-    : name{name_}, vsync_support{vsync_modes_}, has_broken_compute{has_broken_compute_} {}
+               bool has_broken_compute_, u64 device_memory_, u64 memory_budget_, bool integrated_)
+    : name{name_}, vsync_support{vsync_modes_}, has_broken_compute{has_broken_compute_},
+      device_memory{device_memory_}, memory_budget{memory_budget_}, integrated{integrated_} {}
 
 Record::~Record() = default;
 
@@ -72,7 +73,37 @@ void PopulateRecords(std::vector<Record>& records, QWindow* window) try {
 
         name = fmt::format("{} ({})", name, driver_string);
 
-        records.push_back(VkDeviceInfo::Record(name, present_modes, has_broken_compute));
+        // Device memory for the Texture Cache Memory Limit's Auto value: the device-local heaps,
+        // and the largest one's budget (what the texture cache follows in game).
+        bool has_memory_budget = false;
+        for (const VkExtensionProperties& extension :
+             physical_device.EnumerateDeviceExtensionProperties()) {
+            has_memory_budget |=
+                std::string_view{extension.extensionName} == VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+        }
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+        budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+        const VkPhysicalDeviceMemoryProperties memory =
+            physical_device.GetMemoryProperties(has_memory_budget ? &budget : nullptr)
+                .memoryProperties;
+        u64 device_memory = 0;
+        u64 main_heap_size = 0;
+        u64 memory_budget = 0;
+        for (u32 heap = 0; heap < memory.memoryHeapCount; ++heap) {
+            if ((memory.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) {
+                continue;
+            }
+            device_memory += memory.memoryHeaps[heap].size;
+            if (memory.memoryHeaps[heap].size > main_heap_size) {
+                main_heap_size = memory.memoryHeaps[heap].size;
+                memory_budget = has_memory_budget ? budget.heapBudget[heap] : main_heap_size;
+            }
+        }
+        const bool integrated =
+            properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+
+        records.push_back(VkDeviceInfo::Record(name, present_modes, has_broken_compute,
+                                               device_memory, memory_budget, integrated));
     }
 } catch (const Vulkan::vk::Exception& exception) {
     LOG_ERROR(Frontend, "Failed to enumerate devices with error: {}", exception.what());

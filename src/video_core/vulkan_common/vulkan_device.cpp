@@ -1859,6 +1859,7 @@ void Device::CollectPhysicalMemoryInfo() {
         }
         device_access_memory += heap_size;
     }
+    device_local_heap_size = local_memory;
     if (is_integrated) {
         const s64 available_memory = static_cast<s64>(device_access_memory - device_initial_usage);
         const u64 memory_size = Settings::values.vram_usage_mode.GetValue() == Settings::VramUsageMode::Aggressive ? 6_GiB : 4_GiB;

@@ -58,12 +58,16 @@ namespace VkDeviceInfo {
 class Record {
 public:
     explicit Record(std::string_view name, const std::vector<VkPresentModeKHR>& vsync_modes,
-                    bool has_broken_compute);
+                    bool has_broken_compute, u64 device_memory = 0, u64 memory_budget = 0,
+                    bool integrated = false);
     ~Record();
 
     const std::string name;
     const std::vector<VkPresentModeKHR> vsync_support;
     const bool has_broken_compute;
+    const u64 device_memory; ///< Device-local heaps (the card's memory), 0 if unknown
+    const u64 memory_budget; ///< The largest device-local heap's budget now, else its size
+    const bool integrated;   ///< Integrated GPU (its device memory is the system's RAM)
 };
 
 // TODO(crueter): Port some configure_graphics.cpp stuff

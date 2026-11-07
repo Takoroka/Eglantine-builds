@@ -1043,6 +1043,11 @@ FN_MAX_LIMIT_LIST
         return device_access_memory;
     }
 
+    /// The size of the device-local heaps (the card's memory), before budgets and usage modes.
+    u64 GetDeviceLocalHeapSize() const {
+        return device_local_heap_size;
+    }
+
     bool CanReportMemoryUsage() const {
         return extensions.memory_budget;
     }
@@ -1349,6 +1354,7 @@ private:
     bool supports_conditional_barriers{};      ///< Allows barriers in conditional control flow.
     mutable std::atomic<size_t> custom_border_color_samplers_used{};
     u64 device_access_memory{};                ///< Total size of device local memory in bytes.
+    u64 device_local_heap_size{};              ///< Size of the device-local heaps in bytes.
     u32 sets_per_pool{};                       ///< Sets per Description Pool
     NvidiaArchitecture nvidia_arch{NvidiaArchitecture::Arch_AmpereOrNewer};
 
