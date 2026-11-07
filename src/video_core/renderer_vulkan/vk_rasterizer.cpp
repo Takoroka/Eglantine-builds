@@ -757,6 +757,54 @@ void DiagRecordDraw(Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& 
 }
 } // namespace
 
+void RasterizerVulkan::CountMergeRun(bool repeat_draw, bool refresh, u32 refusal) {
+    // Instanced draws are left out, as MFS-code's chunk batching left instanced streams out
+    // (and shaders reading the instance index are not checked here: an upper bound).
+    const bool single = !indirect_draw && draw_instances == 1;
+    merge_runs.Note(single, repeat_draw, refresh && (refusal & RefusalGeometry) == 0);
+    const auto& totals = merge_runs.Get();
+    if ((totals.draws & 4095) != 0) {
+        return;
+    }
+    using namespace std::chrono;
+    const s64 now = duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+    if (merge_runs_log_ns == 0) {
+        merge_runs_log_ns = now;
+        merge_runs_last = totals;
+        return;
+    }
+    if (now - merge_runs_log_ns < duration_cast<nanoseconds>(30s).count()) {
+        return;
+    }
+    const double seconds = static_cast<double>(now - merge_runs_log_ns) / 1e9;
+    const auto& last = merge_runs_last;
+    const double draws = static_cast<double>(totals.draws - last.draws);
+    const auto per_s = [seconds](u64 value, u64 before) {
+        return static_cast<double>(value - before) / seconds;
+    };
+    const auto share = [draws](u64 value, u64 before) {
+        return draws == 0 ? 0.0 : 100.0 * static_cast<double>(value - before) / draws;
+    };
+    LOG_INFO(HW_GPU,
+             "Draw merge candidates {:.0f} s: {:.0f} draws/s; runs differing only in uniform "
+             "buffers or the index range {:.0f}/s holding {:.0f} draws/s ({:.1f}% of draws; "
+             "runs of 2: {:.0f}/s, 3-4: {:.0f}/s, 5-8: {:.0f}/s, 9-16: {:.0f}/s, 17+: {:.0f}/s); "
+             "runs of repeats alone (a multi-draw with no shader change) {:.0f}/s holding "
+             "{:.0f} draws/s ({:.1f}%)",
+             seconds, draws / seconds, per_s(totals.patch_runs, last.patch_runs),
+             per_s(totals.patch_draws, last.patch_draws),
+             share(totals.patch_draws, last.patch_draws),
+             per_s(totals.patch_lengths[0], last.patch_lengths[0]),
+             per_s(totals.patch_lengths[1], last.patch_lengths[1]),
+             per_s(totals.patch_lengths[2], last.patch_lengths[2]),
+             per_s(totals.patch_lengths[3], last.patch_lengths[3]),
+             per_s(totals.patch_lengths[4], last.patch_lengths[4]),
+             per_s(totals.plain_runs, last.plain_runs), per_s(totals.plain_draws, last.plain_draws),
+             share(totals.plain_draws, last.plain_draws));
+    merge_runs_log_ns = now;
+    merge_runs_last = totals;
+}
+
 void RasterizerVulkan::CountRepeat(u32 refusal, bool refresh) {
     using Tegra::Engines::Maxwell3D;
     auto& s = repeat_stats;
@@ -925,6 +973,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     if (repeat_stats_enabled) {
         CountRepeat(refusal, refresh);
     }
+    CountMergeRun(repeat_draw, refresh, refusal);
     maxwell3d->cbuf_changes.Reset();
     // EDEN_NX2_SAME_STATE_VERIFY=<n>: every n-th draw that could take one of those paths takes
     // the full setup instead, which is then compared with what the fast path would have used.
@@ -1261,6 +1310,7 @@ void CountDynamicStateSkip(bool recorded) {
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
+    draw_instances = instance_count;
     {
         // A draw's first and count can come from memory a skipped (rejected) compute program
         // should have written. Past 16M vertices they are garbage: building the quad index

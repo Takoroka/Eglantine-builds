@@ -15,6 +15,7 @@
 
 #include "common/common_types.h"
 #include "video_core/control/channel_state_cache.h"
+#include "video_core/draw_merge_runs.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/rasterizer_interface.h"
@@ -348,6 +349,14 @@ private:
     u64 same_state_verify_count{};
     bool indirect_draw{};      ///< DrawIndirect's PrepareDraw is running
     bool last_draw_indirect{}; ///< The draw prepared before this one was indirect
+    u32 draw_instances{1};     ///< Draw's instance count, for CountMergeRun
+
+    /// Draw merge candidates (play-dkb8 idea 6, measured before A/B bit 19 DrawMerge is built;
+    /// VideoCommon::DrawMergeRuns): the "Draw merge candidates" line every 30 s. Back thread only.
+    VideoCommon::DrawMergeRuns merge_runs;
+    VideoCommon::DrawMergeRuns::Totals merge_runs_last{};
+    s64 merge_runs_log_ns{};
+    void CountMergeRun(bool repeat_draw, bool refresh, u32 refusal);
     struct RepeatStats {
         u64 draws{};
         u64 indirect{};
