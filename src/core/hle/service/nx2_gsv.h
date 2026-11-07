@@ -68,6 +68,7 @@
 #include "core/hle/service/hle_ipc.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/kernel_helpers.h"
+#include "core/hle/service/nx2_present_deadline.h"
 #include "core/hle/service/nvdrv/core/container.h"
 #include "core/hle/service/nvdrv/core/syncpoint_manager.h"
 #include "core/hle/service/nvdrv/devices/nx2_stub_device.h"
@@ -2302,6 +2303,7 @@ private:
     // Eden's GPU thread has processed the frame. Otherwise the game laps the GPU thread and
     // rewrites command memory it hasn't read yet.
     std::atomic<u32> m_wait_timeouts{};
+    std::atomic<u32> m_busy_back_waits{}; ///< WaitForFrame waits the back's work stretched (logged)
     struct PresentStats {
         long long frame_us{}, fence_us{}, composite_us{}, pace_us{}, max_fence_us{};
         long long max_frame_us{}, hitches{};
@@ -2467,8 +2469,12 @@ private:
         auto& syncpoints = system.Host1x().GetSyncpointManager();
         const auto start = std::chrono::steady_clock::now();
         // Long enough to cover shader/pipeline compile stalls: a game that gets more than a few
-        // command buffers ahead misses the equal-value gates its other channels acquire.
-        const auto deadline = start + std::chrono::milliseconds{4000};
+        // command buffers ahead misses the equal-value gates its other channels acquire, and
+        // rewrites command memory the GPU thread hasn't read. With A/B bit PresentWaitBusyBack the
+        // split's back working doesn't count toward it (Service::Nx2::PresentDeadline).
+        auto& split = VideoCommon::GpuSplit::Get();
+        Service::Nx2::PresentDeadline deadline{
+            start, split.Active() && Common::Nx2Ab::On(Common::Nx2Ab::PresentWaitBusyBack)};
         if (!syncpoints.IsReadyGuest(fence_id, fence_value)) {
             // Woken by the GPU thread as it reaches the fence. Polling with 200 us sleeps slept
             // about 1 ms per check on Windows, added to every frame. An action left registered
@@ -2491,7 +2497,7 @@ private:
             // suspension counts, not only an unbroken one.
             bool gpu_waited = false;
             while (!wake->done && system.IsPoweredOn() &&
-                   std::chrono::steady_clock::now() < deadline) {
+                   !deadline.Passed(std::chrono::steady_clock::now())) {
                 if (unless_gpu_waits) {
                     gpu_waited |= system.GPU().HasSuspendedChannels();
                     if (gpu_waited &&
@@ -2499,14 +2505,29 @@ private:
                         return false;
                     }
                 }
+                const auto slice_start = std::chrono::steady_clock::now();
                 wake->cv.wait_for(lk, std::chrono::milliseconds{unless_gpu_waits ? 1 : 50});
+                deadline.AfterSlice(slice_start, std::chrono::steady_clock::now(),
+                                    !split.BackIdle());
             }
+        }
+        if (deadline.Extended() > std::chrono::seconds{1} && m_busy_back_waits++ < 64) {
+            LOG_INFO(Service,
+                     "nx2:vi2 present #{} fence ({}, {}) waited {} ms, {} ms of it while the GPU "
+                     "thread's back worked (A/B bit PresentWaitBusyBack), {}",
+                     m_presents, fence_id, fence_value,
+                     std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count(),
+                     std::chrono::duration_cast<std::chrono::milliseconds>(deadline.Extended())
+                         .count(),
+                     syncpoints.IsReadyGuest(fence_id, fence_value) ? "reached" : "not reached");
         }
         if (unless_gpu_waits && !syncpoints.IsReadyGuest(fence_id, fence_value)) {
             return false;
         }
         if (!syncpoints.IsReadyGuest(fence_id, fence_value) && m_wait_timeouts++ < 64) {
-            LOG_WARNING(Service, "nx2:vi2 present #{} fence ({}, {}) not reached in 4 s (now {})",
+            LOG_WARNING(Service, "nx2:vi2 present #{} fence ({}, {}) not reached in 4 s of an idle GPU back (now {})",
                         m_presents, fence_id, fence_value, syncpoints.GetGuestSyncpointValue(fence_id));
         }
         if (m_presents <= 8 || (m_presents % 600) == 0) {
