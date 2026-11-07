@@ -386,26 +386,34 @@ const bool repeat_stats_enabled = [] {
     }
     return false;
 }();
+
+/// A refusal bit when its condition holds. Both ?: operands are u32: GCC's -Wextra rejects an
+/// enumerator next to a plain 0.
+constexpr u32 RefuseIf(bool refuse, u32 bit) noexcept {
+    return refuse ? bit : 0u;
+}
 } // Anonymous namespace
 
 u32 RasterizerVulkan::RepeatRefusal(bool is_indexed) const {
     using Tegra::Engines::Maxwell3D;
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
     const auto& serials = maxwell3d->same_state_serials;
-    u32 refusal = repeat.valid ? 0 : RefusalNoPrevious;
-    refusal |= serials[Maxwell3D::SameStateOther] != repeat.serials[Maxwell3D::SameStateOther] ? RefusalRegisters : 0;
+    u32 refusal = RefuseIf(!repeat.valid, RefusalNoPrevious);
+    refusal |= RefuseIf(serials[Maxwell3D::SameStateOther] != repeat.serials[Maxwell3D::SameStateOther],
+                        RefusalRegisters);
     // Values only dynamic states read: a repeat updates those states too (UpdateDynamicStates).
     if (!Common::Nx2Ab::On(Common::Nx2Ab::DynamicDeltas)) {
-        refusal |= serials[Maxwell3D::SameStateDynamic] != repeat.serials[Maxwell3D::SameStateDynamic]
-                       ? RefusalRegisters
-                       : 0;
+        refusal |= RefuseIf(serials[Maxwell3D::SameStateDynamic] != repeat.serials[Maxwell3D::SameStateDynamic],
+                            RefusalRegisters);
     }
-    refusal |= serials[Maxwell3D::SameStateUniforms] != repeat.serials[Maxwell3D::SameStateUniforms] ? RefusalUniforms : 0;
-    refusal |= serials[Maxwell3D::SameStateGeometry] != repeat.serials[Maxwell3D::SameStateGeometry] ? RefusalGeometry : 0;
-    refusal |= VideoCommon::GpuSplit::Get().BackEvents() != repeat.back_events ? RefusalBackEvents : 0;
-    refusal |= setup_events.load(std::memory_order_relaxed) != repeat.setup_events ? RefusalSetupEvents : 0;
-    refusal |= buffer_events != repeat.buffer_events ? RefusalBufferEvents : 0;
-    refusal |= scheduler.RecordSerial() != repeat.record_serial ? RefusalRecords : 0;
+    refusal |= RefuseIf(serials[Maxwell3D::SameStateUniforms] != repeat.serials[Maxwell3D::SameStateUniforms],
+                        RefusalUniforms);
+    refusal |= RefuseIf(serials[Maxwell3D::SameStateGeometry] != repeat.serials[Maxwell3D::SameStateGeometry],
+                        RefusalGeometry);
+    refusal |= RefuseIf(VideoCommon::GpuSplit::Get().BackEvents() != repeat.back_events, RefusalBackEvents);
+    refusal |= RefuseIf(setup_events.load(std::memory_order_relaxed) != repeat.setup_events, RefusalSetupEvents);
+    refusal |= RefuseIf(buffer_events != repeat.buffer_events, RefusalBufferEvents);
+    refusal |= RefuseIf(scheduler.RecordSerial() != repeat.record_serial, RefusalRecords);
     const bool excluded = draw_state.topology != repeat.topology || is_indexed != repeat.is_indexed ||
                           !draw_state.inline_index_draw_indexes.empty() ||
                           maxwell3d->engine_state != Maxwell3D::EngineHint::None;
@@ -413,9 +421,21 @@ u32 RasterizerVulkan::RepeatRefusal(bool is_indexed) const {
         // The setup synchronized the indices up to its binding's size.
         const u64 end = (u64{draw_state.index_buffer.first} + draw_state.index_buffer.count) *
                         draw_state.index_buffer.FormatSizeInBytes();
-        refusal |= end > repeat.index_limit ? RefusalIndexRange : 0;
+        refusal |= RefuseIf(end > repeat.index_limit, RefusalIndexRange);
     }
-    return refusal | (excluded ? RefusalExcluded : 0);
+    return refusal | RefuseIf(excluded, RefusalExcluded);
+}
+
+const char* RasterizerVulkan::EngineLabel(const Tegra::Engines::EngineInterface* engine) const noexcept {
+    if (engine == nullptr) {
+        return "deferred call";
+    }
+    for (const auto& [known, label] : channel_engines) {
+        if (known == engine) {
+            return label;
+        }
+    }
+    return "another channel's engine";
 }
 
 bool RasterizerVulkan::CanRefreshBuffers() const {
@@ -775,7 +795,7 @@ void RasterizerVulkan::CountRepeat(u32 refusal, bool refresh) {
         if ((refusal & RefusalBackEvents) != 0) {
             const auto [from, to] = VideoCommon::GpuSplit::Get().LastBackEventEngines();
             const Tegra::Engines::EngineInterface* const own = maxwell3d;
-            ++s.back_event_engines[to == own ? from : to];
+            ++s.back_event_engines[EngineLabel(to == own ? from : to)];
         }
         if ((refusal & RefusalRegisters) != 0) {
             const u32 method = maxwell3d->last_other_method;
@@ -821,8 +841,7 @@ void RasterizerVulkan::CountRepeat(u32 refusal, bool refresh) {
         const auto it = last_stats.back_event_engines.find(engine);
         const u64 n = count - (it != last_stats.back_event_engines.end() ? it->second : 0);
         if (n != 0) {
-            engines += fmt::format(" {} {}/s", engine != nullptr ? typeid(*engine).name() : "deferred call",
-                                   rate(n, 0));
+            engines += fmt::format(" {} {}/s", engine, rate(n, 0));
         }
     }
     LOG_INFO(HW_GPU,
@@ -891,7 +910,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     // the draw parameters, other engines' work, cache invalidations, commands recorded): its
     // pipeline, descriptors, buffer bindings and render pass are still what this draw needs and
     // still bound in the command buffer, so only the draw is recorded.
-    const u32 refusal = same_state_enabled ? RepeatRefusal(is_indexed) : RefusalNoPrevious;
+    const u32 refusal = same_state_enabled ? RepeatRefusal(is_indexed) : u32{RefusalNoPrevious};
     // A pipeline that writes storage buffers is never repeated: its draws refresh instead.
     const bool repeat_draw = refusal == 0 && !repeat.refresh_only;
     // Only uniform buffers (bindings, uploads) and vertex and index buffer addresses changed, and
@@ -3700,6 +3719,17 @@ void RasterizerVulkan::BindChannel(Tegra::Control::ChannelState& channel) {
     };
     const s32 channel_id = channel.bind_id;
     BindToChannel(channel_id);
+    if (channel.payload) {
+        // The repeat stats' back-event engine names (the GCC builds have no RTTI).
+        auto& engines = *channel.payload;
+        channel_engines = {{
+            {&engines.maxwell_3d, "3D"},
+            {&engines.kepler_compute, "compute"},
+            {&engines.maxwell_dma, "DMA"},
+            {&engines.fermi_2d, "2D"},
+            {&engines.kepler_memory, "inline-to-memory"},
+        }};
+    }
     {
         std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
         texture_cache.BindToChannel(channel_id);

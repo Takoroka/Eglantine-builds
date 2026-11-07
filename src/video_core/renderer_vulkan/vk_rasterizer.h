@@ -357,9 +357,12 @@ private:
         /// Register refusals by Maxwell3D::last_other_method (NUM_REGS: a state run; the last
         /// slot: an HLE/interpreted macro).
         std::vector<u64> other_methods;
-        /// Back-event refusals by the other engine of the last engine switch (null: a call).
-        std::unordered_map<const Tegra::Engines::EngineInterface*, u64> back_event_engines;
+        /// Back-event refusals by the other engine of the last engine switch (EngineLabel).
+        std::unordered_map<const char*, u64> back_event_engines;
     } repeat_stats;
+    /// The bound channel's engines and their names in the repeat stats (no RTTI in GCC builds).
+    std::array<std::pair<const Tegra::Engines::EngineInterface*, const char*>, 5> channel_engines{};
+    [[nodiscard]] const char* EngineLabel(const Tegra::Engines::EngineInterface* engine) const noexcept;
 
     /// Uniform slot keep (uniform_stream_reuse.h): what happened since the last draw that bound
     /// uniform buffers. Clean when nothing but the guest writes listed here did.
