@@ -36,6 +36,7 @@
 #include "common/env_gate.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/gpu_build_clock.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
@@ -1071,6 +1072,8 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     if (!is_new) {
         return pipeline.get();
     }
+    // nx2:vi2's present wait doesn't count this toward its deadline (A/B bit PresentWaitBusyBack)
+    const VideoCommon::GpuBuildScope build_scope;
     if (Common::Nx2Ab::On(Common::Nx2Ab::PipelinePrebuild)) {
         pipeline = TakeComputePrebuild(key, shader);
     }
@@ -1606,6 +1609,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
             State expected{State::Queued};
             if (!job.state.compare_exchange_strong(expected, State::Cancelled,
                                                    std::memory_order_acq_rel)) {
+                const VideoCommon::GpuBuildScope build_scope;
                 job.state.wait(State::Running, std::memory_order_acquire);
             }
         }
@@ -2167,6 +2171,8 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
 } // Anonymous namespace
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
+    // nx2:vi2's present wait doesn't count this toward its deadline (A/B bit PresentWaitBusyBack)
+    const VideoCommon::GpuBuildScope build_scope;
     const auto begin = std::chrono::steady_clock::now();
     SCOPE_EXIT {
         ReportRuntimePipeline("Graphics", begin);
