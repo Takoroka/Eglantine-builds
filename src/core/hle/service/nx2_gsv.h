@@ -3201,6 +3201,10 @@ private:
         return Common::Nx2Ab::On(Common::Nx2Ab::VdecStopQuiet);
     }
 
+    static bool OneEndFrame() {
+        return Common::Nx2Ab::On(Common::Nx2Ab::VdecOneEndFrame);
+    }
+
     // Start (6): the input-ready event is signalled again while the queue has room.
     void Start(HLERequestContext& ctx) {
         Log(ctx, "start");
@@ -3589,6 +3593,7 @@ private:
                 m_decoded.clear();
                 m_last_decoded_pts = 0;
                 m_dropped_in_a_row = 0;
+                m_end_queued = false;
                 if (decoder) {
                     lk.unlock();
                     decoder->Reset();
@@ -3664,14 +3669,22 @@ private:
                 m_last_decoded_pts = pts;
                 m_decoded.push_back({std::move(picture), pts, false});
             }
-            if (input.end) {
+            const bool one_end = OneEndFrame();
+            if (one_end && !input.end && !pictures.empty()) {
+                m_end_queued = false;
+            }
+            if (input.end && !(one_end && m_end_queued)) {
                 // The client stops at the frame marked end of stream; give it one even when the
-                // last input held no picture.
+                // last input held no picture. Only one per stream: Kirby Air Riders submits end
+                // of stream until it gets its frame, and a second one (empty, at the submission's
+                // pts of -1) left its lesson player waiting for a frame that never comes due.
                 if (m_decoded.empty()) {
-                    m_decoded.push_back({std::nullopt, input.pts, true});
+                    m_decoded.push_back(
+                        {std::nullopt, one_end ? m_last_decoded_pts : input.pts, true});
                 } else {
                     m_decoded.back().end = true;
                 }
+                m_end_queued = true;
             }
         }
     }
@@ -3803,6 +3816,7 @@ private:
     u64 m_release_anchors{};      ///< Clock settings from releases (A/B bit 30)
     u64 m_frame_interval{16667}; ///< us, from consecutive decoded frames
     u64 m_last_decoded_pts{};
+    bool m_end_queued{}; ///< Decode thread: this stream's end-of-stream frame is queued (bit 32)
     u32 m_dropped_in_a_row{};
     std::deque<Input> m_inputs;
     std::deque<Decoded> m_decoded;     ///< Waiting for a free output image

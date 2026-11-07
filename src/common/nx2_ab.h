@@ -193,6 +193,10 @@ enum Feature : u64 {
     // Finalize until the next Start (INx2VideoSession). Kirby Air Riders aborted when it fired
     // after finalize.
     VdecStopQuiet = 1ull << 29,
+    // switchbrew (11-07): one end-of-stream frame per decoder stream, an empty one at the last
+    // decoded pts (INx2VideoSession::DecodeLoop). Kirby Air Riders' lesson videos stuck on a
+    // second, empty end frame at pts -1.
+    VdecOneEndFrame = 1ull << 32,
 };
 
 inline const u64 g_mask = [] {
