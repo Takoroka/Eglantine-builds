@@ -25,6 +25,10 @@ enum Feature : u64 {
     // texlookup (11-06): the Texture Cache Memory Limit setting caps the collector's thresholds
     // (TextureCache::ApplyThresholdOverrides) in place of MaxCriticalMemory.
     TcMemoryLimit = 1ull << 1,
+    // frontprep (11-06): with channels parked and nothing queued, the GPU thread waits for a
+    // wake (semaphore writes, back batch ends, commands) instead of a 2 ms yield loop; at most
+    // 200 us (VideoCommon::PendingWake). Idea: SerkiGohan (#681), MFS-code latch wake.
+    PendingWake = 1ull << 2,
     // fences (11-05): direct draws with no vertices or no instances skip the draw setup.
     ZeroDrawSkip = 1ull << 40,
     // vkoff (11-05): draws with none of the dynamic states' dirty flags set skip their updates.
