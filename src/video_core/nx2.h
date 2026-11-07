@@ -612,7 +612,7 @@ public:
             return value ? std::strtoull(value, nullptr, 16) : u64{0};
         }();
         if (from_env != 0) {
-            ArmWatch(from_env, std::numeric_limits<s64>::max());
+            ArmWatch(from_env, (std::numeric_limits<s64>::max)());
         }
     }
 
