@@ -447,6 +447,8 @@ std::vector<Encoding> AllEncodings() {
             out.push_back({Lse(size, true, true, 1, op, 0, 31), bytes, bytes, false, false, 1, 31});
             out.push_back({Lse(size, true, true, 1, op, 0, 1), bytes, bytes, false, false, 1, 1});
             out.push_back({Lse(size, true, true, 1, op, 0, 0), bytes, bytes, false, false, 1, 0});
+            // Rs == Rn: the operand is the address.
+            out.push_back({Lse(size, true, true, 0, op, 0, 2), bytes, bytes, false, false, 0, 2});
         }
     }
     // CAS: every size and variant (Rs = X1, Rt = X2), and Rs == Rt, Rs = XZR.
@@ -457,6 +459,10 @@ std::vector<Encoding> AllEncodings() {
         }
         out.push_back({Cas(size, true, 1, true, 0, 1), bytes, bytes, true, false, 1, 1});
         out.push_back({Cas(size, true, 31, true, 0, 2), bytes, bytes, true, false, 31, 2});
+        // Rs == Rn (the old value overwrites the address register) and Rt == Rn (the address
+        // is the new value).
+        out.push_back({Cas(size, true, 0, true, 0, 2), bytes, bytes, true, false, 0, 2});
+        out.push_back({Cas(size, true, 1, true, 0, 0), bytes, bytes, true, false, 1, 0});
     }
     // CASP: both sizes and variants (Rs = X2/X3, Rt = X4/X5), and Rs = X30 (the pair's second
     // register is XZR).
@@ -534,7 +540,7 @@ TEST_CASE("A64: LSE atomics native vs exclusive pair", "[a64][lse]") {
                     for (size_t i = 0; i < word; ++i) {
                         mem(c.addr + w * word + i) = static_cast<u8>(value >> (8 * i));
                     }
-                    if ((e.is_cas || e.is_casp) && (v & 1) == 0 && e.rs + w != 31) {
+                    if ((e.is_cas || e.is_casp) && (v & 1) == 0 && e.rs + w != 31 && e.rs + w != 0) {
                         const u64 mask = SizeMask(word);
                         u64& rs = c.regs[e.rs + w];
                         rs = (rs & ~mask) | (value & mask);
@@ -854,4 +860,112 @@ TEST_CASE("A64: exclusive monitor with and without its lock, four cores", "[a64]
             REQUIRE(pair[1] == 4 * iterations);
         });
     }
+}
+
+namespace {
+
+// A block of random ALU ops, loads, stores and atomics (X0-X3 hold four 0x100-apart addresses in
+// the data page and are never written), then B . - the native atomics sit among many live
+// values, where the register allocator has to move things out of RAX/RBX/RCX/RDX around them.
+std::vector<u32> RandomBlock(std::mt19937_64& rng, size_t count) {
+    std::vector<u32> code;
+    const auto dest = [&] { return static_cast<u32>(4 + rng() % 27); };  // X4-X30
+    const auto src = [&] { return static_cast<u32>(rng() % 32); };       // X0-X30, XZR
+    const auto base = [&] { return static_cast<u32>(rng() % 4); };       // X0-X3
+    const auto even_pair = [&] { return static_cast<u32>(4 + 2 * (rng() % 13)); };  // X4..X28
+    for (size_t i = 0; i < count; ++i) {
+        switch (rng() % 11) {
+        case 0:
+            code.push_back(0x8B000000u | src() << 16 | src() << 5 | dest());  // ADD Xd, Xn, Xm
+            break;
+        case 1:
+            code.push_back(0x0B000000u | src() << 16 | src() << 5 | dest());  // ADD Wd, Wn, Wm
+            break;
+        case 2:
+            code.push_back(0xCA000000u | src() << 16 | src() << 5 | dest());  // EOR Xd, Xn, Xm
+            break;
+        case 3:
+            code.push_back(0x91000000u | static_cast<u32>(rng() % 4096) << 10 | (4 + rng() % 27) << 5 | dest());  // ADD Xd, Xn, #imm
+            break;
+        case 4:
+            code.push_back(0xF9400000u | static_cast<u32>(rng() % 16) << 10 | base() << 5 | dest());  // LDR Xt, [Xb, #8*i]
+            break;
+        case 5:
+            code.push_back(0xF9000000u | static_cast<u32>(rng() % 16) << 10 | base() << 5 | src());  // STR Xt, [Xb, #8*i]
+            break;
+        case 6:
+        case 7: {  // LDADD..SWP, any size and variant; Rt may be XZR
+            const u32 rt = rng() % 8 == 0 ? 31u : dest();
+            code.push_back(Lse(static_cast<u32>(rng() % 4), rng() & 1, rng() & 1, src(), static_cast<u32>(rng() % 9), base(), rt));
+            break;
+        }
+        case 8:
+        case 9: {  // CAS, any size and variant: Rs is written, so it is a destination
+            const u32 rs = rng() % 8 == 0 ? 31u : dest();
+            code.push_back(Cas(static_cast<u32>(rng() % 4), rng() & 1, rs, rng() & 1, base(), src()));
+            break;
+        }
+        default:  // CASP, both sizes
+            code.push_back(Casp(rng() & 1, rng() & 1, even_pair(), rng() & 1, base(), even_pair()));
+            break;
+        }
+    }
+    code.push_back(branch_self);
+    return code;
+}
+
+State ExecuteBlock(Machine& m, u64 pc, const std::vector<u32>& code, const std::array<u64, 31>& regs,
+                   const std::vector<u8>& data) {
+    for (size_t i = 0; i < code.size(); ++i) {
+        m.env.Write<u32>(pc + i * 4, code[i]);
+    }
+    std::memcpy(m.arena.base + data_base, data.data(), page_size);
+    m.jit.SetRegisters(regs);
+    m.jit.SetSP(0x8000);
+    m.jit.SetPstate(0);
+    m.jit.SetPC(pc);
+    m.env.ticks_left = code.size() + 3;
+    m.jit.Run();
+    State s;
+    s.regs = m.jit.GetRegisters();
+    s.pc = m.jit.GetPC();
+    s.data.assign(m.arena.base + data_base, m.arena.base + data_base + page_size);
+    return s;
+}
+
+}  // namespace
+
+TEST_CASE("A64: LSE atomics in random blocks, native vs exclusive pair", "[a64][lse]") {
+    std::mt19937_64 rng{0xB10C'15E'0001ull};
+    constexpr size_t block_instructions = 40;
+    constexpr u64 block_stride = 0x100;  // 64 instructions per code slot
+    size_t blocks = 0;
+    for (int round = 0; round < 4; ++round) {
+        // Fresh JITs per round: code_size / block_stride slots each.
+        Machine native{true};
+        Machine reference{false};
+        for (u64 pc = code_base; pc + block_stride <= code_size; pc += block_stride) {
+            const std::vector<u32> code = RandomBlock(rng, block_instructions);
+            std::array<u64, 31> regs{};
+            for (auto& r : regs) {
+                r = Interesting(rng);
+            }
+            for (u64 i = 0; i < 4; ++i) {
+                regs[i] = data_base + 0x100 * i;
+            }
+            std::vector<u8> data(page_size);
+            for (auto& b : data) {
+                b = static_cast<u8>(rng());
+            }
+            INFO("block " << blocks << " at pc " << std::hex << pc);
+            const State got = ExecuteBlock(native, pc, code, regs, data);
+            const State want = ExecuteBlock(reference, pc, code, regs, data);
+            REQUIRE(got.regs == want.regs);
+            REQUIRE(got.data == want.data);
+            REQUIRE(got.pc == want.pc);
+            REQUIRE(got.pc == pc + block_instructions * 4);
+            ++blocks;
+        }
+    }
+    REQUIRE(blocks >= 1000);
 }
