@@ -40,6 +40,7 @@
 #include "core/frontend/framebuffer_layout.h"
 #include "core/perf_stats.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_build_clock.h"
 #include "video_core/gpu_split.h"
 #include "video_core/framebuffer_config.h"
 #include "core/core_timing.h"
@@ -2303,7 +2304,7 @@ private:
     // Eden's GPU thread has processed the frame. Otherwise the game laps the GPU thread and
     // rewrites command memory it hasn't read yet.
     std::atomic<u32> m_wait_timeouts{};
-    std::atomic<u32> m_busy_back_waits{}; ///< WaitForFrame waits the back's work stretched (logged)
+    std::atomic<u32> m_busy_back_waits{}; ///< WaitForFrame waits the GPU thread's builds stretched (logged)
     struct PresentStats {
         long long frame_us{}, fence_us{}, composite_us{}, pace_us{}, max_fence_us{};
         long long max_frame_us{}, hitches{};
@@ -2471,8 +2472,9 @@ private:
         // Long enough to cover shader/pipeline compile stalls: a game that gets more than a few
         // command buffers ahead misses the equal-value gates its other channels acquire, and
         // rewrites command memory the GPU thread hasn't read. With A/B bit PresentWaitBusyBack the
-        // split's back working doesn't count toward it (Service::Nx2::PresentDeadline).
+        // GPU thread's pipeline builds don't count toward it (Service::Nx2::PresentDeadline).
         auto& split = VideoCommon::GpuSplit::Get();
+        const auto& builds = VideoCommon::GpuBuildClock::Get();
         Service::Nx2::PresentDeadline deadline{
             start, split.Active() && Common::Nx2Ab::On(Common::Nx2Ab::PresentWaitBusyBack)};
         if (!syncpoints.IsReadyGuest(fence_id, fence_value)) {
@@ -2506,15 +2508,16 @@ private:
                     }
                 }
                 const auto slice_start = std::chrono::steady_clock::now();
+                const auto built_before = builds.Total(slice_start);
                 wake->cv.wait_for(lk, std::chrono::milliseconds{unless_gpu_waits ? 1 : 50});
-                deadline.AfterSlice(slice_start, std::chrono::steady_clock::now(),
-                                    !split.BackIdle());
+                const auto slice_end = std::chrono::steady_clock::now();
+                deadline.AfterSlice(slice_start, slice_end, builds.Total(slice_end) - built_before);
             }
         }
-        if (deadline.Extended() > std::chrono::seconds{1} && m_busy_back_waits++ < 64) {
+        if (deadline.Extended() > std::chrono::milliseconds{500} && m_busy_back_waits++ < 64) {
             LOG_INFO(Service,
                      "nx2:vi2 present #{} fence ({}, {}) waited {} ms, {} ms of it while the GPU "
-                     "thread's back worked (A/B bit PresentWaitBusyBack), {}",
+                     "thread built pipelines (A/B bit PresentWaitBusyBack), {}",
                      m_presents, fence_id, fence_value,
                      std::chrono::duration_cast<std::chrono::milliseconds>(
                          std::chrono::steady_clock::now() - start)
