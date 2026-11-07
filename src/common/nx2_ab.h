@@ -37,6 +37,10 @@ enum Feature : u64 {
     // a few threads of their own; boot and the builds a draw or dispatch waits for keep all of the
     // pipeline workers (PipelineCache::async_workers).
     BuilderThreadsByPhase = 1ull << 4,
+    // texlookup (11-06): VK_EXT_memory_priority / VK_EXT_pageable_device_local_memory: render
+    // targets, buffers and the stream buffer high, texture cache images by recency
+    // (VideoCommon::MemoryPriority). Read once, at device creation.
+    VramPriority = 1ull << 6,
     // fences (11-05): direct draws with no vertices or no instances skip the draw setup.
     ZeroDrawSkip = 1ull << 40,
     // vkoff (11-05): draws with none of the dynamic states' dirty flags set skip their updates.

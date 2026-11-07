@@ -99,6 +99,32 @@ public:
 
     u64 GetDeviceMemorySlack() const;
 
+    /// VRAM priority (A/B bit VramPriority): set by the texture cache while it looks up a
+    /// render target or depth buffer, so that an image it creates for one is made with the
+    /// Frame priority (VideoCommon::MemoryPriority).
+    bool render_target_hint = false;
+
+    /// Gives a tracked image's own memory the tier's priority (vkSetDeviceMemoryPriorityEXT).
+    void SetResidencyTier(Image& image, VideoCommon::ResidencyTier tier);
+
+    /// Allocations carry priorities (VK_EXT_memory_priority).
+    bool ResidencyActive() const;
+
+    /// Images made since the last call: with memory of their own (dedicated) or in shared
+    /// blocks, how many of each for render targets, and their bytes. For the VRAM priority log.
+    struct ResidencyCreated {
+        u64 dedicated;
+        u64 dedicated_bytes;
+        u64 dedicated_targets;
+        u64 blocks;
+        u64 block_bytes;
+        u64 block_targets;
+    };
+    ResidencyCreated TakeResidencyCreated() noexcept {
+        return std::exchange(residency_created, ResidencyCreated{});
+    }
+    ResidencyCreated residency_created{};
+
     /// Device memory is the system's RAM (the collector keeps its fixed cap there).
     bool IsIntegratedGpu() const;
 
@@ -504,6 +530,11 @@ public:
         return memory_block;
     }
 
+    /// original_image's own device memory when its priority can be changed (residency_tracked).
+    [[nodiscard]] VkDeviceMemory ResidencyMemory() const noexcept {
+        return residency_memory;
+    }
+
     /// Returns true when the image is already initialized and mark it as initialized
     [[nodiscard]] bool ExchangeInitialization() noexcept {
         return std::exchange(initialized, true);
@@ -658,6 +689,8 @@ private:
     /// original_image's memory, which stays where it was put: asked of VMA once rather than for
     /// every image at each collector pass.
     vk::Image::MemoryBlock memory_block{};
+    /// original_image's dedicated memory, with pageable device memory (A/B bit VramPriority).
+    VkDeviceMemory residency_memory{};
 
     vk::Buffer compute_unswizzle_buffer;
     VkDeviceSize compute_unswizzle_buffer_size = 0;

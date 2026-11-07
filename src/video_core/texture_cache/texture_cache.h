@@ -7,6 +7,8 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <numeric>
 #include <cstdlib>
 #include <limits>
@@ -564,6 +566,7 @@ void TextureCache<P>::TickFrame() {
                      budget_thresholds ? "by the budget" : "capped");
         }
     }
+    TickResidency();
     // Every 600 frames: device memory in use against the collector's thresholds.
     // Skip expensive heap allocation, map construction, and sorting unless debug logging is explicitly enabled.
     static const bool log_tc = std::getenv("EDEN_NX2_TC_LOG") != nullptr;
@@ -3308,11 +3311,18 @@ template <class P>
 ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAddr gpu_addr) {
     ImageId image_id{};
     bool delete_state = has_deleted_images;
+    // VRAM priority: an image made here is a render target or depth buffer (Frame priority).
+    if constexpr (HAS_RESIDENCY) {
+        runtime.render_target_hint = true;
+    }
     do {
         has_deleted_images = false;
         image_id = FindOrInsertImage(info, gpu_addr);
         delete_state |= has_deleted_images;
     } while (has_deleted_images);
+    if constexpr (HAS_RESIDENCY) {
+        runtime.render_target_hint = false;
+    }
     has_deleted_images = delete_state;
     if (!image_id) {
         return NULL_IMAGE_VIEW_ID;
@@ -4013,11 +4023,88 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
             image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
         }
         MarkModification(image);
+        // VRAM priority: what the GPU writes (render targets, storage images) is the frame's.
+        if (image.residency_tracked && image.residency_tier != ResidencyTier::Frame) {
+            SetResidencyTier(image, ResidencyTier::Frame);
+            ++residency_raised;
+        }
     }
     // Once a frame is enough (the item's tick is the frame); the pool item is a cache miss away.
     if (image.lru_touch_tick != frame_tick) {
         image.lru_touch_tick = frame_tick;
         lru_cache.Touch(image.lru_index, frame_tick);
+        // Only tracked images are ever cold (TickResidency).
+        if (image.residency_tier == ResidencyTier::Cold) {
+            SetResidencyTier(image, ResidencyTierOnUse(image.residency_tier, false));
+            ++residency_rewarmed;
+        }
+    }
+}
+
+template <class P>
+void TextureCache<P>::SetResidencyTier(Image& image, ResidencyTier tier) {
+    if constexpr (HAS_RESIDENCY) {
+        runtime.SetResidencyTier(image, tier);
+    }
+    image.residency_tier = tier;
+}
+
+template <class P>
+void TextureCache<P>::TickResidency() {
+    if constexpr (HAS_RESIDENCY) {
+        if (!runtime.ResidencyActive()) {
+            return;
+        }
+        // Images with memory of their own that nothing used for ResidencyColdFrames get the
+        // lowest priority: the driver moves them out of VRAM first when it has to.
+        u64 bound{};
+        if (frame_tick % ResidencyScanFrames == 0 &&
+            ResidencyColdBound(frame_tick, ResidencyColdFrames, bound)) {
+            u32 lowered = 0;
+            lru_cache.ForEachItemBelow(bound, [&](ImageId image_id) {
+                Image& image = slot_images[image_id];
+                if (image.residency_tracked && image.residency_tier != ResidencyTier::Cold) {
+                    SetResidencyTier(image, ResidencyTier::Cold);
+                    ++residency_lowered;
+                    ++lowered;
+                }
+                return lowered >= ResidencyMaxLoweredPerScan;
+            });
+        }
+        // Every 30 s, in every log (grep "VRAM priority:"): the tracked images by tier, the
+        // priority changes, and how the images made since were placed.
+        const auto now = std::chrono::steady_clock::now();
+        if (residency_next_log == std::chrono::steady_clock::time_point{}) {
+            residency_next_log = now + std::chrono::seconds{30};
+            return;
+        }
+        if (now < residency_next_log) {
+            return;
+        }
+        residency_next_log = now + std::chrono::seconds{30};
+        std::array<u64, 3> count{};
+        std::array<u64, 3> bytes{};
+        for (const auto [image_id, image] : slot_images) {
+            if (image->residency_tracked) {
+                const size_t tier = static_cast<size_t>(image->residency_tier);
+                ++count[tier];
+                bytes[tier] += image->residency_bytes;
+            }
+        }
+        const auto created = runtime.TakeResidencyCreated();
+        constexpr auto frame = static_cast<size_t>(ResidencyTier::Frame);
+        constexpr auto normal = static_cast<size_t>(ResidencyTier::Normal);
+        constexpr auto cold = static_cast<size_t>(ResidencyTier::Cold);
+        LOG_INFO(HW_GPU,
+                 "VRAM priority: images with own memory: frame {} ({} MiB), normal {} ({} MiB), "
+                 "cold {} ({} MiB); last 30 s: {} raised to frame, {} back from cold, {} lowered "
+                 "to cold; made {} with own memory ({} MiB, {} render targets), {} in blocks "
+                 "({} MiB, {} render targets)",
+                 count[frame], bytes[frame] >> 20, count[normal], bytes[normal] >> 20, count[cold],
+                 bytes[cold] >> 20, residency_raised, residency_rewarmed, residency_lowered,
+                 created.dedicated, created.dedicated_bytes >> 20, created.dedicated_targets,
+                 created.blocks, created.block_bytes >> 20, created.block_targets);
+        residency_raised = residency_rewarmed = residency_lowered = 0;
     }
 }
 

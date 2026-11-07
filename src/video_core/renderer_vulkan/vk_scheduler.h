@@ -20,6 +20,7 @@
 #include "common/polyfill_thread.h"
 #include "common/settings.h"
 #include "video_core/gpu_split.h"
+#include "video_core/gpu_timestamp_stats.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -34,10 +35,25 @@ namespace Vulkan {
 class CommandPool;
 class Device;
 class Framebuffer;
+class GpuTimestamps;
 class GraphicsPipeline;
 class StateTracker;
 
 struct QueryCacheParams;
+
+/// The backend's own work outside render passes, timed with EDEN_NX2_GPU_TIMESTAMPS
+/// (Scheduler::TimestampInternal); guest compute programs are keyed by their hash.
+enum class TimedWork : u64 {
+    TextureUpload = 0x0FFF'FFFF'0000'0001ULL, // under 2^60 (Scheduler's TimedKey)
+    VertexRepack,
+    Uint8Index,
+    QuadIndex,
+    ConditionalResolve,
+    QueryPrefixScan,
+    AstcDecode,
+    BcEncode,
+    Unswizzle3D,
+};
 
 /// The scheduler abstracts command buffer and fence management with an interface that's able to do
 /// OpenGL-like operations on Vulkan command buffers.
@@ -154,28 +170,66 @@ public:
         on_submit = std::move(func);
     }
 
-    /// Send work to a separate thread.
+    /// Send work to a separate thread, with the upload command buffer (submitted before the
+    /// main one) as the second argument.
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer, vk::CommandBuffer>
     void RecordWithUploadBuffer(T&& command) {
-        if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
-            VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
+        if (timestamps) [[unlikely]] {
+            TimeUploadBuffer();
         }
-        ++record_serial;
-        if (chunk->Record(command)) {
-            return;
-        }
-        DispatchWork();
-        (void)chunk->Record(command);
+        RecordImpl(std::forward<T>(command));
     }
 
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer>
     void Record(T&& c) {
-        this->RecordWithUploadBuffer(
-            [command = std::move(c)](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
-                command(cmdbuf);
-            });
+        RecordImpl([command = std::move(c)](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
+            command(cmdbuf);
+        });
+    }
+
+    /// EDEN_NX2_GPU_TIMESTAMPS=1 (GpuTimestamps): the GPU time of render passes, dispatch and
+    /// texture upload batches, upload command buffers and the present, logged every 30 s.
+    [[nodiscard]] bool TimestampsEnabled() const noexcept {
+        return timestamps != nullptr;
+    }
+
+    /// Outside render passes, before recording a dispatch or a texture upload: consecutive ones
+    /// with the same key make one segment. `name` labels a key the first time (null: a guest
+    /// compute program, key = its hash).
+    void TimestampOutside(u64 key, VideoCommon::GpuSegmentKind kind, const char* name = nullptr) {
+        if (timestamps) [[unlikely]] {
+            TimeOutside(key, kind, name);
+        }
+    }
+
+    /// The backend's own work outside render passes (see TimestampOutside).
+    void TimestampInternal(TimedWork work) {
+        if (timestamps) [[unlikely]] {
+            TimeInternal(work);
+        }
+    }
+
+    /// A draw recorded in the current render pass.
+    void TimestampDraw() noexcept {
+        if (timed_pass.open) [[unlikely]] {
+            ++timed_pass.work;
+        }
+    }
+
+    /// Around the present's recording (RendererVulkan::Composite).
+    void TimestampPresent(bool begin) {
+        if (timestamps) [[unlikely]] {
+            TimePresent(begin);
+        }
+    }
+
+    /// The rasterizer's frame end: open segments end here (a render pass goes on in a new one).
+    void TimestampFrameEnd() {
+        if (timestamps) [[unlikely]] {
+            TimeFrameEnd();
+        }
     }
 
     /// Whether the recording thread submitted `tick` within 20 ms.
@@ -253,8 +307,43 @@ public:
     std::mutex submit_mutex;
 
 private:
+    template <typename T>
+    void RecordImpl(T&& command) {
+        if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
+            VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
+        }
+        ++record_serial;
+        if (chunk->Record(command)) {
+            return;
+        }
+        DispatchWork();
+        (void)chunk->Record(command);
+    }
+
+    /// A timed segment (GpuTimestamps) between its begin and end timestamps.
+    struct TimedSegment {
+        bool open = false;
+        bool upload = false; ///< Its timestamps go to the upload command buffer.
+        VkQueryPool pool{};
+        u32 end_query{};
+        u32 index{};
+        u64 key{};
+        u32 work{};
+    };
+
+    void OpenTimed(TimedSegment& segment, u64 key, bool upload);
+    void CloseTimed(TimedSegment& segment);
+    void WriteTimestamp(VkQueryPool pool, u32 query, bool upload);
+    void TimePassBegin(const Framebuffer* framebuffer);
+    void TimeOutside(u64 key, VideoCommon::GpuSegmentKind kind, const char* name);
+    void TimeInternal(TimedWork work);
+    void TimeUploadBuffer();
+    void TimePresent(bool begin);
+    void TimeFrameEnd();
+
     std::chrono::steady_clock::time_point last_flush{};
     bool flush_pending{};
+
 
     class Command {
     public:
@@ -386,6 +475,14 @@ private:
     bool compute_writes_pending{};
     bool graphics_pipeline_missing{};
     std::unique_ptr<CommandPool> command_pool;
+    /// EDEN_NX2_GPU_TIMESTAMPS (null when off) and its open segments. Before worker_thread: the
+    /// query pools outlive the worker that records into them.
+    std::unique_ptr<GpuTimestamps> timestamps;
+    TimedSegment timed_pass;
+    TimedSegment timed_outside;
+    TimedSegment timed_upload;
+    TimedSegment timed_present;
+    u64 timed_pass_key{}; ///< The active render pass's key (a frame end opens a new segment).
 
     VideoCommon::QueryCacheBase<QueryCacheParams>* query_cache = nullptr;
 

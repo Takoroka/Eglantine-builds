@@ -19,6 +19,7 @@
 #include "common/literals.h"
 #include "common/logging.h"
 #include <ranges>
+#include "video_core/texture_cache/memory_priority.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
@@ -84,6 +85,22 @@ namespace {
                 return VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
         }
         return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    }
+
+    // VK_EXT_memory_priority (A/B bit VramPriority; ignored without it): the stream buffer holds
+    // the frame's uniforms and small uploads, device-local buffers the guest's vertex, index,
+    // uniform and storage data and its command lists. Host memory keeps the default.
+    [[nodiscard]] float MemoryUsagePriority(MemoryUsage usage) {
+        switch (usage) {
+            case MemoryUsage::Stream:
+                return VideoCommon::MemoryPriority::Frame;
+            case MemoryUsage::DeviceLocal:
+                return VideoCommon::MemoryPriority::Buffers;
+            case MemoryUsage::Upload:
+            case MemoryUsage::Download:
+                break;
+        }
+        return VideoCommon::MemoryPriority::Normal;
     }
 } // namespace
 
@@ -206,7 +223,8 @@ MemoryAllocator::MemoryAllocator(const Device &device_)
 
 MemoryAllocator::~MemoryAllocator() = default;
 
-vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated) const
+vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated,
+                                       float priority) const
 {
     const VmaAllocationCreateInfo alloc_ci = {
             // Best fit: images freed by the thousand leave holes in the blocks, which new ones
@@ -221,7 +239,8 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
             .memoryTypeBits = 0,
             .pool = VK_NULL_HANDLE,
             .pUserData = nullptr,
-            .priority = 0.f,
+            // Used for a dedicated allocation; one in a block has the block's (Normal).
+            .priority = priority,
     };
 
     VkImage handle{};
@@ -333,7 +352,7 @@ VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &
         .memoryTypeBits = requirements.memoryTypeBits,
         .pool = VK_NULL_HANDLE,
         .pUserData = nullptr,
-        .priority = 0.f,
+        .priority = VideoCommon::MemoryPriority::Normal,
     };
     VmaAllocation allocation{};
     VmaAllocationInfo info{};
@@ -415,7 +434,7 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
         .memoryTypeBits = usage == MemoryUsage::Stream ? 0u : valid_memory_types,
         .pool = VK_NULL_HANDLE,
         .pUserData = nullptr,
-        .priority = 0.f,
+        .priority = MemoryUsagePriority(usage),
     };
 
     VkBuffer handle{};
@@ -473,7 +492,7 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
         .memoryTypeBits = memory_type_bits,
         .pool = VK_NULL_HANDLE,
         .pUserData = nullptr,
-        .priority = 0.f,
+        .priority = MemoryUsagePriority(usage),
     };
 
     VkBuffer handle{};
@@ -510,6 +529,7 @@ MemoryCommit MemoryAllocator::Commit(const VkMemoryRequirements &reqs, MemoryUsa
     ci.memoryTypeBits = reqs.memoryTypeBits & valid_memory_types;
     ci.requiredFlags = 0;
     ci.preferredFlags = MemoryUsagePreferredVmaFlags(usage);
+    ci.priority = MemoryUsagePriority(usage);
 
     VmaAllocation a{};
     VmaAllocationInfo info{};
@@ -545,7 +565,7 @@ MemoryCommit MemoryAllocator::Commit(const vk::Buffer &buffer, MemoryUsage usage
     ci.preferredFlags = MemoryUsagePreferredVmaFlags(usage);
     ci.pool = VK_NULL_HANDLE;
     ci.pUserData = nullptr;
-    ci.priority = 0.0f;
+    ci.priority = MemoryUsagePriority(usage);
 
     const VkBuffer raw = *buffer;
 

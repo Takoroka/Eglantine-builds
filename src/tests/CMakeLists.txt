@@ -62,6 +62,7 @@ add_executable(tests
     video_core/pending_wake.cpp
     video_core/method_tally.cpp
     video_core/texture_cache_memory_limit.cpp
+    video_core/vram_priority_timestamps.cpp
     input_common/calibration_configuration_job.cpp
 )
 

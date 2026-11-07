@@ -102,6 +102,7 @@ add_library(video_core STATIC
     gpu.h
     gpu_split.cpp
     gpu_split.h
+    gpu_timestamp_stats.h
     gpu_thread.cpp
     gpu_thread.h
     guest_memory.h
@@ -196,6 +197,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_fence_manager.h
     renderer_vulkan/vk_graphics_pipeline.cpp
     renderer_vulkan/vk_graphics_pipeline.h
+    renderer_vulkan/vk_gpu_timestamps.cpp
+    renderer_vulkan/vk_gpu_timestamps.h
     renderer_vulkan/vk_multi_range_buffer.cpp
     renderer_vulkan/vk_multi_range_buffer.h
     renderer_vulkan/vk_master_semaphore.cpp
@@ -279,6 +282,7 @@ add_library(video_core STATIC
     texture_cache/image_view_info.cpp
     texture_cache/image_view_info.h
     texture_cache/memory_limit.h
+    texture_cache/memory_priority.h
     texture_cache/render_targets.h
     texture_cache/samples_helper.h
     texture_cache/texture_cache.cpp

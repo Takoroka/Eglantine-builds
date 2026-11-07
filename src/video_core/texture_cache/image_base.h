@@ -15,6 +15,7 @@
 #include "common/common_types.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view_info.h"
+#include "video_core/texture_cache/memory_priority.h"
 #include "video_core/texture_cache/types.h"
 
 namespace VideoCommon {
@@ -133,6 +134,13 @@ struct ImageBase {
     size_t lru_index = SIZE_MAX;
     /// Frame the texture cache last touched lru_index in (PrepareImage): the item is current.
     u64 lru_touch_tick = ~0ULL;
+
+    /// VRAM priority (A/B bit VramPriority): the backend can change the priority of the image's
+    /// device memory (a dedicated allocation with VK_EXT_pageable_device_local_memory), which
+    /// follows residency_tier. residency_bytes is that memory's size.
+    u64 residency_bytes = 0;
+    bool residency_tracked = false;
+    ResidencyTier residency_tier = ResidencyTier::Normal;
 
     std::array<u32, MAX_MIP_LEVELS> mip_level_offsets{};
 

@@ -71,6 +71,9 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE(EXT, IndexTypeUint8, INDEX_TYPE_UINT8, index_type_uint8)                               \
     FEATURE(EXT, LineRasterization, LINE_RASTERIZATION, line_rasterization)                        \
     FEATURE(EXT, MeshShader, MESH_SHADER, mesh_shader)                                             \
+    FEATURE(EXT, MemoryPriority, MEMORY_PRIORITY, memory_priority)                                 \
+    FEATURE(EXT, PageableDeviceLocalMemory, PAGEABLE_DEVICE_LOCAL_MEMORY,                          \
+            pageable_device_local_memory)                                                          \
     FEATURE(EXT, PrimitiveTopologyListRestart, PRIMITIVE_TOPOLOGY_LIST_RESTART,                    \
             primitive_topology_list_restart)                                                       \
     FEATURE(EXT, ProvokingVertex, PROVOKING_VERTEX, provoking_vertex)                              \
@@ -801,6 +804,25 @@ FN_MAX_LIMIT_LIST
     /// Returns true if vkResetQueryPool (host-side query reset) is supported.
     bool IsHostQueryResetSupported() const {
         return features.host_query_reset.hostQueryReset != VK_FALSE;
+    }
+
+    /// VK_EXT_memory_priority is enabled (A/B bit VramPriority): allocations carry a priority
+    /// (VideoCommon::MemoryPriority).
+    bool IsMemoryPrioritySupported() const {
+        return extensions.memory_priority;
+    }
+
+    /// VK_EXT_pageable_device_local_memory is enabled too: SetMemoryPriority works.
+    bool IsPageableDeviceLocalMemorySupported() const {
+        return extensions.pageable_device_local_memory;
+    }
+
+    /// Changes the priority of a VkDeviceMemory (vkSetDeviceMemoryPriorityEXT); nothing without
+    /// pageable device-local memory.
+    void SetMemoryPriority(VkDeviceMemory memory, float priority) const {
+        if (extensions.pageable_device_local_memory && memory != VK_NULL_HANDLE) {
+            dld.vkSetDeviceMemoryPriorityEXT(*logical, memory, priority);
+        }
     }
 
     /// Returns true if the device supports VK_EXT_transform_feedback.

@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "video_core/texture_cache/memory_priority.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/vulkan_common/vma.h"
@@ -108,7 +109,10 @@ namespace Vulkan {
 
         /// `dedicated`: own device memory, returned to the driver on destruction (short-lived
         /// images would otherwise leave holes in the shared blocks).
-        vk::Image CreateImage(const VkImageCreateInfo &ci, bool dedicated = false) const;
+        /// `priority`: VK_EXT_memory_priority of the image's memory when VMA gives it its own
+        /// (a dedicated allocation); one in a shared block has the block's (Normal).
+        vk::Image CreateImage(const VkImageCreateInfo &ci, bool dedicated = false,
+                              float priority = VideoCommon::MemoryPriority::Normal) const;
 
         /// A sparse resident image with nothing bound (reads return zero, writes are dropped), or
         /// a null image when the device can't make one.
