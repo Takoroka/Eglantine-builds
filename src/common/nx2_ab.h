@@ -59,6 +59,12 @@ enum Feature : u64 {
     // atomic on the fastmem pointer instead of an exclusive load + store pair (Dynarmic
     // UserConfig::native_lse_atomics). Read when a core's JIT is made.
     LseAtomics = 1ull << 15,
+    // codegen (11-06, play-dkb8 idea 8): Eglantine #717 (brandonbunnelle): dynarmic x64
+    // exclusives without the global monitor's lock, the load before the reservation is
+    // published, cross-core clears with lock cmpxchg (Dynarmic UserConfig::
+    // lockless_exclusive_monitor). Read when a core's JIT is made. Changes little under
+    // Auto CPU accuracy, which already skips the lock (Unsafe_IgnoreGlobalMonitor).
+    LockFreeMonitor = 1ull << 25,
     // fences (11-05): direct draws with no vertices or no instances skip the draw setup.
     ZeroDrawSkip = 1ull << 40,
     // vkoff (11-05): draws with none of the dynamic states' dirty flags set skip their updates.

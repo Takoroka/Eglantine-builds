@@ -409,10 +409,28 @@ void EmitExclusiveUnlock(BlockOfCode& code, const UserConfig& conf, Xbyak::Reg64
 /// lost to the read-then-cmpxchg window only ever surfaces as a failed guest-memory compare
 /// in the owner's next exclusive store: a spurious LL/SC failure, which the architecture
 /// permits and every retry loop handles.
+/// Without UserConfig::lockless_exclusive_monitor the caller holds the monitor lock and the
+/// clear is a plain store, as before.
 template<typename UserConfig>
 void EmitExclusiveTestAndClear(BlockOfCode& code, const UserConfig& conf, Xbyak::Reg64 vaddr,
                                Xbyak::Reg64 pointer, Xbyak::Reg64 dead, Xbyak::Reg64 expected) {
     if (conf.HasOptimization(OptimizationFlag::Unsafe_IgnoreGlobalMonitor)) {
+        return;
+    }
+    if (!conf.lockless_exclusive_monitor) {
+        code.mov(dead, u64(0xDEAD'DEAD'DEAD'DEAD));
+        const size_t processor_count = GetExclusiveMonitorProcessorCount(conf.global_monitor);
+        for (size_t processor_index = 0; processor_index < processor_count; processor_index++) {
+            if (processor_index == conf.processor_id) {
+                continue;
+            }
+            Xbyak::Label ok;
+            code.mov(pointer, std::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, processor_index)));
+            code.cmp(qword[pointer], vaddr);
+            code.jne(ok, code.T_NEAR);
+            code.mov(qword[pointer], dead);
+            code.L(ok);
+        }
         return;
     }
 

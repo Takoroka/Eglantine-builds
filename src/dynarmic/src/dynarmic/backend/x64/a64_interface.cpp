@@ -91,8 +91,8 @@ public:
         const HaltReason hr = block_of_code.RunCode(&jit_state, current_code_ptr);
         PerformRequestedCacheInvalidation(hr);
         is_executing = false;
-        if (native_lse_atomics && (++runs_since_lse_flush & 255) == 0) {
-            LseStats::Flush(jit_state.lse_native_ops, lse_native_flushed);
+        if ((native_lse_atomics || conf.lockless_exclusive_monitor) && (++runs_since_lse_flush & 255) == 0) {
+            LseStats::Flush({jit_state.lse_native_ops, jit_state.exclusive_stores, jit_state.exclusive_store_failures}, lse_flushed);
         }
         return hr;
     }
@@ -312,7 +312,7 @@ private:
     const bool native_lse_atomics = conf.native_lse_atomics && conf.fastmem_pointer.has_value() &&
                                     conf.fastmem_exclusive_access && !conf.check_halt_on_memory_access;
     u64 runs_since_lse_flush = 0;
-    u64 lse_native_flushed = 0;
+    LseStats::Totals lse_flushed{};
 };
 
 Jit::Jit(UserConfig conf)

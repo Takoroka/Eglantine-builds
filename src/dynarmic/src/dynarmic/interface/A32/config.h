@@ -219,6 +219,10 @@ struct UserConfig {
     /// recompilation of that block with fastmem disabled. Recompiled code will use memory
     /// callbacks.
     bool recompile_on_exclusive_fastmem_failure = true;
+    /// x64, fastmem exclusives: exclusive loads and stores without the global monitor's lock
+    /// (the load comes before the reservation is published; other cores' reservations are
+    /// cleared with lock cmpxchg). False: every exclusive takes the monitor lock.
+    bool lockless_exclusive_monitor = false;
 
     /// When set to true, UserCallbacks::InstructionSynchronizationBarrierRaised will be
     /// called when an ISB instruction is executed.

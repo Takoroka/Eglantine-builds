@@ -361,6 +361,16 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
 
     const auto wrapped_fn = read_fallbacks[std::make_tuple(ordered, bitsize, vaddr.getIdx(), value_idx)];
 
+    // Without UserConfig::lockless_exclusive_monitor (Eden: A/B bit 25 off): the monitor lock
+    // and the reservation published before the load, as before.
+    const bool lockless = conf.lockless_exclusive_monitor;
+    if (!lockless) {
+        EmitExclusiveLock(code, conf, tmp, tmp2.cvt32());
+        code.mov(code.byte[code.ABI_JIT_PTR + offsetof(AxxJitState, exclusive_state)], u8(1));
+        code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)));
+        code.mov(qword[tmp], vaddr);
+    }
+
     // Order, not a lock, closes the reservation window here. The guest load happens BEFORE
     // this core's reservation becomes visible to others; a store from another core that
     // lands around it is then either inside the snapshot (this core's own compare fails:
@@ -393,11 +403,17 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
         code.call(wrapped_fn);
     }
 
-    code.mov(code.byte[code.ABI_JIT_PTR + offsetof(AxxJitState, exclusive_state)], u8(1));
-    code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)));
-    EmitWriteMemoryMov<bitsize>(code, tmp, value_idx, false);
-    code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)));
-    code.mov(qword[tmp], vaddr);
+    if (lockless) {
+        code.mov(code.byte[code.ABI_JIT_PTR + offsetof(AxxJitState, exclusive_state)], u8(1));
+        code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)));
+        EmitWriteMemoryMov<bitsize>(code, tmp, value_idx, false);
+        code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)));
+        code.mov(qword[tmp], vaddr);
+    } else {
+        code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)));
+        EmitWriteMemoryMov<bitsize>(code, tmp, value_idx, false);
+        EmitExclusiveUnlock(code, conf, tmp, tmp2.cvt32());
+    }
 
     if constexpr (bitsize == 128) {
         ctx.reg_alloc.DefineValue(code, inst, Xbyak::Xmm{value_idx});
@@ -445,6 +461,11 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
     // heavily; that convoy was the CPU-side frame cost). Contended same-address stores still
     // arbitrate correctly: the guest-memory CMPXCHG below fails for the loser, which is the
     // spurious-failure outcome LL/SC retry loops are written for.
+    // Without UserConfig::lockless_exclusive_monitor: under the monitor lock, as before.
+    const bool lockless = conf.lockless_exclusive_monitor;
+    if (!lockless) {
+        EmitExclusiveLock(code, conf, tmp, tmp2.cvt32());
+    }
     SharedLabel end = ctx.GenSharedLabel();
 
     code.mov(status, u32(1));
@@ -530,6 +551,13 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
     }
 
     code.L(*end);
+    if (lockless) {
+        // status: 0 stored, 1 failed (no reservation, lost it, or memory changed).
+        code.inc(qword[code.ABI_JIT_PTR + offsetof(AxxJitState, exclusive_stores)]);
+        code.add(qword[code.ABI_JIT_PTR + offsetof(AxxJitState, exclusive_store_failures)], status.cvt64());
+    } else {
+        EmitExclusiveUnlock(code, conf, tmp, eax);
+    }
     ctx.reg_alloc.DefineValue(code, inst, status);
     EmitCheckMemoryAbort(ctx, inst);
 }

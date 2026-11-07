@@ -293,6 +293,8 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     // ARMv8.1 LSE atomics as one host atomic (A/B bit 15); Dynarmic uses it only with fastmem
     // exclusives and without memory-abort checks (the debugger).
     config.native_lse_atomics = Common::Nx2Ab::On(Common::Nx2Ab::LseAtomics);
+    // Exclusives without the global monitor's lock (A/B bit 25; Eglantine #717).
+    config.lockless_exclusive_monitor = Common::Nx2Ab::On(Common::Nx2Ab::LockFreeMonitor);
 
     // System registers
     config.tpidrro_el0 = &m_cb->m_tpidrro_el0;
