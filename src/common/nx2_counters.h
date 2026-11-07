@@ -8,6 +8,8 @@
 // next to the code they count; these only turn a window of counts into text.
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cstddef>
 #include <span>
 #include <string>
@@ -65,6 +67,69 @@ inline std::vector<size_t> TopIndices(std::span<const u64> values, size_t max_co
     indices.resize(count);
     return indices;
 }
+
+/// Counts of nanosecond durations in buckets about 19% wide (4 per power of two; exact below
+/// 4 ns), for percentiles of a window of values. Negative values count as 0.
+class LatencyHistogram {
+public:
+    static constexpr size_t NUM_BUCKETS = 4 * 40; ///< Up to 2^41 ns; larger values count there
+
+    void Add(s64 ns) noexcept {
+        ++counts[Bucket(ns > 0 ? static_cast<u64>(ns) : 0)];
+        ++total;
+    }
+
+    [[nodiscard]] u64 Count() const noexcept {
+        return total;
+    }
+
+    /// The duration that the fraction p (0 to 1) of the values are at most: the upper end of the
+    /// bucket the p-th value fell in (0 when empty).
+    [[nodiscard]] s64 Percentile(double p) const noexcept {
+        if (total == 0) {
+            return 0;
+        }
+        const double wanted = std::clamp(p, 0.0, 1.0) * static_cast<double>(total);
+        const u64 rank = std::max<u64>(static_cast<u64>(wanted + 0.999999), 1);
+        u64 seen = 0;
+        for (size_t bucket = 0; bucket < NUM_BUCKETS; ++bucket) {
+            seen += counts[bucket];
+            if (seen >= rank) {
+                return static_cast<s64>(UpperEnd(bucket));
+            }
+        }
+        return static_cast<s64>(UpperEnd(NUM_BUCKETS - 1));
+    }
+
+    void Clear() noexcept {
+        counts = {};
+        total = 0;
+    }
+
+    static constexpr size_t Bucket(u64 ns) noexcept {
+        if (ns < 4) {
+            return static_cast<size_t>(ns);
+        }
+        const u32 exponent = static_cast<u32>(std::bit_width(ns)) - 1;
+        const u64 mantissa = (ns >> (exponent - 2)) & 3;
+        return std::min<size_t>(4 * (exponent - 1) + static_cast<size_t>(mantissa),
+                                NUM_BUCKETS - 1);
+    }
+
+    /// The largest duration a bucket holds.
+    static constexpr u64 UpperEnd(size_t bucket) noexcept {
+        if (bucket < 4) {
+            return bucket;
+        }
+        const u32 exponent = static_cast<u32>(bucket / 4) + 1;
+        const u64 mantissa = bucket % 4;
+        return ((5 + mantissa) << (exponent - 2)) - 1;
+    }
+
+private:
+    std::array<u32, NUM_BUCKETS> counts{};
+    u64 total{};
+};
 
 /// Per-core rates joined by '/': "12.3k/950/0/7".
 inline std::string FormatPerCore(std::span<const u64> per_core, s64 window_ns) {

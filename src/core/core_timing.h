@@ -18,7 +18,9 @@
 #include <boost/heap/fibonacci_heap.hpp>
 
 #include "common/common_types.h"
+#include "common/nx2_counters.h"
 #include "common/thread.h"
+#include "common/timed_sleeper.h"
 #include "common/cpu_features.h"
 
 namespace Core::Timing {
@@ -165,6 +167,14 @@ public:
         u64 idle_waits{};
         u64 overshoots{};   ///< Timed waits that ran out
         s64 overshoot_ns{}; ///< How long after the event's time those returned
+        // The cheap wait (A/B bit TimingWaitCheap):
+        u64 sleeps{};             ///< Timed waits that slept first
+        s64 sleep_ns{};           ///< Time in those sleeps
+        u64 sleeps_woken{};       ///< Sleeps a new earliest event ended
+        u64 sleeps_past_event{};  ///< Sleeps that returned after the event's time (it ran late)
+        u64 sleep_failures{};     ///< The timer could not be armed: precise wait only
+        u64 short_waits{};        ///< Timed waits shorter than margin + MIN_SLEEP: precise only
+        Common::Nx2Counters::LatencyHistogram sleep_overshoot{}; ///< Timer lateness per sleep
     };
     void CountTimedWait(s64 wait_ns, bool woken, s64 waited_ns, s64 overshoot_ns);
     void CountLate(s64 late);
@@ -174,7 +184,20 @@ public:
     u64 late_count{};
     s64 late_ns{};
     s64 late_max_ns{};
+    Common::Nx2Counters::LatencyHistogram late_histogram{};
     std::atomic<u32> unschedule_calls{0}; ///< UnscheduleEvent calls (each walks the queue)
+
+    /// Waits for the next event at next_time (now: the time already read); true when a new
+    /// event (event.Set) ended the wait. With A/B bit TimingWaitCheap on, where the precise wait
+    /// keeps the thread on its CPU (MWAITX/UMWAIT), it first sleeps on a high-resolution timer
+    /// until sleep_margin before the event, then waits precisely for the rest.
+    bool WaitForNextEvent(s64 now, s64 next_time);
+    /// Ends a sleep of the timing thread after event.Set (only when it sleeps).
+    void WakeSleepingTimer();
+    Common::TimedSleeper sleeper;
+    Common::SleepMargin sleep_margin; ///< Timing thread only
+    std::atomic<bool> timer_sleeping{false};
+    bool cheap_wait_supported{}; ///< Set by the timing thread when it starts
 
     using heap_t = boost::heap::fibonacci_heap<CoreTiming::Event, boost::heap::compare<std::greater<>>>;
     heap_t event_queue;
