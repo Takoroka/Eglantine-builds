@@ -8,6 +8,7 @@
 #include <array>
 #include <bit>
 #include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <string>
 #include <typeinfo>
@@ -39,6 +40,7 @@
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/native_query_trace.h"
+#include "video_core/query_reads.h"
 #include "video_core/indirect_reset.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/kepler_compute.h"
@@ -287,11 +289,9 @@ RasterizerVulkan::~RasterizerVulkan() {
     VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr);
     VideoCommon::GpuSplit::Get().SetBackIdleHook(nullptr, nullptr);
     VideoCommon::GpuSplit::Get().SetSubmitHook(nullptr, nullptr);
+    // The channels are gone by now, and submitting invalidates the state tracker's flags.
+    state_tracker.ClearChannel();
     scheduler.WaitWorker();
-    // On stop the channels can be destroyed before the rasterizer, and the final Finish
-    // invalidates the command buffer state through the tracker's flags pointer: point it at the
-    // tracker's own flags first. Idea: SmileyTatsu ca7c66c3b4.
-    state_tracker.DetachChannel();
     scheduler.Finish();
     delete std::exchange(g_diag_pool, nullptr);
 }
@@ -2337,6 +2337,40 @@ void RasterizerVulkan::ReleaseFences(bool force) {
     fence_manager.WaitPendingFences(force);
 }
 
+void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
+    if (addr == 0 || size == 0 || !query_cache.SemiFlushRegion(addr, size)) {
+        return;
+    }
+    // Some reports still wait for host results, written by operations the next fence runs. Below
+    // High GPU accuracy a fence runs its own callback at once: wait for an operation queued
+    // behind theirs instead. On the split's back the fence's submission may be deferred, and
+    // nothing else submits it while this thread waits. The state outlives a wait that gives up.
+    struct Wait {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool written{};
+    };
+    const auto wait = std::make_shared<Wait>();
+    SyncOperation([wait] {
+        std::scoped_lock lock{wait->mutex};
+        wait->written = true;
+        wait->cv.notify_all();
+    });
+    SignalFence([] {});
+    scheduler.FlushDeferred();
+    const auto start = std::chrono::steady_clock::now();
+    bool written;
+    {
+        std::unique_lock lock{wait->mutex};
+        written = wait->cv.wait_for(lock, std::chrono::milliseconds{100},
+                                    [&wait] { return wait->written; });
+    }
+    VideoCommon::QueryReads::CountWait(
+        written, static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now() - start)
+                                      .count()));
+}
+
 void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
                                                 VideoCommon::CacheType which) {
     SCOPE_EXIT {
@@ -3742,12 +3776,16 @@ void RasterizerVulkan::BindChannel(Tegra::Control::ChannelState& channel) {
     query_cache.BindToChannel(channel_id);
     state_tracker.ChangeChannel(channel);
     state_tracker.InvalidateState();
+    bound_channel_id = channel_id;
 }
 
 void RasterizerVulkan::ReleaseChannel(s32 channel_id) {
     SCOPE_EXIT {
         NoteSetupChange();
     };
+    if (channel_id == bound_channel_id) {
+        state_tracker.ClearChannel();
+    }
     EraseChannel(channel_id);
     {
         std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};

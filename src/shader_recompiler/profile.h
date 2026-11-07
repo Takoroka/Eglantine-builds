@@ -108,6 +108,9 @@ struct Profile {
     /// OpGroupNonUniformShuffle with a lane that varies per invocation returns wrong values in the
     /// vertex to fragment stages (AMD's own compiler: the Windows driver and AMDVLK)
     bool has_broken_graphics_subgroup_shuffle{};
+    /// Task programs zero the mesh workgroup count in their payload first: a task that culls all
+    /// its threads leaves it undefined, and Intel's drivers launch what is there
+    bool needs_task_payload_init{};
     u32 max_subgroup_size{};
 
     u32 gl_max_compute_smem_size{};

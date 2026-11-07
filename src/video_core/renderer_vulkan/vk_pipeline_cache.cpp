@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
@@ -12,6 +13,7 @@
 #include <iostream>
 #include <memory>
 #include <span>
+#include <string_view>
 #include <thread>
 #include <unordered_set>
 #include <utility>
@@ -405,6 +407,23 @@ bool GraphicsPipelineCacheKey::operator==(const GraphicsPipelineCacheKey& rhs) c
 }
 
 namespace {
+// Matches Mesa's boolean parsing of its environment options.
+bool EnvFlagSet(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) {
+        return false;
+    }
+    const std::string_view v{value};
+    for (const std::string_view truthy : {"1", "true", "t", "yes", "y"}) {
+        if (std::ranges::equal(v, truthy, [](char a, char b) {
+                return std::tolower(static_cast<unsigned char>(a)) == b;
+            })) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // NVIDIA's and AMD's drivers keep a disk cache of built pipelines of their own. Eden's copy on top
 // only kept every pipeline the title ever built in host memory (title 1: a 245 MB file, ~0.35 GB
 // of RAM for the session) and copied it whole at each save, which stalled frames; pipelines built
@@ -414,6 +433,9 @@ bool DriverCachesPipelines(const Device& device) {
     case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
     case VK_DRIVER_ID_AMD_PROPRIETARY:
         return true;
+    case VK_DRIVER_ID_MESA_RADV:
+        // RADV uses Mesa's on-disk shader cache unless the user turns it off.
+        return !EnvFlagSet("MESA_SHADER_CACHE_DISABLE") && !EnvFlagSet("MESA_GLSL_CACHE_DISABLE");
     default:
         return false;
     }
@@ -460,6 +482,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         Common::Nx2Ab::On(Common::Nx2Ab::DeferredMatrixPipelines)) {
         matrix_workers.reset(new Common::ThreadWorker(1, "VkMatrixPipelines", {},
                                                       Common::ThreadPlacement::Background));
+    }
+    if (Settings::values.use_vulkan_driver_pipeline_cache.GetValue() && !use_vulkan_pipeline_cache) {
+        LOG_INFO(Render_Vulkan, "Driver keeps its own pipeline cache, not saving a Vulkan one");
     }
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
@@ -576,6 +601,8 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
             (driver_id == VK_DRIVER_ID_AMD_PROPRIETARY ||
              driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE) &&
             Common::EnvGate("EGLANTINE_AMD_FRAGMENT_SHUFFLE"),
+        .needs_task_payload_init = driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS ||
+                                   driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA,
         .max_subgroup_size = device.GetMaxSubgroupSize(),
         .has_broken_robust =
             device.IsNvidia() && device.GetNvidiaArch() <= NvidiaArchitecture::Arch_Pascal,
@@ -757,6 +784,11 @@ PipelineCache::~PipelineCache() {
     serialization_thread.WaitForRequests();
     SaveUsedPipelines();
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
+        if (!device.CanReadPipelineCacheDuringBuilds()) {
+            // Drop queued builds, as destroying the workers would; running ones must end first.
+            workers.ClearRequests();
+            workers.WaitForRequests();
+        }
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                      CACHE_VERSION);
     }
@@ -1100,7 +1132,8 @@ void PipelineCache::StopTranslation() {
 }
 
 void PipelineCache::QueueVulkanPipelineCacheFlush() {
-    if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty()) {
+    if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty() ||
+        !device.CanReadPipelineCacheDuringBuilds()) {
         return;
     }
     if (++pipelines_since_flush < VULKAN_CACHE_FLUSH_PIPELINES) {

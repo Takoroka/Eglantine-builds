@@ -184,6 +184,7 @@ void GpuSplit::Stop() {
     read_ahead = false;
     ClearPendingWrites();
     last_unplaced_write = 0;
+    report_pages.clear();
     published.store(0, std::memory_order_relaxed);
     consumed.store(0, std::memory_order_relaxed);
     back_waiting.store(false, std::memory_order_relaxed);
@@ -392,6 +393,26 @@ void GpuSplit::NoteRelease(const Tegra::MemoryManager& memory, GPUVAddr address,
     const u64 value = payload;
     NoteWrite(memory, address, sizeof(value), &value);
     NoteWrite(memory, address + sizeof(value), sizeof(u64), nullptr);
+}
+
+void GpuSplit::NoteCounterReport(const Tegra::MemoryManager& memory, GPUVAddr address) {
+    if (const auto device = memory.GpuToCpuAddress(address)) {
+        report_pages.insert(*device >> 12);
+    }
+}
+
+bool GpuSplit::TouchesReportPages(const Tegra::MemoryManager& memory, GPUVAddr address,
+                                  size_t size) const {
+    if (report_pages.empty() || size == 0) {
+        return false;
+    }
+    for (GPUVAddr page = address & ~GPUVAddr{0xfff}; page < address + size; page += 0x1000) {
+        if (const auto device = memory.GpuToCpuAddress(page);
+            device && report_pages.contains(*device >> 12)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void GpuSplit::ClearPendingWrites() {

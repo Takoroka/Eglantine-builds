@@ -31,6 +31,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_sem_model.h"
+#include "video_core/query_reads.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/texture.h"
 #ifdef ARCHITECTURE_x86_64
@@ -1152,6 +1153,9 @@ void FrontNoteReport(VideoCommon::GpuSplit& split, const MemoryManager& memory, 
     const bool one_word = ((query >> 28) & 1) != 0;
     if (((query >> 23) & 0x1f) != 0) {
         split.NoteWrite(memory, address, one_word ? 4 : 16, nullptr);
+        if (Common::Nx2Ab::On(Common::Nx2Ab::MacroReadQueryWait)) {
+            split.NoteCounterReport(memory, address);
+        }
         return;
     }
     split.NoteRelease(memory, address, regs[base + 2], one_word);
@@ -1757,7 +1761,16 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     // from a culling dispatch, constant buffer and inline uploads, semaphore releases). The
     // front's record of the writes it queued gives them without waiting for all of it.
     fs.read_ahead.resize(words);
-    const bool ahead = split.ReadsAhead() &&
+    // Counter reports land only once a later fence pops, which that record can't tell: reads of
+    // their pages drain and wait for them (QueryReads). Without it the front doesn't note them.
+    const bool query_wait = Common::Nx2Ab::On(Common::Nx2Ab::MacroReadQueryWait);
+    const bool report_pages =
+        query_wait && (!split.ReadsAhead() ||
+                       split.TouchesReportPages(memory_manager, source, read_bytes));
+    if (report_pages && split.ReadsAhead()) {
+        VideoCommon::QueryReads::CountAheadFallback();
+    }
+    const bool ahead = split.ReadsAhead() && !report_pages &&
                        split.ReadAhead(memory_manager, source, fs.read_ahead.data(), words);
     if (ahead && !ReadAheadCheck()) {
         take(fs.read_ahead);
@@ -1777,6 +1790,12 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         // The download records into the Vulkan scheduler, which the split's back owns.
         split.Run([memory = &memory_manager, source, read_bytes] {
             memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+        });
+    }
+    if (report_pages) {
+        // The query cache is the back's too.
+        split.Run([this, source, read_bytes] {
+            VideoCommon::QueryReads::Flush(memory_manager, *rasterizer, source, read_bytes);
         });
     }
     fs.read_back.resize(words);

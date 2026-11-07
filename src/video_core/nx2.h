@@ -9,12 +9,14 @@
 #include <chrono>
 #include <cstdlib>
 #include <functional>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <utility>
 #include <vector>
 
 #include "common/common_types.h"
+#include "common/logging.h"
 #include "common/nx2_ab.h"
 #include "video_core/nx2_pending_wake.h"
 
@@ -567,7 +569,13 @@ public:
     }
 
     /// A GPU write of `value` to the u32 at `device_address`.
-    void OnWrite(u64 device_address, u32 value) {
+    void OnWrite(u64 device_address, u32 value, const char* source = nullptr) {
+        if (const u64 block = watch_block.load(std::memory_order_relaxed);
+            block != 0 && device_address >= block - 0x60 && device_address <= block + 0x60 &&
+            TakeWatchLine()) {
+            LOG_INFO(HW_GPU, "Semaphore write {:#x} = {:#x} [source {}]", device_address, value,
+                     source ? source : "?");
+        }
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
@@ -582,6 +590,44 @@ public:
         // A channel waits on a semaphore: the GPU thread may be waiting for a wake (A/B bit
         // PendingWake).
         VideoCommon::PendingWake::Get().Notify(VideoCommon::PendingWake::SemaphoreWrite);
+    }
+
+    /// Deadlock hunt: log every write near `block` (the flip-counter semaphores sit at a
+    /// stable device address across boots). Armed by EDEN_NX2_SEM_TRACE=<hex> at boot or by
+    /// the puller's stuck-acquire warning. `lines`: how many writes it logs. The warning's
+    /// watch stops after AutoWatchLines, since a game that only stalled once (a load) keeps
+    /// writing the block every frame for the rest of the session.
+    void ArmWatch(u64 block, s64 lines = AutoWatchLines) {
+        if (block != 0 && watch_block.load(std::memory_order_relaxed) == 0) {
+            watch_lines_left.store(lines, std::memory_order_relaxed);
+            watch_block.store(block, std::memory_order_relaxed);
+            LOG_INFO(HW_GPU, "Semaphore write watch armed at {:#x}", block);
+        }
+    }
+
+    /// EDEN_NX2_SEM_TRACE=<hex device address>: arm the write watch from boot, with no limit.
+    void MaybeArmWatchFromEnv() {
+        static const u64 from_env = [] {
+            const char* const value = std::getenv("EDEN_NX2_SEM_TRACE");
+            return value ? std::strtoull(value, nullptr, 16) : u64{0};
+        }();
+        if (from_env != 0) {
+            ArmWatch(from_env, std::numeric_limits<s64>::max());
+        }
+    }
+
+    /// Whether a watched write may still log (see ArmWatch).
+    bool TakeWatchLine() {
+        const s64 left = watch_lines_left.fetch_sub(1, std::memory_order_relaxed);
+        if (left == 1) {
+            LOG_INFO(HW_GPU, "Semaphore write watch: {} writes logged, no more lines",
+                     AutoWatchLines);
+        }
+        return left > 0;
+    }
+
+    [[nodiscard]] u64 WatchBlock() const {
+        return watch_block.load(std::memory_order_relaxed);
     }
 
 private:
@@ -609,6 +655,9 @@ private:
     std::mutex mutex;
     std::vector<Waiter> waiters;
     std::atomic<size_t> count{};
+    std::atomic<u64> watch_block{};
+    std::atomic<s64> watch_lines_left{};
+    static constexpr s64 AutoWatchLines = 4096;
 };
 
 } // namespace Tegra

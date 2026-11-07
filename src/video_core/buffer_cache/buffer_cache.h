@@ -1021,6 +1021,17 @@ void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_wr
     parts.ForEach([&](DAddr start, DAddr end) {
         device_memory.WriteBlockUnsafe(start, data + (start - device_addr), end - start);
     });
+    // Deadlock hunt: a download touching the watched semaphore block logs the block's new
+    // content (downloads are one of the three writers of the flip counters). After the write:
+    // returning before it dropped the download.
+    if (const u64 watch = Tegra::Nx2SemaphoreWaiters::Get().WatchBlock();
+        watch != 0 && device_addr < watch + 0x60 && watch < device_addr + size &&
+        Tegra::Nx2SemaphoreWaiters::Get().TakeWatchLine()) {
+        u32 words[4]{};
+        device_memory.ReadBlock(watch, words, sizeof(words));
+        LOG_INFO(HW_GPU, "Semaphore write {:#x} = {:#x} [source download] (+{:#x} {:#x} {:#x})",
+                 watch, words[0], words[1], words[2], words[3]);
+    }
 }
 
 template <class P>

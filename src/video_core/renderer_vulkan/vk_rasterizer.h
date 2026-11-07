@@ -128,6 +128,7 @@ public:
     void SignalSyncPoint(u32 value) override;
     void SignalReference() override;
     void ReleaseFences(bool force = true) override;
+    void FlushQueryResults(DAddr addr, u64 size) override;
     void FlushAndInvalidateRegion(
         DAddr addr, u64 size, VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     void WaitForIdle() override;
@@ -282,6 +283,7 @@ private:
     const Device& device;
     MemoryAllocator& memory_allocator;
     StateTracker& state_tracker;
+    s32 bound_channel_id = -1;
     Scheduler& scheduler;
 
     StagingBufferPool staging_pool;
