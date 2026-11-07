@@ -437,6 +437,16 @@ bool WantsOwnPresentQueue() {
 #endif
 }
 
+/// Download copies may get a graphics-family queue of their own (A/B bit ReadbackQueue; off for
+/// the whole run, no queue either). Not on Android, as for presents.
+bool WantsReadbackQueue() {
+#ifdef __ANDROID__
+    return false;
+#else
+    return Common::Nx2Ab::On(Common::Nx2Ab::ReadbackQueue);
+#endif
+}
+
 } // Anonymous namespace
 
 void Device::RemoveExtension(bool& extension, const std::string& extension_name) {
@@ -846,6 +856,15 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
                  streamline_attached    ? "NVIDIA Streamline hooks the present"
                  : !WantsOwnPresentQueue() ? "A/B bit PresentOwnQueue is off (or Android)"
                                            : "the graphics family has a single queue");
+    }
+    if (readback_choice.available) {
+        readback_queue = logical.GetQueue(graphics_family, readback_choice.readback_index);
+        LOG_INFO(Render_Vulkan, "Download copies on queue {} of the graphics family {} (A/B bit "
+                 "ReadbackQueue)", readback_choice.readback_index, graphics_family);
+    } else {
+        LOG_INFO(Render_Vulkan, "Download copies on the graphics queue: {}",
+                 !WantsReadbackQueue() ? "A/B bit ReadbackQueue is off (or Android)"
+                                       : "the graphics family has no queue left for them");
     }
 
     VmaVulkanFunctions functions{};
@@ -1818,6 +1837,10 @@ void Device::SetupFamilies(VkSurfaceKHR surface) {
     present_choice = ChoosePresentQueue(graphics_family, present_family,
                                         queue_family_properties[graphics_family].queueCount,
                                         WantsOwnPresentQueue());
+    // Download copies (BufferCacheRuntime::ReadbackCopies, WantsReadbackQueue).
+    readback_choice = ChooseReadbackQueue(present_choice,
+                                          queue_family_properties[graphics_family].queueCount,
+                                          WantsReadbackQueue());
 }
 
 bool Device::TryReserveCustomBorderColorSamplers(size_t count) const {
@@ -1988,21 +2011,22 @@ void Device::CollectToolingInfo() {
 }
 
 std::vector<VkDeviceQueueCreateInfo> Device::GetDeviceQueueCreateInfos() const {
-    static constexpr std::array<float, 2> QUEUE_PRIORITIES{1.0f, 1.0f};
+    static constexpr std::array<float, 3> QUEUE_PRIORITIES{1.0f, 1.0f, 1.0f};
 
     ::Common::unordered_set<u32> unique_queue_families{graphics_family, present_family};
     std::vector<VkDeviceQueueCreateInfo> queue_cis;
     queue_cis.reserve(unique_queue_families.size());
 
     for (const u32 queue_family : unique_queue_families) {
-        // The graphics family may get a second queue for presents (present_choice).
+        // The graphics family may get a second queue for presents (present_choice) and one more
+        // for download copies (readback_choice, which counts the presents' too).
         auto& ci = queue_cis.emplace_back(VkDeviceQueueCreateInfo{
             .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
             .pNext = nullptr,
             .flags = 0,
             .queueFamilyIndex = queue_family,
             .queueCount =
-                queue_family == graphics_family ? present_choice.graphics_queue_count : 1,
+                queue_family == graphics_family ? readback_choice.graphics_queue_count : 1,
             .pQueuePriorities = nullptr,
         });
         ci.pQueuePriorities = QUEUE_PRIORITIES.data();

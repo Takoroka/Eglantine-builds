@@ -11,6 +11,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <span>
+#include <string>
+#include <utility>
 #include <vector>
 
 #ifdef _MSC_VER
@@ -39,6 +41,16 @@ VkBufferCopy MakeBufferCopy(const VideoCommon::BufferCopy& copy) {
         .dstOffset = copy.dst_offset,
         .size = copy.size,
     };
+}
+
+// EDEN_NX2_READBACK_VERIFY=1: BufferCacheRuntime::VerifyReadback.
+const bool readback_verify = [] {
+    const char* const value = std::getenv("EDEN_NX2_READBACK_VERIFY");
+    return value != nullptr && value[0] == '1';
+}();
+
+void Nx2CountReadback(std::atomic<u64>& counter, u64 amount = 1) {
+    counter.fetch_add(amount, std::memory_order_relaxed);
 }
 
 VkIndexType IndexTypeFromNumElements(const Device& device, u32 num_elements) {
@@ -367,6 +379,7 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
       quad_index_pass(device, scheduler, descriptor_pool, staging_pool,
                       compute_pass_descriptor_queue),
       multi_range_buffers(device_) {
+    readback_queue = ReadbackQueue::Create(device, scheduler.GetMasterSemaphore());
     const VkDriverIdKHR driver_id = device.GetDriverID();
     const bool enable_vertex_repack = VertexRepackEnabled();
     LOG_INFO(Render_Vulkan, "69-byte vertex layout repacking {} ({})",
@@ -655,6 +668,152 @@ void BufferCacheRuntime::HostReadBarrier() {
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
                                HOST_READ_BARRIER);
     });
+}
+
+bool BufferCacheRuntime::ReadbackCopies(
+    const StagingBufferRef& staging,
+    std::span<const std::pair<Buffer*, VideoCommon::BufferCopy>> copies) {
+    if (!Common::Nx2Ab::On(Common::Nx2Ab::ReadbackQueue)) {
+        return false;
+    }
+    if (!readback_queue) {
+        Nx2CountReadback(readback_stats.no_queue);
+        return false;
+    }
+    // The last submission that used a source: its writes are what the copies must see. A source
+    // used in the command buffer still recording can't be waited for apart from the rest of it.
+    u64 wait_tick = 0;
+    for (const auto& [buffer, copy] : copies) {
+        wait_tick = (std::max)({wait_tick, buffer->LastUsageTick(), buffer->GpuWriteTick(),
+                                buffer->getWriteTick()});
+    }
+    if (!scheduler.IsSubmitted(wait_tick)) {
+        Nx2CountReadback(readback_stats.recording);
+        return false;
+    }
+    boost::container::small_vector<ReadbackQueue::Region, 16> regions;
+    u64 bytes = 0;
+    for (const auto& [buffer, copy] : copies) {
+        regions.push_back({buffer->Handle(), MakeBufferCopy(copy)});
+        bytes += copy.size;
+    }
+    const u64 waited = readback_queue->CopyAndWait(staging.buffer, regions, wait_tick);
+    Nx2CountReadback(readback_stats.copies);
+    Nx2CountReadback(readback_stats.copy_ns, waited);
+    Nx2CountReadback(readback_stats.bytes, bytes);
+    if (readback_verify) [[unlikely]] {
+        VerifyReadback(staging, copies);
+    }
+    MaybeLogReadbacks();
+    return true;
+}
+
+void BufferCacheRuntime::FinishReadback() {
+    const auto start = std::chrono::steady_clock::now();
+    scheduler.Finish();
+    Nx2CountReadback(readback_stats.finishes);
+    Nx2CountReadback(readback_stats.finish_ns,
+                     static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - start)
+                                          .count()));
+    MaybeLogReadbacks();
+}
+
+void BufferCacheRuntime::VerifyReadback(
+    const StagingBufferRef& staging,
+    std::span<const std::pair<Buffer*, VideoCommon::BufferCopy>> copies) {
+    u64 end = 0;
+    for (const auto& [buffer, copy] : copies) {
+        end = (std::max)(end, copy.dst_offset + copy.size - staging.offset);
+    }
+    const StagingBufferRef check = staging_pool.Request(end, MemoryUsage::Download);
+    for (const auto& [buffer, copy] : copies) {
+        VideoCommon::BufferCopy moved = copy;
+        moved.dst_offset = copy.dst_offset - staging.offset + check.offset;
+        buffer->MarkUsage(copy.src_offset, copy.size);
+        CopyBuffer(check.buffer, *buffer, std::span{&moved, 1}, true);
+    }
+    HostReadBarrier();
+    scheduler.Finish();
+    Nx2CountReadback(readback_stats.verified);
+    bool mismatched = false;
+    for (const auto& [buffer, copy] : copies) {
+        const u64 offset = copy.dst_offset - staging.offset;
+        u8* const fast = staging.mapped_span.data() + offset;
+        const u8* const slow = check.mapped_span.data() + offset;
+        if (std::memcmp(fast, slow, copy.size) == 0) {
+            continue;
+        }
+        if (!mismatched) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                LOG_WARNING(Render_Vulkan,
+                            "Readback queue verify: buffer {:#x} [{:#x}, +{:#x}) differs from the "
+                            "Finish() copy (last use tick {}, GPU write tick {})",
+                            buffer->CpuAddr(), copy.src_offset, copy.size,
+                            buffer->LastUsageTick(), buffer->GpuWriteTick());
+            }
+        }
+        mismatched = true;
+        std::memcpy(fast, slow, copy.size);
+    }
+    if (mismatched) {
+        Nx2CountReadback(readback_stats.mismatched);
+    }
+}
+
+void BufferCacheRuntime::MaybeLogReadbacks() {
+    using namespace std::chrono;
+    const s64 now = duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+    s64 next = readback_stats.next_log.load(std::memory_order_relaxed);
+    if (now < next || !readback_stats.next_log.compare_exchange_strong(
+                          next, now + duration_cast<nanoseconds>(30s).count(),
+                          std::memory_order_relaxed)) {
+        return;
+    }
+    const auto load = [](const std::atomic<u64>& counter) {
+        return counter.load(std::memory_order_relaxed);
+    };
+    const ReadbackTotals totals{
+        .copies = load(readback_stats.copies),
+        .copy_ns = load(readback_stats.copy_ns),
+        .bytes = load(readback_stats.bytes),
+        .finishes = load(readback_stats.finishes),
+        .finish_ns = load(readback_stats.finish_ns),
+        .recording = load(readback_stats.recording),
+        .no_queue = load(readback_stats.no_queue),
+        .verified = load(readback_stats.verified),
+        .mismatched = load(readback_stats.mismatched),
+    };
+    const ReadbackTotals last = std::exchange(readback_last, totals);
+    const s64 start = std::exchange(readback_last_log, now);
+    if (start == 0) {
+        return; // The first window starts here.
+    }
+    const double seconds = static_cast<double>(now - start) / 1e9;
+    const auto rate = [seconds](u64 value, u64 before) {
+        return static_cast<double>(value - before) / seconds;
+    };
+    const auto mean_us = [](u64 ns, u64 ns_before, u64 count, u64 count_before) {
+        const u64 n = count - count_before;
+        return n == 0 ? 0.0 : static_cast<double>(ns - ns_before) / 1e3 / static_cast<double>(n);
+    };
+    std::string verify;
+    if (readback_verify) {
+        verify = fmt::format("; verify: {} compared, {} differed", totals.verified - last.verified,
+                             totals.mismatched - last.mismatched);
+    }
+    LOG_INFO(Render_Vulkan,
+             "Readback queue (bit 11 {}) {:.0f} s: {:.0f}/s copied on the readback queue (mean "
+             "{:.0f} us wait, {:.0f} KiB/s), {:.0f}/s through Finish() (mean {:.0f} us; {:.0f}/s "
+             "with a source in the recording command buffer, {:.0f}/s without a readback "
+             "queue){}",
+             Common::Nx2Ab::On(Common::Nx2Ab::ReadbackQueue) ? "on" : "off", seconds,
+             rate(totals.copies, last.copies),
+             mean_us(totals.copy_ns, last.copy_ns, totals.copies, last.copies),
+             rate(totals.bytes, last.bytes) / 1024.0, rate(totals.finishes, last.finishes),
+             mean_us(totals.finish_ns, last.finish_ns, totals.finishes, last.finishes),
+             rate(totals.recording, last.recording), rate(totals.no_queue, last.no_queue), verify);
 }
 
 void BufferCacheRuntime::ClearBuffer(VkBuffer dest_buffer, u32 offset, size_t size, u32 value) {

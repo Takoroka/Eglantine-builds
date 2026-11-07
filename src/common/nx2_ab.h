@@ -116,6 +116,10 @@ enum Feature : u64 {
     // still holds, also under the GPU split (VideoCommon::FlushQueryResults). Idea:
     // zortos293/lichii 7ae3e7401.
     MacroReadQueryWait = 1ull << 9,
+    // backperf (11-06, play-dkb7 idea 32): buffer downloads copy on a graphics-family queue of
+    // their own (Vulkan::ReadbackQueue) after the GPU tick of the source's last use, and wait for
+    // that copy alone instead of Finish() (the whole graphics queue).
+    ReadbackQueue = 1ull << 11,
 };
 
 inline const u64 g_mask = [] {

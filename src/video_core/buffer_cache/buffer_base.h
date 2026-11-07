@@ -138,6 +138,16 @@ public:
         write_tick = write_tick_;
     }
 
+    /// The tick of the last command buffer with a GPU write to it (MarkWrittenBuffer, every write
+    /// unlike write_tick): what a download copy on another queue waits for (A/B bit 11).
+    u64 GpuWriteTick() const noexcept {
+        return gpu_write_tick;
+    }
+
+    void NoteGpuWrite(u64 tick) noexcept {
+        gpu_write_tick = tick;
+    }
+
 private:
     VAddr cpu_addr = 0;
     BufferFlagBits flags{};
@@ -145,6 +155,7 @@ private:
     size_t lru_id = SIZE_MAX;
     size_t size_bytes = 0;
     u64 write_tick = 0;
+    u64 gpu_write_tick = 0;
     u64 lru_touch_tick = ~u64{0};
 };
 
