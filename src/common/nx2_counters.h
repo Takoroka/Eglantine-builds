@@ -39,7 +39,7 @@ constexpr double Percent(s64 part_ns, s64 window_ns) {
 /// A rate in a few characters: 0, 7, 950, 12.3k, 123k, 1.20M.
 inline std::string FormatRate(double per_second) {
     if (per_second < 999.5) {
-        return fmt::format("{:.0f}", std::max(per_second, 0.0));
+        return fmt::format("{:.0f}", (std::max)(per_second, 0.0));
     }
     if (per_second < 99'950.0) {
         return fmt::format("{:.1f}k", per_second / 1e3);
@@ -59,7 +59,7 @@ inline std::vector<size_t> TopIndices(std::span<const u64> values, size_t max_co
             indices.push_back(i);
         }
     }
-    const size_t count = std::min(max_count, indices.size());
+    const size_t count = (std::min)(max_count, indices.size());
     std::partial_sort(indices.begin(), indices.begin() + static_cast<std::ptrdiff_t>(count),
                       indices.end(), [values](size_t a, size_t b) {
                           return values[a] != values[b] ? values[a] > values[b] : a < b;

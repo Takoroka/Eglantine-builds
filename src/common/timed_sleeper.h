@@ -67,12 +67,12 @@ public:
         if (samples < WARMUP) {
             return INITIAL_NS;
         }
-        return std::clamp(std::max(previous_max, current_max) + GUARD_NS, GUARD_NS, MAX_NS);
+        return std::clamp((std::max)(previous_max, current_max) + GUARD_NS, GUARD_NS, MAX_NS);
     }
 
     /// One sleep that timed out: how long after its requested end it returned.
     void AddOvershoot(s64 overshoot_ns) noexcept {
-        current_max = std::max(current_max, std::max<s64>(overshoot_ns, 0));
+        current_max = (std::max)(current_max, std::max<s64>(overshoot_ns, 0));
         ++samples;
         if (++in_window == WINDOW) {
             previous_max = current_max;
