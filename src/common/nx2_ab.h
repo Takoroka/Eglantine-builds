@@ -76,6 +76,9 @@ enum Feature : u64 {
     PresentOwnQueue = 1ull << 61,    ///< Presents on a queue of their own, not under the scheduler's
                                      ///< submit lock (Swapchain::Present)
     AcquireNoDrain = 1ull << 62,     ///< Semaphore acquires read ahead of the back, no drain (puller)
+    // switchbrew (11-06): the query cache's IsRegionGpuModified stops at the first dirty query
+    // (QueryCacheBase::IterateCache). Idea: Orchid d38d025192.
+    QueryIterateEarlyStop = 1ull << 63,
 };
 
 inline const u64 g_mask = [] {

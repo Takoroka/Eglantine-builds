@@ -287,6 +287,10 @@ RasterizerVulkan::~RasterizerVulkan() {
     VideoCommon::GpuSplit::Get().SetBackIdleHook(nullptr, nullptr);
     VideoCommon::GpuSplit::Get().SetSubmitHook(nullptr, nullptr);
     scheduler.WaitWorker();
+    // On stop the channels can be destroyed before the rasterizer, and the final Finish
+    // invalidates the command buffer state through the tracker's flags pointer: point it at the
+    // tracker's own flags first. Idea: SmileyTatsu ca7c66c3b4.
+    state_tracker.DetachChannel();
     scheduler.Finish();
     delete std::exchange(g_diag_pool, nullptr);
 }
