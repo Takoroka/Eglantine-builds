@@ -38,6 +38,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/surface.h"
+#include "video_core/texture_cache/astc_path_stats.h"
 #include "video_core/texture_cache/formatter.h"
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/util.h"
@@ -313,6 +314,18 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
                                                                   : VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
     }
     return HugeAstcHostFormat(device, info);
+}
+
+// Texels of all levels and layers of an image (AstcPathStats).
+[[nodiscard]] u64 AstcImageTexels(const ImageInfo& info) {
+    u64 texels = 0;
+    for (s32 level = 0; level < info.resources.levels; ++level) {
+        texels += VideoCommon::AstcCopyTexels((std::max)(info.size.width >> level, 1U),
+                                              (std::max)(info.size.height >> level, 1U),
+                                              (std::max)(info.size.depth >> level, 1U),
+                                              static_cast<u32>(info.resources.layers));
+    }
+    return texels;
 }
 
 // ASTC that the GPU decodes and re-compresses to BC1/BC3 itself (TranscodeAstcToBcn): no CPU
@@ -4762,7 +4775,9 @@ void TextureCacheRuntime::AccelerateImageUpload(
     u32 z_start, u32 z_count) {
 
     if (IsPixelFormatASTC(image.info.format)) {
-        if (bc_encoder_pass && WillUseGpuBcnTranscode(device, image.info)) {
+        const bool transcode = bc_encoder_pass && WillUseGpuBcnTranscode(device, image.info);
+        VideoCommon::GetAstcPathStats().CountGpu(transcode, AstcImageTexels(image.info));
+        if (transcode) {
             return TranscodeAstcToBcn(image, map, swizzles);
         }
         return astc_decoder_pass->Assemble(image, map, swizzles);
@@ -4786,6 +4801,10 @@ void TextureCacheRuntime::AccelerateImageUpload(
 void TextureCacheRuntime::AccelerateImageUploadLayers(
     Image& image, const StagingBufferRef& map,
     std::span<const VideoCommon::SwizzleParameters> swizzles, std::span<const u32> layers) {
+    VideoCommon::GetAstcPathStats().CountGpu(
+        false, AstcImageTexels(image.info) /
+                   static_cast<u64>((std::max)(image.info.resources.layers, 1)) *
+                   layers.size());
     astc_decoder_pass->AssembleLayers(image, map, swizzles, layers);
 }
 

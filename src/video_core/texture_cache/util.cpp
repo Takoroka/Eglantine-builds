@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <numeric>
 #include <optional>
@@ -29,6 +30,7 @@
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
 #include "video_core/surface.h"
+#include "video_core/texture_cache/astc_path_stats.h"
 #include "video_core/texture_cache/decode_bc.h"
 #include "video_core/texture_cache/format_lookup_table.h"
 #include "video_core/texture_cache/formatter.h"
@@ -1302,6 +1304,11 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
                   std::span<BufferImageCopy> copies) {
     u32 output_offset = 0;
     Common::ScratchBuffer<u8> decode_scratch;
+    // ASTC decoded here missed the GPU paths: counted with the reason (AstcPathStats).
+    const bool astc_upload = IsPixelFormatASTC(info.format);
+    const auto astc_start =
+        astc_upload ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    u64 astc_texels = 0;
 
     const Extent2D tile_size = DefaultBlockSize(info.format);
     for (BufferImageCopy& copy : copies) {
@@ -1315,6 +1322,11 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
 
         const auto input_offset = input.subspan(copy.buffer_offset);
         copy.buffer_offset = output_offset;
+        if (astc_upload) {
+            astc_texels += AstcCopyTexels(copy.image_extent.width, copy.image_extent.height,
+                                          copy.image_extent.depth,
+                                          static_cast<u32>(copy.image_subresource.num_layers));
+        }
 
         const auto recompression_setting = Settings::GetAstcRecompression();
         const bool astc = IsPixelFormatASTC(info.format);
@@ -1368,6 +1380,15 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
 
         copy.buffer_row_length = mip_size.width;
         copy.buffer_image_height = mip_size.height;
+    }
+    if (astc_upload) {
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - astc_start);
+        GetAstcPathStats().CountCpu(
+            ClassifyCpuAstc(info.type, info.size.depth,
+                            Settings::values.accelerate_astc.GetValue() ==
+                                Settings::AstcDecodeMode::Gpu),
+            astc_texels, static_cast<u64>(ns.count()));
     }
 }
 

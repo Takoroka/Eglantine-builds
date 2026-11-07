@@ -29,6 +29,7 @@
 #include "video_core/guest_memory.h"
 #include "video_core/guest_read_areas.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/texture_cache/astc_path_stats.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/texture_cache_base.h"
@@ -567,6 +568,10 @@ void TextureCache<P>::TickFrame() {
         }
     }
     TickResidency();
+    // Every 30 s while there are ASTC uploads: which path they took (AstcPathStats).
+    if (const auto report = GetAstcPathStats().TakeReport(std::chrono::steady_clock::now())) {
+        LOG_INFO(HW_GPU, "{}", *report);
+    }
     // Every 600 frames: device memory in use against the collector's thresholds.
     // Skip expensive heap allocation, map construction, and sorting unless debug logging is explicitly enabled.
     static const bool log_tc = std::getenv("EDEN_NX2_TC_LOG") != nullptr;
