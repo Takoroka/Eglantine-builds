@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -19,6 +20,7 @@
 #include "dynarmic/backend/x64/a64_emit_x64.h"
 #include "dynarmic/backend/x64/a64_jitstate.h"
 #include "dynarmic/backend/x64/block_of_code.h"
+#include "dynarmic/backend/x64/code_cache_flush_log.h"
 #include "dynarmic/backend/x64/devirtualize.h"
 #include "dynarmic/backend/x64/jitstate_info.h"
 #include "dynarmic/common/atomic.h"
@@ -248,6 +250,8 @@ private:
         constexpr size_t MINIMUM_REMAINING_CODESIZE = 1 * 1024 * 1024;
         if (block_of_code.SpaceRemaining() < MINIMUM_REMAINING_CODESIZE) {
             // Immediately evacuate cache
+            NoteFullCacheFlush("A64", conf.processor_id, block_of_code.GetTotalCodeSize(),
+                               std::chrono::steady_clock::now() - cache_cleared_at);
             invalidate_entire_cache = true;
             PerformRequestedCacheInvalidation(HaltReason::CacheInvalidation);
         }
@@ -277,6 +281,7 @@ private:
             if (invalidate_entire_cache) {
                 block_of_code.ClearCache();
                 emitter.ClearCache();
+                cache_cleared_at = std::chrono::steady_clock::now();
             } else {
                 emitter.InvalidateCacheRanges(invalid_cache_ranges);
             }
@@ -295,6 +300,8 @@ private:
     bool invalidate_entire_cache = false;
     boost::icl::interval_set<u64> invalid_cache_ranges;
     std::mutex invalidation_mutex;
+    // Last full clear of the code cache (or creation), for the "JIT code cache full" line.
+    std::chrono::steady_clock::time_point cache_cleared_at = std::chrono::steady_clock::now();
 };
 
 Jit::Jit(UserConfig conf)
