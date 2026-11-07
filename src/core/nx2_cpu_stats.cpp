@@ -3,10 +3,12 @@
 
 #include <array>
 #include <string>
+#include <utility>
 
 #include <fmt/format.h>
 
 #include "common/logging.h"
+#include "common/nx2_ab.h"
 #include "common/nx2_counters.h"
 #include "core/nx2_cpu_stats.h"
 
@@ -196,9 +198,58 @@ void Report(s64 window_ns) {
                              FormatRate(PerSecond(total, window_ns)),
                              FormatPerCore(per_core, window_ns));
     }
-    LOG_INFO(Core_ARM, "nx2 CPU hints (last {:.1f} s, per core in brackets): {}/s{}",
+    // WFE parking (A/B bit WfePark): per core, and how much of the time the cores parked.
+    const auto take_wfe = [](Wfe what) {
+        std::array<u64, NUM_CORES> per_core{};
+        u64 total = 0;
+        for (size_t core = 0; core < NUM_CORES; ++core) {
+            per_core[core] =
+                g_cores[core].wfe[static_cast<size_t>(what)].exchange(0, std::memory_order_relaxed);
+            total += per_core[core];
+        }
+        return std::make_pair(total, per_core);
+    };
+    const auto [event_set, event_set_cores] = take_wfe(Wfe::EventSet);
+    const auto [spin, spin_cores] = take_wfe(Wfe::Spin);
+    const auto [parked, parked_cores] = take_wfe(Wfe::Parked);
+    const auto [park_woken, park_woken_cores] = take_wfe(Wfe::ParkWoken);
+    const auto [park_ns, park_ns_cores] = take_wfe(Wfe::ParkNs);
+    std::string parked_share;
+    for (size_t core = 0; core < NUM_CORES; ++core) {
+        parked_share += fmt::format("{}{:.1f}", core == 0 ? "" : "/",
+                                    Percent(static_cast<s64>(park_ns_cores[core]), window_ns));
+    }
+    LOG_INFO(Core_ARM,
+             "nx2 CPU hints (last {:.1f} s, per core in brackets): {}/s{} | WFE parking (A/B bit "
+             "WfePark {}): event set {}/s, spinning {}/s ({}), parked {}/s ({}), {:.0f}% of parks "
+             "ended by a SEV or an interrupt, time parked % per core {}",
              static_cast<double>(window_ns) / 1e9, FormatRate(PerSecond(hint_total, window_ns)),
-             hints);
+             hints, Common::Nx2Ab::On(Common::Nx2Ab::WfePark) ? "on" : "off",
+             FormatRate(PerSecond(event_set, window_ns)), FormatRate(PerSecond(spin, window_ns)),
+             FormatPerCore(spin_cores, window_ns), FormatRate(PerSecond(parked, window_ns)),
+             FormatPerCore(parked_cores, window_ns),
+             parked != 0 ? static_cast<double>(park_woken) * 100.0 / static_cast<double>(parked)
+                         : 0.0,
+             parked_share);
+
+    // The address arbiter (A/B bit KernelWakeFast).
+    std::array<u64, static_cast<size_t>(Arbiter::Count)> arbiter{};
+    for (size_t core = 0; core < NUM_CORES; ++core) {
+        for (size_t what = 0; what < arbiter.size(); ++what) {
+            arbiter[what] += g_cores[core].arbiter[what].exchange(0, std::memory_order_relaxed);
+        }
+    }
+    const auto arb = [&](Arbiter what) { return arbiter[static_cast<size_t>(what)]; };
+    const auto rate = [&](Arbiter what) { return FormatRate(PerSecond(arb(what), window_ns)); };
+    LOG_INFO(Kernel,
+             "nx2 arbiter (last {:.1f} s, A/B bit KernelWakeFast {}): signals fast {}/s, under the "
+             "scheduler lock {}/s ({}/s woke nobody), threads woken {}/s | waits fast {}/s, under "
+             "the scheduler lock {}/s ({}/s slept) | verify mismatches {}",
+             static_cast<double>(window_ns) / 1e9,
+             Common::Nx2Ab::On(Common::Nx2Ab::KernelWakeFast) ? "on" : "off",
+             rate(Arbiter::SignalFast), rate(Arbiter::SignalSlow), rate(Arbiter::SignalNoneWoken),
+             rate(Arbiter::ThreadsWoken), rate(Arbiter::WaitFast), rate(Arbiter::WaitSlow),
+             rate(Arbiter::WaitSlept), arb(Arbiter::VerifyMismatch));
 }
 
 } // namespace Core::Nx2CpuStats

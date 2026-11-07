@@ -13,6 +13,7 @@
 #include <mutex>
 
 #include "core/arm/arm_interface.h"
+#include "core/nx2_wfe_park.h"
 
 namespace Kernel {
 class KernelCore;
@@ -66,6 +67,19 @@ public:
         return m_core_index;
     }
 
+    /// WFE on this core (its host thread, inside the JIT): A/B bit WfePark.
+    void WaitForEvent(u64 pc) {
+        m_wfe.WaitForEvent(pc, m_is_interrupted, m_core_index);
+    }
+    /// SEVL on this core.
+    void SendEventLocal() noexcept {
+        m_wfe.SendEventLocal();
+    }
+    /// SEV from any core: sets this core's event register and ends its park.
+    void SendEvent() {
+        m_wfe.SendEvent();
+    }
+
 private:
     const std::size_t m_core_index;
     std::mutex m_guard;
@@ -74,6 +88,7 @@ private:
     KThread* m_current_thread{};
     std::atomic<bool> m_is_interrupted{};
     bool m_is_single_core{};
+    Core::WfePark m_wfe;
 };
 
 } // namespace Kernel

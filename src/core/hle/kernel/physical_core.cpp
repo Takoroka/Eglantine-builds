@@ -275,6 +275,9 @@ void PhysicalCore::Interrupt() {
     // Interrupt ourselves.
     m_on_interrupt.notify_one();
 
+    // End a WFE park (A/B bit WfePark): the JIT stops for the interrupt once it returns.
+    m_wfe.Wake();
+
     // If there is no thread running, we are done.
     if (arm_interface == nullptr) {
         return;
