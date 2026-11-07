@@ -60,6 +60,9 @@ enum Feature : u64 {
     WaitForIdleBarrier = 1ull << 60, ///< Waits for idle wait (a barrier), compute-to-draw barriers
                                      ///< (RasterizerVulkan::WaitForIdle, Scheduler)
     AcquireNoDrain = 1ull << 62,     ///< Semaphore acquires read ahead of the back, no drain (puller)
+    // switchbrew (11-06): the query cache's IsRegionGpuModified stops at the first dirty query
+    // (QueryCacheBase::IterateCache). Idea: Orchid d38d025192.
+    QueryIterateEarlyStop = 1ull << 63,
 };
 
 inline const u64 g_mask = [] {
