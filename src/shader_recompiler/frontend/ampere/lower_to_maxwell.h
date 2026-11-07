@@ -145,6 +145,10 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
     }
     case 0x387: case 0x983:
         operand(opcode == 0x387 ? 32 : 16); operand(24); break;
+    case 0x987: { // STL [Ra + URb + offset], data of 1-4 registers
+        const u32 width = input.Bits(73, 3), count = width == 6 ? 4 : width == 5 ? 2 : 1;
+        operand(32, count); operand(24); break;
+    }
     case 0x981: case 0x986: {
         const u32 width = input.Bits(73, 3), count = width == 6 ? 4 : width == 5 ? 2 : 1;
         operand(opcode == 0x981 ? 16 : 32, count);
@@ -299,8 +303,11 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         RegisterPressure pressure{insn};
         bool requires_shadow = false;
         for (u32 bit : {16U, 24U, 32U, 64U}) {
+            // The uniform-based stores keep their data register in bits 32-39 too (Kirby Air
+            // Riders: STG.E desc[UR6][R33.64], R248): without a shadow copy the store would read
+            // the lowering's register, not the program's.
             if (bit == 32 && insn.Bits(9, 3) != 1 && opcode != 0xb60 && opcode != 0xb66 && opcode != 0xf66 &&
-                opcode != 0x988 && opcode != 0x927) continue;
+                opcode != 0x988 && opcode != 0x927 && opcode != 0x986 && opcode != 0x987) continue;
             const u32 reg = insn.Bits(bit, 8);
             if (reg >= shadow_boundary && reg < 255) requires_shadow = true;
         }

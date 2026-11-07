@@ -534,4 +534,33 @@ TEST_CASE("Ampere Kirby Air Riders race forms: reserved registers, SHF.L.U64.HI,
         CHECK(field(*it, 8, 8) == 224);
     }
 }
+
+TEST_CASE("Ampere uniform-based stores copy reserved data registers", "[video_core][ampere]") {
+    const auto lower = [](Instruction instruction) {
+        return LowerToMaxwell(std::array<Instruction, 2>{instruction, EXIT});
+    };
+    const auto copies = [](const auto& lowered) { return CountMaxwell(lowered, 0x5c98a, 44); };
+    // STG.E [R33 + UR6], R248 (Kirby Air Riders' race programs): R248 is a reserved register,
+    // so the data comes through the borrowed quartet R212-R215.
+    const auto reserved = lower({{0x21007986, 0x000000f8, 0x0810a906, 0x0001e800}});
+    INFO(reserved.error);
+    REQUIRE(static_cast<bool>(reserved));
+    CHECK(copies(reserved) == 16);
+    const u64 stg = FindMaxwell(reserved, 0x1ddb, 51); // STG (LDG is 0x1dda)
+    REQUIRE(stg != 0);
+    CHECK((stg & 0xff) == 212);
+
+    // From R220: it lowered before too, but stored UR4's mirror (R220) instead of the program's R220.
+    const auto mirror = lower({{0x21007986, 0x000000dc, 0x0810a906, 0x0001e800}});
+    INFO(mirror.error);
+    REQUIRE(static_cast<bool>(mirror));
+    CHECK(copies(mirror) == 16);
+    CHECK((FindMaxwell(mirror, 0x1ddb, 51) & 0xff) == 212);
+
+    // STL [UR8+0x40], R248.
+    const auto local = lower({{0xff007987, 0x000040f8, 0x08100808, 0x0001e200}});
+    INFO(local.error);
+    REQUIRE(static_cast<bool>(local));
+    CHECK(copies(local) == 16);
+}
 } // namespace
