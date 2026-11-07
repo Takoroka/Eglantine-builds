@@ -3163,6 +3163,11 @@ private:
     };
     static constexpr size_t MaxHeldFrames = 16;
 
+    static bool Trace() {
+        static const bool trace = std::getenv("EDEN_NX2_VDEC_TRACE") != nullptr;
+        return trace;
+    }
+
     void Log(HLERequestContext& ctx, std::string_view what) {
         const auto* w = ctx.CommandBuffer();
         if (Nx2FirstVideoCommand(GetServiceName(), ctx.GetCommand())) {
@@ -3211,6 +3216,7 @@ private:
         if (StopQuiet()) {
             std::scoped_lock lk{m_mutex};
             m_stopped = false;
+            m_input_ended = false;
             m_ready->room.store(!m_stream_ended && m_inputs.size() < MaxQueuedInputs,
                                 std::memory_order_relaxed);
         }
@@ -3346,6 +3352,15 @@ private:
             ClockFromRelease(w[2]);
         }
         const auto handle = HandOut(w[2], Fence{~w[4], w[6]});
+        if (Trace()) {
+            std::scoped_lock lk{m_mutex};
+            LOG_INFO(Service,
+                     "{} 314 image {} -> next frame at syncpoint {} value {} (now {}), stream ended "
+                     "{}, {} inputs, {} decoded queued",
+                     GetServiceName(), w[2], ~handle[0], handle[2],
+                     system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(~handle[0]),
+                     m_stream_ended, m_inputs.size(), m_decoded.size());
+        }
         TipcReplyWords(ctx, {handle[0], handle[1], handle[2], handle[3]});
     }
 
@@ -3378,6 +3393,7 @@ private:
             m_inputs.push_back(std::move(input));
             m_stream_ended = false;
             m_stopped = false;
+            m_input_ended = end && OneEndFrame();
             m_ready->room.store(!end && m_inputs.size() < MaxQueuedInputs, std::memory_order_relaxed);
         }
         m_cv.notify_one();
@@ -3394,6 +3410,7 @@ private:
             m_inputs.clear();
             m_flush = true;
             m_stream_ended = false;
+            m_input_ended = false;
             m_clock_offset.reset();
             m_held.clear();
             // A stopped decoder asks for no input until Start (or a submission): Kirby Air Riders
@@ -3559,6 +3576,14 @@ private:
                 AnchorClock(output->pts, output->image);
             }
         }
+        if (Trace()) {
+            if (output) {
+                LOG_INFO(Service, "{} 213 -> image {} pts {} us{}", GetServiceName(), output->image,
+                         output->pts, output->end ? ", end of stream" : "");
+            } else {
+                LOG_INFO(Service, "{} 213 -> nothing finished", GetServiceName());
+            }
+        }
         if (!output) {
             // Nothing finished: the code the client's own Acquire uses for an empty ring.
             IPC::ResponseBuilder rb{ctx, 2};
@@ -3638,7 +3663,10 @@ private:
             }
             Input input = std::move(m_inputs.front());
             m_inputs.pop_front();
-            if (!m_stream_ended && !m_stopped) {
+            // After end of stream was submitted the decoder asks for no more input (bit 32): Kirby
+            // Air Riders' lesson player serves the ready event first, and while it kept firing it
+            // only submitted end of stream again, never reaching its Stop.
+            if (!m_stream_ended && !m_stopped && !m_input_ended) {
                 m_ready->room.store(m_inputs.size() < MaxQueuedInputs, std::memory_order_relaxed);
             }
             std::string codec = m_codec;
@@ -3817,6 +3845,7 @@ private:
     u64 m_frame_interval{16667}; ///< us, from consecutive decoded frames
     u64 m_last_decoded_pts{};
     bool m_end_queued{}; ///< Decode thread: this stream's end-of-stream frame is queued (bit 32)
+    bool m_input_ended{}; ///< The last submission was end of stream: no more input asked (bit 32)
     u32 m_dropped_in_a_row{};
     std::deque<Input> m_inputs;
     std::deque<Decoded> m_decoded;     ///< Waiting for a free output image
