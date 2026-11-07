@@ -24,9 +24,29 @@
 
 namespace AudioCore::Sink {
 
+Nx2AudioStats::StreamCounters& SinkStream::Stats() {
+    Nx2AudioStats::StreamCounters* counters = stats.load(std::memory_order_acquire);
+    if (counters == nullptr) {
+        counters = &Nx2AudioStats::Stream(name);
+        stats.store(counters, std::memory_order_release);
+    }
+    return *counters;
+}
+
 void SinkStream::AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) {
     if (type == StreamType::In)
         return;
+
+    // TEMP ("nx2 audio"): buffers in, and samples a full ring didn't take (they never play, but
+    // their buffer still counts its frames: the device callback then pops short).
+    Nx2AudioStats::StreamCounters& counters = Stats();
+    counters.appended.fetch_add(1, std::memory_order_relaxed);
+    const auto push = [&](std::span<const s16> pushed) {
+        const size_t taken = samples_buffer.Push(pushed);
+        if (taken < pushed.size()) {
+            counters.dropped_samples.fetch_add(pushed.size() - taken, std::memory_order_relaxed);
+        }
+    };
 
     constexpr s32 min = (std::numeric_limits<s16>::min)();
     constexpr s32 max = (std::numeric_limits<s16>::max)();
@@ -60,7 +80,7 @@ void SinkStream::AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) {
         }
 
         queue.EmplaceWait(buffer);
-        samples_buffer.Push(samples.subspan(0, samples.size() / system_channels * device_channels));
+        push(samples.subspan(0, samples.size() / system_channels * device_channels));
     } else if (system_channels < device_channels) {
         std::vector<s16> new_samples(samples.size() / system_channels * device_channels);
         for (u32 r_offs = 0, w_offs = 0; r_offs < samples.size(); r_offs += system_channels, w_offs += device_channels)
@@ -68,7 +88,7 @@ void SinkStream::AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) {
                 new_samples[w_offs + channel] = s16(std::clamp(s32(f32(samples[r_offs + channel]) * volume), min, max));
 
         queue.EmplaceWait(buffer);
-        samples_buffer.Push(new_samples);
+        push(new_samples);
     } else {
         if (volume != 1.0f) {
             for (u32 i = 0; i < samples.size(); ++i)
@@ -76,7 +96,7 @@ void SinkStream::AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) {
         }
 
         queue.EmplaceWait(buffer);
-        samples_buffer.Push(samples);
+        push(samples);
     }
 
     ++queued_buffers;
@@ -173,7 +193,20 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
     size_t frames_written{0};
     size_t actual_frames_written{0};
 
+    // TEMP ("nx2 audio"): what the device asks for, and how much was queued for it.
+    Nx2AudioStats::StreamCounters& counters = Stats();
+    Nx2AudioStats::MaybeReport();
+    counters.callbacks.fetch_add(1, std::memory_order_relaxed);
+    counters.frames_requested.fetch_add(num_frames, std::memory_order_relaxed);
+    Nx2AudioStats::AddMax(counters.frames_requested_max, num_frames);
+    {
+        const u64 queued = queued_buffers.load(std::memory_order_relaxed);
+        counters.queue_sum.fetch_add(queued, std::memory_order_relaxed);
+        Nx2AudioStats::AddMin(counters.queue_min, queued);
+    }
+
     if (system.IsPaused() || system.IsShuttingDown()) {
+        counters.paused_callbacks.fetch_add(1, std::memory_order_relaxed);
         if (system.IsShuttingDown()) {
             std::scoped_lock lk{release_mutex};
             queued_buffers.store(0);
@@ -190,6 +223,9 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
 
             if (!queue.TryPop(playing_buffer)) {
                 lk.unlock();
+                counters.underrun_callbacks.fetch_add(1, std::memory_order_relaxed);
+                counters.underrun_frames.fetch_add(num_frames - frames_written,
+                                                   std::memory_order_relaxed);
                 for (size_t i = frames_written; i < num_frames; i++)
                     std::memcpy(&output_buffer[i * frame_size], last_frame.data(), frame_size_bytes);
                 frames_written = num_frames;
@@ -203,7 +239,13 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
 
         const size_t frames_available = std::min<u64>(playing_buffer.frames - playing_buffer.frames_played, num_frames - frames_written);
 
-        samples_buffer.Pop(&output_buffer[frames_written * frame_size], frames_available * frame_size);
+        const size_t popped = samples_buffer.Pop(&output_buffer[frames_written * frame_size],
+                                                 frames_available * frame_size);
+        if (popped < frames_available * frame_size) {
+            counters.short_pop_frames.fetch_add((frames_available * frame_size - popped) /
+                                                    frame_size,
+                                                std::memory_order_relaxed);
+        }
 
         frames_written += frames_available;
         actual_frames_written += frames_available;

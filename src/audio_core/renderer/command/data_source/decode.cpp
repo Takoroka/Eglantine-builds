@@ -7,6 +7,7 @@
 #include <array>
 #include <vector>
 
+#include "audio_core/nx2_audio_stats.h"
 #include "audio_core/renderer/command/data_source/decode.h"
 #include "audio_core/renderer/command/resample/resample.h"
 #include "common/fixed_point.h"
@@ -394,6 +395,10 @@ void DecodeFromWaveBuffers(Core::Memory::Memory& memory, const DecodeFromWaveBuf
         }
 
         output_buffer = output_buffer.subspan(samples_to_write);
+    }
+    // TEMP ("nx2 audio"): a voice ran out of the game's wave buffers in this render pass.
+    if (is_buffer_starved) {
+        AudioCore::Nx2AudioStats::g_render.voices_starved.fetch_add(1, std::memory_order_relaxed);
     }
 
     voice_state.wave_buffers_consumed = wavebuffers_consumed;
