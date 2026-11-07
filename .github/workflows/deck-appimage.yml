@@ -1,9 +1,12 @@
-name: build-linux
+name: deck-appimage
 
-# Reusable: builds the Linux binaries (x86_64 and aarch64; with pgo=both also the clang PGO
-# variants) and uploads one artifact per platform holding the tar.gz and the AppImage.
+# Manual x86_64 Linux build (tar.gz + AppImage, e.g. for Steam Deck test builds), run with
+#   gh workflow run deck-appimage.yml -f sha=<full sha> -f version=<label> -f refspec=<label> -f tag=<label>
+# A copy of build-linux.yml with workflow_dispatch instead of workflow_call and x86_64 only: this
+# repository is private, and GitHub has no free ARM64 runners for private repositories.
+
 on:
-  workflow_call:
+  workflow_dispatch:
     inputs:
       sha:
         type: string
@@ -49,7 +52,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [x86_64, aarch64]
+        arch: [x86_64]
         pgo: ${{ fromJSON(inputs.pgo == 'both' && '[false, true]' || '[false]') }}
 
     steps:
