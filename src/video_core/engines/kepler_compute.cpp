@@ -19,6 +19,7 @@
 #include <unordered_set>
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/nx2_ab.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
 #include "core/core.h"
@@ -39,6 +40,7 @@
 #include "video_core/macro_turing_jit.h"
 #endif
 #include "video_core/rasterizer_interface.h"
+#include "video_core/shader_environment.h"
 #include "video_core/textures/decoders.h"
 
 namespace Tegra::Engines {
@@ -568,36 +570,54 @@ void CountSkippedRejectedDispatch() {
                  seconds, static_cast<double>(count) / seconds);
     }
 }
+
+/// A native QMD's launch parameters; false at a constant buffer address wider than supported
+/// (the buffers before it are set). The back's dispatch and the front's prebuild decode alike.
+bool DecodeNativeLaunch(const NativeQmdScheduler::Descriptor& qmd,
+                        KeplerCompute::LaunchParams& launch) {
+    launch.grid_dim_x.Assign(qmd[12]);
+    launch.grid_dim_y.Assign(qmd[13] & 0xffff);
+    launch.grid_dim_z.Assign(qmd[14] & 0xffff);
+    launch.shared_alloc.Assign(qmd[17] & 0x3ffff);
+    launch.block_dim_x.Assign(qmd[18] >> 16);
+    launch.block_dim_y.Assign(qmd[19] & 0xffff);
+    launch.block_dim_z.Assign(qmd[19] >> 16);
+    launch.const_buffer_enable_mask.Assign(qmd[20] & 0xff);
+    launch.local_pos_alloc.Assign(qmd[23] & 0xffffff);
+    launch.local_crs_alloc.Assign(qmd[50] & 0xffffff);
+    for (u32 slot = 0; slot < KeplerCompute::NumConstBuffers; ++slot) {
+        const u32 high = qmd[33 + slot * 2];
+        if (high & 0x1ff00) {
+            return false;
+        }
+        auto& buffer = launch.const_buffer_config[slot];
+        buffer.address_low = qmd[32 + slot * 2];
+        buffer.address_high.Assign(high & 0xff);
+        buffer.size.Assign(((high >> 19) & 0x1fff) << 4);
+    }
+    return true;
+}
+
+/// The program address of a native QMD.
+GPUVAddr NativeProgramAddress(const NativeQmdScheduler::Descriptor& qmd) {
+    return (GPUVAddr{qmd[49] & 0x1ffff} << 32) | qmd[48];
+}
+
+constexpr u64 DonkeyKongBananzaProgramId = 0x040074A01BF12000ULL;
+constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
 } // Anonymous namespace
 
 bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& qmd) {
     launch_description = {};
-    launch_description.grid_dim_x.Assign(qmd[12]);
-    launch_description.grid_dim_y.Assign(qmd[13] & 0xffff);
-    launch_description.grid_dim_z.Assign(qmd[14] & 0xffff);
-    launch_description.shared_alloc.Assign(qmd[17] & 0x3ffff);
-    launch_description.block_dim_x.Assign(qmd[18] >> 16);
-    launch_description.block_dim_y.Assign(qmd[19] & 0xffff);
-    launch_description.block_dim_z.Assign(qmd[19] >> 16);
-    launch_description.const_buffer_enable_mask.Assign(qmd[20] & 0xff);
-    launch_description.local_pos_alloc.Assign(qmd[23] & 0xffffff);
-    launch_description.local_crs_alloc.Assign(qmd[50] & 0xffffff);
     regs.code_loc.address_low = qmd[48];
     regs.code_loc.address_high = qmd[49] & 0x1ffff;
-    for (u32 slot = 0; slot < NumConstBuffers; ++slot) {
-        const u32 high = qmd[33 + slot * 2];
-        if (high & 0x1ff00) {
-            LOG_ERROR(HW_GPU, "Native compute constant address exceeds supported GPU width");
-            if (VideoCommon::Nx2Diag::CountersEnabled()) {
-                VideoCommon::Nx2Diag::Diagnostics::Get().Note(true, regs.code_loc.Address(), 0, "dropped", 0, 0,
-                                                              "constant address too wide");
-            }
-            return false;
+    if (!DecodeNativeLaunch(qmd, launch_description)) {
+        LOG_ERROR(HW_GPU, "Native compute constant address exceeds supported GPU width");
+        if (VideoCommon::Nx2Diag::CountersEnabled()) {
+            VideoCommon::Nx2Diag::Diagnostics::Get().Note(true, regs.code_loc.Address(), 0, "dropped", 0, 0,
+                                                          "constant address too wide");
         }
-        auto& buffer = launch_description.const_buffer_config[slot];
-        buffer.address_low = qmd[32 + slot * 2];
-        buffer.address_high.Assign(high & 0xff);
-        buffer.size.Assign(((high >> 19) & 0x1fff) << 4);
+        return false;
     }
     const u64 diag_code = regs.code_loc.Address();
     const u32 diag_groups = launch_description.grid_dim_x.Value() * launch_description.grid_dim_y.Value() *
@@ -916,7 +936,6 @@ bool KeplerCompute::EmulatesNativeTensorPrograms() const {
     // compact form (UsesCompactTensorPrograms). Other titles keep the upscale stand-in (emulating
     // title 4's network takes the host driver minutes to compile). Chosen per title, not per
     // dispatch: the shader cache keeps the result of a program's first dispatch.
-    constexpr u64 DonkeyKongBananzaProgramId = 0x040074A01BF12000ULL;
     return Settings::GetCurrentProgramID() == DonkeyKongBananzaProgramId ||
            UsesCompactTensorPrograms();
 }
@@ -926,7 +945,6 @@ bool KeplerCompute::UsesCompactTensorPrograms() const {
     // stand-in blits the network's input instead, which leaves the frame flat and far too bright
     // (Kokiri Forest median luma ~0.29 against ~0.10 with the network). The compact form calls a
     // helper that shuffles across 32 lanes, so it needs compute shaders created 32 threads wide.
-    constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
     return !dlss_chain.active && Settings::GetCurrentProgramID() == OcarinaOfTimeProgramId &&
            rasterizer->SupportsGameDlssNetwork();
 }
@@ -1771,6 +1789,8 @@ struct KeplerCompute::FrontState {
     bool compute_uploaded{};
     u32 bind_pointer{};
     MacroEngine* macro{}; ///< Without a native context: the one macro engine
+    /// Launch shapes (program and sizes) already handed to the pipeline workers (FrontPrebuild).
+    std::unordered_set<u64> prebuild_offered;
 };
 
 KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
@@ -1914,7 +1934,56 @@ void KeplerCompute::FrontShadowQmd(FrontState& fs, GPUVAddr qmd_address, u32 arg
                          payload);
             return true;
         },
-        [](const auto&) { return true; });
+        [&](const NativeQmdScheduler::Descriptor& descriptor) {
+            FrontPrebuild(fs, descriptor);
+            return true;
+        });
+}
+
+void KeplerCompute::FrontPrebuild(FrontState& fs, const NativeQmdScheduler::Descriptor& qmd) {
+    if (!Common::Nx2Ab::On(Common::Nx2Ab::PipelinePrebuild)) {
+        return;
+    }
+    // Each launch shape once: the program and the sizes its translation takes from the QMD.
+    const GPUVAddr program{NativeProgramAddress(qmd)};
+    u64 shape{program * 0x9E3779B97F4A7C15ULL};
+    for (const u32 word : {qmd[17], qmd[18], qmd[19], qmd[20], qmd[23], qmd[50]}) {
+        shape = (shape ^ word) * 0x100000001B3ULL;
+    }
+    if (fs.prebuild_offered.size() >= 0x10000) {
+        fs.prebuild_offered.clear();
+    }
+    if (!fs.prebuild_offered.insert(shape).second) {
+        return;
+    }
+    LaunchParams launch{};
+    if (!DecodeNativeLaunch(qmd, launch)) {
+        return; // The back drops this launch
+    }
+    // What ComputeEnvironment reads from the engine, as the back will have it at this launch: the
+    // back's registers are the native ones (the front's copy holds the same values here).
+    VideoCommon::ComputeEngineState engine_state;
+    for (u32 slot = 0; slot < NumConstBuffers; ++slot) {
+        const auto& buffer{launch.const_buffer_config[slot]};
+        engine_state.const_buffers[slot] = {buffer.Address(), buffer.size.Value()};
+    }
+    engine_state.const_buffer_enable_mask = launch.const_buffer_enable_mask.Value();
+    engine_state.local_memory_size = launch.local_pos_alloc + launch.local_crs_alloc;
+    engine_state.shared_memory_size = launch.shared_alloc;
+    engine_state.workgroup_size = {launch.block_dim_x, launch.block_dim_y, launch.block_dim_z};
+    const auto& r{fs.registers};
+    constexpr size_t TIC = KEPLER_COMPUTE_REG_INDEX(tic);
+    engine_state.tic_address = (GPUVAddr{r[TIC]} << 32) | r[TIC + 1];
+    engine_state.tic_limit = r[TIC + 2];
+    engine_state.tex_cb_index = r[KEPLER_COMPUTE_REG_INDEX(tex_cb_index)];
+    engine_state.linked_tsc = launch.linked_tsc != 0;
+    // As EmulatesNativeTensorPrograms and UsesCompactTensorPrograms outside a game DLSS
+    // evaluation (the front doesn't follow those): another answer only gives another key.
+    const u64 program_id{Settings::GetCurrentProgramID()};
+    engine_state.native_compact_tensor =
+        program_id == OcarinaOfTimeProgramId && rasterizer->SupportsGameDlssNetwork();
+    engine_state.native_tensor = program_id == DonkeyKongBananzaProgramId || engine_state.native_compact_tensor;
+    rasterizer->PrebuildCompute(memory_manager, program, engine_state);
 }
 
 MacroEngine& KeplerCompute::FrontMacroEngine(FrontState& fs) {

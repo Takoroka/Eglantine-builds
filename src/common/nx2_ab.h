@@ -37,6 +37,11 @@ enum Feature : u64 {
     // a few threads of their own; boot and the builds a draw or dispatch waits for keep all of the
     // pipeline workers (PipelineCache::async_workers).
     BuilderThreadsByPhase = 1ull << 4,
+    // vkoff (11-06): the split's front hands the compute programs of launches it schedules to the
+    // pipeline workers, which translate and build them early; the back adopts such a pipeline
+    // only when its environment answers every translation query the same (PipelineCache
+    // compute prebuilds).
+    PipelinePrebuild = 1ull << 13,
     // texlookup (11-06): VK_EXT_memory_priority / VK_EXT_pageable_device_local_memory: render
     // targets, buffers and the stream buffer high, texture cache images by recency
     // (VideoCommon::MemoryPriority). Read once, at device creation.

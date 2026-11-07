@@ -1838,6 +1838,11 @@ bool SyncFixEnabled() {
 }
 } // namespace
 
+void RasterizerVulkan::PrebuildCompute(Tegra::MemoryManager& memory, GPUVAddr program_base,
+                                       const VideoCommon::ComputeEngineState& state) {
+    pipeline_cache.QueueComputePrebuild(memory, program_base, state);
+}
+
 const std::string* RasterizerVulkan::DispatchCompute() {
     SCOPE_EXIT {
         NoteSetupChange();

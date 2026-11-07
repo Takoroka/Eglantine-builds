@@ -38,6 +38,7 @@ struct TICEntry;
 
 namespace VideoCommon {
 class GpuSplit;
+struct ComputeEngineState;
 }
 
 namespace VideoCore {
@@ -78,6 +79,13 @@ public:
     /// is skipped without its error being thrown again: the return is that error's text, which
     /// lives as long as the rasterizer (nullptr otherwise).
     virtual const std::string* DispatchCompute() = 0;
+
+    /// Called by the GPU split's front (not the thread that dispatches) for a native compute
+    /// launch it saw ahead of the dispatch: the backend may translate and build its pipeline early,
+    /// reading guest memory through `memory` (the launching channel's).
+    virtual void PrebuildCompute([[maybe_unused]] Tegra::MemoryManager& memory,
+                                 [[maybe_unused]] GPUVAddr program_base,
+                                 [[maybe_unused]] const VideoCommon::ComputeEngineState& state) {}
 
     /// Resets the counter of a query
     virtual void ResetCounter(VideoCommon::QueryType type) = 0;

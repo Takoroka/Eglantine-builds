@@ -97,6 +97,8 @@ public:
     void DrawTexture() override;
     void Clear(u32 layer_count) override;
     const std::string* DispatchCompute() override;
+    void PrebuildCompute(Tegra::MemoryManager& memory, GPUVAddr program_base,
+                         const VideoCommon::ComputeEngineState& state) override;
     void ResetCounter(VideoCommon::QueryType type) override;
     void Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) override;

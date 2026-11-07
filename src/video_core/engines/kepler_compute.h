@@ -284,6 +284,9 @@ private:
     /// The semaphore releases a front write queues, for the front's model (Nx2SemModel).
     void FrontModelReleases(FrontState& state, u32 method, u32 argument);
     void FrontShadowQmd(FrontState& state, GPUVAddr qmd_address, u32 argument);
+    /// A launch the front's QMD shadow runs: its compute program, if not offered yet, goes to the
+    /// pipeline workers to be translated and built ahead of the back (A/B bit PipelinePrebuild).
+    void FrontPrebuild(FrontState& state, const NativeQmdScheduler::Descriptor& qmd);
     MacroEngine& FrontMacroEngine(FrontState& state);
     std::span<u32> FrontMacroPositions(FrontState& state);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);

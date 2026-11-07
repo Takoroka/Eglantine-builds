@@ -399,8 +399,9 @@ public:
     using Instruction = Shader::Ampere::Instruction;
     static constexpr GPUVAddr PageSize = 0x1000;
 
-    explicit NativeInstructionReader(Tegra::MemoryManager& gpu_memory_)
-        : gpu_memory{gpu_memory_} {}
+    /// unsafe: read without flushing (away from the GPU thread).
+    explicit NativeInstructionReader(Tegra::MemoryManager& gpu_memory_, bool unsafe_ = false)
+        : gpu_memory{gpu_memory_}, unsafe{unsafe_} {}
 
     /// Copies the instruction at `address` into `out`, loading its page first if needed.
     /// Returns false when the instruction is not inside a fully mapped page.
@@ -428,12 +429,17 @@ private:
         page_begin = address;
         page_end = address;
         if (length >= sizeof(Instruction) && gpu_memory.IsFullyMappedRange(address, length)) {
-            gpu_memory.ReadBlock(address, page.data(), length);
+            if (unsafe) {
+                gpu_memory.ReadBlockUnsafe(address, page.data(), length);
+            } else {
+                gpu_memory.ReadBlock(address, page.data(), length);
+            }
             page_end = next_page;
         }
     }
 
     Tegra::MemoryManager& gpu_memory;
+    bool unsafe{};
     std::array<Instruction, PageSize / sizeof(Instruction)> page;
     GPUVAddr page_begin{};
     GPUVAddr page_end{};
@@ -466,7 +472,7 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
     constexpr u32 maximum_instructions = Shader::Ampere::ProgramCaptureState::MaximumInstructions;
     std::vector<Instruction> native;
     Shader::Ampere::ProgramCaptureState capture;
-    NativeInstructionReader reader{*gpu_memory};
+    NativeInstructionReader reader{*gpu_memory, detached};
     for (u32 index = 0; index < maximum_instructions; ++index) {
         const GPUVAddr address = program_base + native_header_size + index * sizeof(Instruction);
         Instruction instruction;
@@ -479,7 +485,11 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
                 if (!native.empty()) break;
                 throw Shader::RuntimeError("Unmapped native shader instruction at {:#x}", address);
             }
-            gpu_memory->ReadBlock(address, &instruction, sizeof(instruction));
+            if (detached) {
+                gpu_memory->ReadBlockUnsafe(address, &instruction, sizeof(instruction));
+            } else {
+                gpu_memory->ReadBlock(address, &instruction, sizeof(instruction));
+            }
         }
         native.push_back(instruction);
         const auto status = capture.Observe(instruction, index);
@@ -878,7 +888,49 @@ ComputeEnvironment::ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_com
     }
 }
 
+ComputeEnvironment::ComputeEnvironment(const ComputeEngineState& state,
+                                       Tegra::MemoryManager& gpu_memory_, GPUVAddr program_base_)
+    : GenericEnvironment{gpu_memory_, program_base_, 0}, state_copy{state} {
+    // As the constructor above for a native program, from the copy.
+    stage = Shader::Stage::Compute;
+    local_memory_size = state.local_memory_size;
+    texture_bound = state.tex_cb_index;
+    shared_memory_size = state.shared_memory_size;
+    workgroup_size = state.workgroup_size;
+    detached = true;
+    initial_offset = sizeof(sph);
+    is_proprietary_driver = true;
+    native_tensor = state.native_tensor;
+    native_compact_tensor = state.native_compact_tensor;
+    InitializeNativeCode({}, 0);
+    start_address = sizeof(sph);
+}
+
+bool ComputeEnvironment::ConstBufferEnabled(u32 cbuf_index) const {
+    if (cbuf_index >= 8) {
+        return false;
+    }
+    if (state_copy) {
+        return ((state_copy->const_buffer_enable_mask >> cbuf_index) & 1) != 0;
+    }
+    return ((kepler_compute->launch_description.const_buffer_enable_mask.Value() >> cbuf_index) &
+            1) != 0;
+}
+
 u32 ComputeEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
+    if (state_copy) {
+        if (!ConstBufferEnabled(cbuf_index)) {
+            // What the launch would assert on: no early translation for it.
+            throw EngineStateMissing{};
+        }
+        const auto& cbuf{state_copy->const_buffers[cbuf_index]};
+        u32 value{};
+        if (cbuf_offset < cbuf.size) {
+            value = gpu_memory->Read<u32>(cbuf.address + cbuf_offset);
+        }
+        cbuf_values.emplace(MakeCbufKey(cbuf_index, cbuf_offset), value);
+        return value;
+    }
     const auto& qmd{kepler_compute->launch_description};
     ASSERT(((qmd.const_buffer_enable_mask.Value() >> cbuf_index) & 1) != 0);
     const auto& cbuf{qmd.const_buffer_config[cbuf_index]};
@@ -890,7 +942,23 @@ u32 ComputeEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
     return value;
 }
 
+Tegra::Texture::TICEntry ComputeEnvironment::ReadCopiedTextureInfo(u32 handle) {
+    const auto& state{*state_copy};
+    const auto pair{Tegra::Texture::TexturePair(handle, state.linked_tsc)};
+    if (Tegra::Texture::TextureHeaderIndex(pair.first, state.tic_limit,
+                                           gpu_memory->UsesNativeTiling()) > state.tic_limit) {
+        // A handle the launch's descriptor table doesn't hold (what the copy read is stale).
+        throw EngineStateMissing{};
+    }
+    return ReadTextureInfo(state.tic_address, state.tic_limit, state.linked_tsc, handle, true);
+}
+
 Shader::TextureType ComputeEnvironment::ReadTextureType(u32 handle) {
+    if (state_copy) {
+        const Shader::TextureType result{ConvertTextureType(ReadCopiedTextureInfo(handle))};
+        texture_types.emplace(handle, result);
+        return result;
+    }
     const auto& regs{kepler_compute->regs};
     const auto& qmd{kepler_compute->launch_description};
     auto entry = ReadTextureInfo(regs.tic.Address(), regs.tic.limit, qmd.linked_tsc != 0, handle);
@@ -900,12 +968,64 @@ Shader::TextureType ComputeEnvironment::ReadTextureType(u32 handle) {
 }
 
 Shader::TexturePixelFormat ComputeEnvironment::ReadTexturePixelFormat(u32 handle) {
+    if (state_copy) {
+        const Shader::TexturePixelFormat result(
+            ConvertTexturePixelFormat(ReadCopiedTextureInfo(handle)));
+        texture_pixel_formats.emplace(handle, result);
+        return result;
+    }
     const auto& regs{kepler_compute->regs};
     const auto& qmd{kepler_compute->launch_description};
     auto entry = ReadTextureInfo(regs.tic.Address(), regs.tic.limit, qmd.linked_tsc != 0, handle);
     const Shader::TexturePixelFormat result(ConvertTexturePixelFormat(entry));
     texture_pixel_formats.emplace(handle, result);
     return result;
+}
+
+bool ComputeEnvironment::SameAnswers(ComputeEnvironment& current) {
+    if (stage != current.stage || code != current.code ||
+        native_source_size != current.native_source_size ||
+        start_address != current.start_address || initial_offset != current.initial_offset ||
+        local_memory_size != current.local_memory_size || texture_bound != current.texture_bound ||
+        shared_memory_size != current.shared_memory_size ||
+        workgroup_size != current.workgroup_size ||
+        is_proprietary_driver != current.is_proprietary_driver ||
+        viewport_transform_state != current.viewport_transform_state ||
+        has_unbound_instructions || !cbuf_replacements.empty()) {
+        return false;
+    }
+    for (const auto& [key, value] : cbuf_values) {
+        const u32 index{static_cast<u32>(key >> 32)};
+        if (!current.ConstBufferEnabled(index) ||
+            current.ReadCbufValue(index, static_cast<u32>(key)) != value) {
+            return false;
+        }
+    }
+    for (const auto& [key, mapped] : storage_pointer_types) {
+        const u32 index{static_cast<u32>(key >> 32) & 0xff};
+        const u32 offset{static_cast<u32>(key)};
+        if (!current.ConstBufferEnabled(index)) {
+            return false;
+        }
+        const bool now{(key >> 63) != 0
+                           ? current.IsCbufIndirectStorageBufferPointer(
+                                 index, offset, static_cast<u32>(key >> 40) & 0x3fffff)
+                           : current.IsCbufStorageBufferPointer(index, offset)};
+        if (now != (mapped != 0)) {
+            return false;
+        }
+    }
+    for (const auto& [handle, type] : texture_types) {
+        if (current.ReadTextureType(handle) != type) {
+            return false;
+        }
+    }
+    for (const auto& [handle, format] : texture_pixel_formats) {
+        if (current.ReadTexturePixelFormat(handle) != format) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool ComputeEnvironment::IsTexturePixelFormatInteger(u32 handle) {
@@ -1127,11 +1247,101 @@ void SerializePipeline(std::span<const char> key, std::span<const GenericEnviron
     }
 }
 
+bool MigratePipelineCache(const std::filesystem::path& filename, u32 from_version, u32 to_version,
+                          std::span<const PipelineKeyMigration> migrations, bool with_mesh_state) {
+    const auto migration{std::ranges::find(migrations, from_version,
+                                           &PipelineKeyMigration::from_version)};
+    if (migration == migrations.end()) {
+        return false;
+    }
+    std::filesystem::path temporary{filename};
+    temporary += ".migrating";
+    size_t kept{};
+    size_t dropped{};
+    try {
+        std::ifstream in(filename, std::ios::binary | std::ios::ate);
+        if (!in.is_open()) {
+            return false;
+        }
+        in.exceptions(std::ifstream::failbit);
+        const std::streamoff end{in.tellg()};
+        const std::streamoff header{static_cast<std::streamoff>(MAGIC_NUMBER.size() + sizeof(u32))};
+        in.seekg(header, std::ios::beg);
+        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+        out.exceptions(std::ofstream::failbit);
+        out.write(MAGIC_NUMBER.data(), MAGIC_NUMBER.size())
+            .write(reinterpret_cast<const char*>(&to_version), sizeof(to_version));
+        std::vector<char> environments;
+        std::vector<char> old_key;
+        std::vector<char> new_key;
+        std::streamoff position{header};
+        while (position != end) {
+            // An entry: its environments (copied as they are), then its key (converted).
+            std::streamoff keys_start{};
+            bool compute{};
+            try {
+                u32 num_envs{};
+                in.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+                if (num_envs == 0) {
+                    break;
+                }
+                for (u32 index = 0; index < num_envs; ++index) {
+                    FileEnvironment env;
+                    env.Deserialize(in, with_mesh_state);
+                    if (index == 0) {
+                        compute = env.ShaderStage() == Shader::Stage::Compute;
+                    }
+                }
+                keys_start = in.tellg();
+                old_key.resize(compute ? migration->compute_key_size
+                                       : migration->graphics_key_size);
+                in.read(old_key.data(), static_cast<std::streamsize>(old_key.size()));
+            } catch (const std::ios_base::failure&) {
+                // A partly written last entry (the emulator stopped while appending it).
+                break;
+            }
+            const std::streamoff next{in.tellg()};
+            const auto convert{compute ? migration->convert_compute : migration->convert_graphics};
+            new_key.clear();
+            if (convert != nullptr && convert(old_key, new_key)) {
+                environments.resize(static_cast<size_t>(keys_start - position));
+                in.seekg(position, std::ios::beg);
+                in.read(environments.data(), static_cast<std::streamsize>(environments.size()));
+                out.write(environments.data(), static_cast<std::streamsize>(environments.size()))
+                    .write(new_key.data(), static_cast<std::streamsize>(new_key.size()));
+                ++kept;
+            } else {
+                ++dropped;
+            }
+            in.seekg(next, std::ios::beg);
+            position = next;
+        }
+    } catch (const std::exception& error) {
+        LOG_ERROR(Common_Filesystem, "Pipeline cache migration failed: {}", error.what());
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        return false;
+    }
+    std::error_code error;
+    std::filesystem::rename(temporary, filename, error);
+    if (error) {
+        LOG_ERROR(Common_Filesystem, "Pipeline cache migration failed: {}", error.message());
+        std::filesystem::remove(temporary, error);
+        return false;
+    }
+    LOG_INFO(Common_Filesystem,
+             "Pipeline cache {} kept across version {} -> {}: {} entries with their keys "
+             "converted, {} dropped",
+             Common::FS::PathToUTF8String(filename.filename()), from_version, to_version, kept,
+             dropped);
+    return true;
+}
+
 void LoadPipelines(
     std::stop_token stop_loading, const std::filesystem::path& filename, u32 expected_cache_version,
     Common::UniqueFunction<void, std::ifstream&, FileEnvironment> load_compute,
     Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>> load_graphics,
-    bool with_mesh_state) {
+    bool with_mesh_state, std::span<const PipelineKeyMigration> migrations) {
     std::ifstream file(filename, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
         return;
@@ -1148,6 +1358,13 @@ void LoadPipelines(
             .read(reinterpret_cast<char*>(&cache_version), sizeof(cache_version));
         if (magic_number != MAGIC_NUMBER || cache_version != expected_cache_version) {
             file.close();
+            if (magic_number == MAGIC_NUMBER &&
+                MigratePipelineCache(filename, cache_version, expected_cache_version, migrations,
+                                     with_mesh_state)) {
+                LoadPipelines(stop_loading, filename, expected_cache_version,
+                              std::move(load_compute), std::move(load_graphics), with_mesh_state);
+                return;
+            }
             if (Common::FS::RemoveFile(filename)) {
                 if (magic_number != MAGIC_NUMBER) {
                     LOG_ERROR(Common_Filesystem, "Invalid pipeline cache file");
