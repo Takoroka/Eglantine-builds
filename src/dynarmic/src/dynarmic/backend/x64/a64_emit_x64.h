@@ -110,6 +110,12 @@ public:
     void EmitExclusiveReadMemoryInline(A64EmitContext& ctx, IR::Inst* inst);
     template<std::size_t bitsize, auto callback>
     void EmitExclusiveWriteMemoryInline(A64EmitContext& ctx, IR::Inst* inst);
+    // Native LSE atomics (A64AtomicRMW*, A64AtomicCAS*)
+    template<std::size_t bitsize>
+    void EmitAtomicRMW(A64EmitContext& ctx, IR::Inst* inst);
+    template<std::size_t bitsize>
+    void EmitAtomicCAS(A64EmitContext& ctx, IR::Inst* inst);
+    void EmitAtomicCAS128(A64EmitContext& ctx, IR::Inst* inst);
 
     // Terminal instruction emitters
     bool EmitLeafTerminal(IR::Term::LeafTerminal const& terminal, IR::LocationDescriptor initial_location, bool is_single_step) noexcept override;

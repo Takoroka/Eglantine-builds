@@ -151,6 +151,7 @@ if ("x86_64" IN_LIST ARCHITECTURE)
         backend/x64/callback.cpp
         backend/x64/callback.h
         backend/x64/code_cache_flush_log.h
+        backend/x64/lse_atomics_stats.h
         backend/x64/constant_pool.cpp
         backend/x64/constant_pool.h
         backend/x64/constants.h

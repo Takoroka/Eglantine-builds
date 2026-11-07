@@ -720,6 +720,18 @@ A64OPC(ExclusiveWriteMemory16,                              U32,            U64,
 A64OPC(ExclusiveWriteMemory32,                              U32,            U64,            U64,            U32,            AccType         )
 A64OPC(ExclusiveWriteMemory64,                              U32,            U64,            U64,            U64,            AccType         )
 A64OPC(ExclusiveWriteMemory128,                             U32,            U64,            U64,            U128,           AccType         )
+// ARMv8.1 LSE atomics done natively (UserConfig::native_lse_atomics). Each returns the old value.
+// AtomicRMW: location, vaddr, operand, op (LseOp: the o3:opc field of LDADD..SWP).
+A64OPC(AtomicRMW8,                                          U8,             U64,            U64,            U8,             U8              )
+A64OPC(AtomicRMW16,                                         U16,            U64,            U64,            U16,            U8              )
+A64OPC(AtomicRMW32,                                         U32,            U64,            U64,            U32,            U8              )
+A64OPC(AtomicRMW64,                                         U64,            U64,            U64,            U64,            U8              )
+// AtomicCAS: location, vaddr, expected, desired.
+A64OPC(AtomicCAS8,                                          U8,             U64,            U64,            U8,             U8              )
+A64OPC(AtomicCAS16,                                         U16,            U64,            U64,            U16,            U16             )
+A64OPC(AtomicCAS32,                                         U32,            U64,            U64,            U32,            U32             )
+A64OPC(AtomicCAS64,                                         U64,            U64,            U64,            U64,            U64             )
+A64OPC(AtomicCAS128,                                        U128,           U64,            U64,            U128,           U128            )
 
 // Remember to update:
 // - a32_emit_x64.cpp

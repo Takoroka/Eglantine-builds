@@ -125,4 +125,51 @@ void EmitIR<IR::Opcode::A64ExclusiveWriteMemory128>(biscuit::Assembler&, EmitCon
     ASSERT(false && "Unimplemented instruction");
 }
 
+// Native LSE atomics (UserConfig::native_lse_atomics) are x64 only: this backend's frontend
+// options never ask for them.
+template<>
+void EmitIR<IR::Opcode::A64AtomicRMW8>(biscuit::Assembler&, EmitContext&, IR::Inst*) {
+    ASSERT(false && "Unimplemented instruction");
+}
+
+template<>
+void EmitIR<IR::Opcode::A64AtomicRMW16>(biscuit::Assembler&, EmitContext&, IR::Inst*) {
+    ASSERT(false && "Unimplemented instruction");
+}
+
+template<>
+void EmitIR<IR::Opcode::A64AtomicRMW32>(biscuit::Assembler&, EmitContext&, IR::Inst*) {
+    ASSERT(false && "Unimplemented instruction");
+}
+
+template<>
+void EmitIR<IR::Opcode::A64AtomicRMW64>(biscuit::Assembler&, EmitContext&, IR::Inst*) {
+    ASSERT(false && "Unimplemented instruction");
+}
+
+template<>
+void EmitIR<IR::Opcode::A64AtomicCAS8>(biscuit::Assembler&, EmitContext&, IR::Inst*) {
+    ASSERT(false && "Unimplemented instruction");
+}
+
+template<>
+void EmitIR<IR::Opcode::A64AtomicCAS16>(biscuit::Assembler&, EmitContext&, IR::Inst*) {
+    ASSERT(false && "Unimplemented instruction");
+}
+
+template<>
+void EmitIR<IR::Opcode::A64AtomicCAS32>(biscuit::Assembler&, EmitContext&, IR::Inst*) {
+    ASSERT(false && "Unimplemented instruction");
+}
+
+template<>
+void EmitIR<IR::Opcode::A64AtomicCAS64>(biscuit::Assembler&, EmitContext&, IR::Inst*) {
+    ASSERT(false && "Unimplemented instruction");
+}
+
+template<>
+void EmitIR<IR::Opcode::A64AtomicCAS128>(biscuit::Assembler&, EmitContext&, IR::Inst*) {
+    ASSERT(false && "Unimplemented instruction");
+}
+
 }  // namespace Dynarmic::Backend::RV64

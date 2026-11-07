@@ -4,8 +4,11 @@
 // ARMv8.1 LSE atomics (LDADD/LDCLR/LDEOR/LDSET/LD{S,U}{MAX,MIN}/SWP, CAS, CASP) and
 // ARMv8.3 RCpc LDAPR.
 //
-// Each read-modify-write is built from an exclusive load and an exclusive store. If the
-// store fails (another core touched the monitor in between) no register is changed and the
+// With TranslationOptions::native_lse_atomics each one is a single A64AtomicRMW/A64AtomicCAS
+// instruction that returns the old value, done by the backend with one host atomic.
+//
+// Otherwise each read-modify-write is built from an exclusive load and an exclusive store. If
+// the store fails (another core touched the monitor in between) no register is changed and the
 // same instruction is executed again, so the operation stays atomic with multiple cores.
 
 #include "dynarmic/frontend/A64/translate/impl/impl.h"
@@ -77,11 +80,58 @@ static IR::AccType AtomicAccType(bool acquire, bool release) {
     return acquire || release ? IR::AccType::ORDERED : IR::AccType::ATOMIC;
 }
 
+// Writes the zero-extended `bytes`-byte value to Xr (no write for ZR).
+static void AtomicSetReg(TranslatorVisitor& v, Reg r, IR::UAny value, size_t bytes) {
+    if (bytes == 8) {
+        v.X(64, r, IR::U64{value});
+    } else {
+        v.X(32, r, v.ZeroExtend(value, 32));
+    }
+}
+
+// Native lowering: the host atomic is a full barrier, which covers every acquire/release variant.
+// No block end and no retry: the backend's atomic always completes.
+static bool NativeAtomicMemOp(TranslatorVisitor& v, size_t bytes, Reg Rs, size_t opv, Reg Rn, Reg Rt) {
+    const IR::U64 address = AtomicAddress(v, Rn);
+    const IR::UAny old = v.ir.AtomicRMW(bytes, address, v.X(bytes * 8, Rs), static_cast<u8>(opv));
+    AtomicSetReg(v, Rt, old, bytes);
+    return true;
+}
+
+static bool NativeCompareAndSwap(TranslatorVisitor& v, size_t bytes, Reg Rs, Reg Rn, Reg Rt) {
+    const IR::U64 address = AtomicAddress(v, Rn);
+    const IR::UAny old = v.ir.AtomicCAS(bytes, address, v.X(bytes * 8, Rs), v.X(bytes * 8, Rt));
+    AtomicSetReg(v, Rs, old, bytes);
+    return true;
+}
+
+static bool NativeCompareAndSwapPair(TranslatorVisitor& v, bool sz, Reg Rs, Reg Rs2, Reg Rn, Reg Rt, Reg Rt2) {
+    const IR::U64 address = AtomicAddress(v, Rn);
+    if (!sz) {
+        // Two 32-bit words, one 64-bit compare-and-swap (the first word is the low half).
+        const IR::U64 expected = v.ir.Pack2x32To1x64(v.X(32, Rs), v.X(32, Rs2));
+        const IR::U64 desired = v.ir.Pack2x32To1x64(v.X(32, Rt), v.X(32, Rt2));
+        const IR::U64 old{v.ir.AtomicCAS(8, address, expected, desired)};
+        v.X(32, Rs, v.ir.LeastSignificantWord(old));
+        v.X(64, Rs2, v.ir.LogicalShiftRight(old, v.ir.Imm8(32)));
+        return true;
+    }
+    const IR::U128 expected = v.ir.Pack2x64To1x128(v.X(64, Rs), v.X(64, Rs2));
+    const IR::U128 desired = v.ir.Pack2x64To1x128(v.X(64, Rt), v.X(64, Rt2));
+    const IR::U128 old = v.ir.AtomicCAS128(address, expected, desired);
+    v.X(64, Rs, v.ir.VectorGetElement(64, old, 0));
+    v.X(64, Rs2, v.ir.VectorGetElement(64, old, 1));
+    return true;
+}
+
 bool TranslatorVisitor::AtomicMemOp(Imm<2> size, bool A, bool R, Reg Rs, Imm<4> op, Reg Rn, Reg Rt) {
     const size_t bytes = size_t{1} << size.ZeroExtend<size_t>();
     const size_t opv = op.ZeroExtend<size_t>();
     if (opv > 0b1000) {
         return UnallocatedEncoding();
+    }
+    if (options.native_lse_atomics) {
+        return NativeAtomicMemOp(*this, bytes, Rs, opv, Rn, Rt);
     }
 
     const IR::U64 address = AtomicAddress(*this, Rn);
@@ -136,6 +186,9 @@ bool TranslatorVisitor::LDAPR_sz(Imm<2> size, Reg Rn, Reg Rt) {
 
 bool TranslatorVisitor::CompareAndSwap(Imm<2> size, bool L, Reg Rs, bool o0, Reg Rn, Reg Rt) {
     const size_t bytes = size_t{1} << size.ZeroExtend<size_t>();
+    if (options.native_lse_atomics) {
+        return NativeCompareAndSwap(*this, bytes, Rs, Rn, Rt);
+    }
     const IR::U64 address = AtomicAddress(*this, Rn);
     const IR::AccType acctype = AtomicAccType(L, o0);
 
@@ -157,6 +210,9 @@ bool TranslatorVisitor::CompareAndSwapPair(bool sz, bool L, Reg Rs, bool o0, Reg
     }
     const Reg Rs2 = AtomicNextReg(Rs);
     const Reg Rt2 = AtomicNextReg(Rt);
+    if (options.native_lse_atomics) {
+        return NativeCompareAndSwapPair(*this, sz, Rs, Rs2, Rn, Rt, Rt2);
+    }
     const IR::U64 address = AtomicAddress(*this, Rn);
     const IR::AccType acctype = AtomicAccType(L, o0);
 

@@ -283,6 +283,15 @@ struct UserConfig {
     /// callbacks.
     bool recompile_on_exclusive_fastmem_failure = true;
 
+    /// Determines if the ARMv8.1 LSE atomics (LDADD/LDCLR/LDEOR/LDSET/LD{S,U}{MAX,MIN}/SWP,
+    /// CAS, CASP) are done with one host atomic (lock xadd/xchg/cmpxchg/cmpxchg16b) on the
+    /// fastmem pointer instead of an exclusive load + store pair. Accesses that fault in the
+    /// fastmem arena, misaligned ones and code compiled without fastmem do the operation with
+    /// the memory callbacks (MemoryRead + MemoryWriteExclusive* until the write succeeds).
+    /// Only used with fastmem_pointer and fastmem_exclusive_access set and
+    /// check_halt_on_memory_access clear; x64 backend only.
+    bool native_lse_atomics = false;
+
     /// This option relates to translation. Generally when we run into an unpredictable
     /// instruction the ExceptionRaised callback is called. If this is true, we define
     /// definite behaviour for some unpredictable instructions.

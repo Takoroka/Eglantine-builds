@@ -41,6 +41,10 @@ enum Feature : u64 {
     // targets, buffers and the stream buffer high, texture cache images by recency
     // (VideoCommon::MemoryPriority). Read once, at device creation.
     VramPriority = 1ull << 6,
+    // codegen (11-06, play-dkb7 idea 16): ARMv8.1 LSE atomics (LDADD..SWP, CAS, CASP) as one host
+    // atomic on the fastmem pointer instead of an exclusive load + store pair (Dynarmic
+    // UserConfig::native_lse_atomics). Read when a core's JIT is made.
+    LseAtomics = 1ull << 15,
     // fences (11-05): direct draws with no vertices or no instances skip the draw setup.
     ZeroDrawSkip = 1ull << 40,
     // vkoff (11-05): draws with none of the dynamic states' dirty flags set skip their updates.
