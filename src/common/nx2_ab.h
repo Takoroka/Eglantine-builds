@@ -41,6 +41,11 @@ enum Feature : u64 {
     // targets, buffers and the stream buffer high, texture cache images by recency
     // (VideoCommon::MemoryPriority). Read once, at device creation.
     VramPriority = 1ull << 6,
+    // texlookup (11-06, play-dkb7 idea 21): sparse binds are queued and go to the queue in one
+    // vkQueueBindSparse right before the next submission, which waits for them on a timeline
+    // semaphore, instead of a bind and a fence wait each (Scheduler::BindSparse). The bind queue
+    // (a transfer queue with sparse binding when there is one) is picked at device creation.
+    SparseBindAsync = 1ull << 12,
     // fences (11-05): direct draws with no vertices or no instances skip the draw setup.
     ZeroDrawSkip = 1ull << 40,
     // vkoff (11-05): draws with none of the dynamic states' dirty flags set skip their updates.

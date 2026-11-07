@@ -131,40 +131,14 @@ SparseBuffer MultiRangeBufferCache::CreateSparse(const Device& device, Scheduler
         });
         resource_offset += source.size;
     }
-    const VkSparseBufferMemoryBindInfo buffer_bind{
-        .buffer = raw,
-        .bindCount = static_cast<u32>(binds.size()),
-        .pBinds = binds.data(),
-    };
-    const VkBindSparseInfo bind_info{
-        .sType = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO,
-        .pNext = nullptr,
-        .waitSemaphoreCount = 0,
-        .pWaitSemaphores = nullptr,
-        .bufferBindCount = 1,
-        .pBufferBinds = &buffer_bind,
-        .imageOpaqueBindCount = 0,
-        .pImageOpaqueBinds = nullptr,
-        .imageBindCount = 0,
-        .pImageBinds = nullptr,
-        .signalSemaphoreCount = 0,
-        .pSignalSemaphores = nullptr,
-    };
-    const VkFenceCreateInfo fence_ci{
-        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-    };
-    vk::Fence fence = device.GetLogical().CreateFence(fence_ci);
-    VkResult bind_result = VK_ERROR_UNKNOWN;
-    {
-        std::scoped_lock lock{scheduler.submit_mutex};
-        bind_result = device.GetGraphicsQueue().BindSparse(bind_info, *fence);
-    }
-    if (bind_result != VK_SUCCESS) {
+    // Bound before the command buffers that read the buffer run: with the next submission, which
+    // waits for them (A/B bit SparseBindAsync), or at once. The buffer is destroyed only once
+    // that submission is done (RetireEntry).
+    SparseBindBatch batch;
+    batch.AddBuffer(raw, binds);
+    if (!scheduler.BindSparse(std::move(batch), false)) {
         return SparseBuffer{};
     }
-    fence.Wait();
     return handle;
 }
 

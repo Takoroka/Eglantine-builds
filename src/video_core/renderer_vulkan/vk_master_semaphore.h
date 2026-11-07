@@ -54,14 +54,22 @@ public:
     /// Waits for a tick to be hit on the GPU
     void Wait(u64 tick);
 
-    /// Submits the device graphics queue, updating the tick as necessary
+    /// Submits the device graphics queue, updating the tick as necessary. With sparse_semaphore
+    /// (timeline semaphores only), the submission also waits for it to reach sparse_value: the
+    /// sparse binds its commands use (Scheduler::BindSparse).
     VkResult SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
-                         VkSemaphore signal_semaphore, VkSemaphore wait_semaphore, u64 host_tick);
+                         VkSemaphore signal_semaphore, VkSemaphore wait_semaphore, u64 host_tick,
+                         VkSemaphore sparse_semaphore = VK_NULL_HANDLE, u64 sparse_value = 0);
+
+    /// Whether the GPU tick is kept by a timeline semaphore (else by fences).
+    [[nodiscard]] bool IsTimeline() const noexcept {
+        return static_cast<bool>(semaphore);
+    }
 
 private:
     VkResult SubmitQueueTimeline(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
                                  VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
-                                 u64 host_tick);
+                                 u64 host_tick, VkSemaphore sparse_semaphore, u64 sparse_value);
     VkResult SubmitQueueFence(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
                               VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                               u64 host_tick);

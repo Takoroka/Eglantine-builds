@@ -6,9 +6,11 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <thread>
@@ -23,6 +25,7 @@
 #include "video_core/gpu_timestamp_stats.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+#include "video_core/vulkan_common/sparse_bind_batch.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace VideoCommon {
@@ -232,6 +235,23 @@ public:
         }
     }
 
+    /// Sparse memory binds of images and buffers. A/B bit SparseBindAsync: queued, then bound in
+    /// one vkQueueBindSparse right before the next submission, which waits for them on a timeline
+    /// semaphore: what is recorded before that submission (the uploads into the new blocks
+    /// first) runs after the binds. `now` (memory freed right after), the bit off or no timeline
+    /// semaphores: bound at once with a fence wait, as before, together with what was queued.
+    /// False only when binding at once failed; queued binds that fail are logged and counted.
+    bool BindSparse(SparseBindBatch&& binds, bool now);
+
+    /// Serial of the binds queued now, 0 when none are (the next submission takes them).
+    [[nodiscard]] u64 PendingSparseSerial() const noexcept {
+        return pending_sparse_serial.load(std::memory_order_relaxed);
+    }
+
+    /// Binds queued under serial that no submission took yet are bound now: an image destroyed
+    /// before its binds reached the queue (recording thread only).
+    void FlushSparseBinds(u64 serial);
+
     /// Whether the recording thread submitted `tick` within 20 ms.
     [[nodiscard]] bool WaitForSubmission(u64 tick) const {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{20};
@@ -337,6 +357,14 @@ private:
     void TimePassBegin(const Framebuffer* framebuffer);
     void TimeOutside(u64 key, VideoCommon::GpuSegmentKind kind, const char* name);
     void TimeInternal(TimedWork work);
+
+    /// Worker, under submit_mutex: binds a queued batch on the sparse queue, signalling the
+    /// sparse timeline; returns the value the submission waits for (0: nothing to wait for).
+    u64 SubmitSparse(SparseBindBatch& batch);
+    /// Recording thread: binds what is queued and binds at once, and waits (a fence).
+    bool BindSparseNow(SparseBindBatch&& binds);
+    /// Worker, under submit_mutex: retires finished batches (their GPU time) and logs every 30 s.
+    void TickSparse();
     void TimeUploadBuffer();
     void TimePresent(bool begin);
     void TimeFrameEnd();
@@ -483,6 +511,26 @@ private:
     TimedSegment timed_upload;
     TimedSegment timed_present;
     u64 timed_pass_key{}; ///< The active render pass's key (a frame end opens a new segment).
+
+    /// Sparse binds (BindSparse). Before worker_thread: the worker binds and waits with these.
+    SparseBindBatch pending_sparse;                ///< Recording thread
+    std::atomic<u64> pending_sparse_serial{0};     ///< Its serial, 0 when empty
+    u64 sparse_serials = 0;                        ///< Recording thread
+    u64 sparse_handed = 0;                         ///< Batches given to submissions (recording)
+    std::atomic<u64> sparse_bound{0};              ///< Of those, how many the worker bound
+    vk::Semaphore sparse_timeline;                 ///< Signalled by each queued batch
+    u64 sparse_timeline_value = 0;                 ///< Worker, under submit_mutex
+    std::deque<std::pair<u64, std::chrono::steady_clock::time_point>> sparse_in_flight; ///< Worker
+    std::chrono::steady_clock::time_point sparse_next_log{};                         ///< Worker
+    struct SparseStats {
+        std::atomic<u64> queued{};      ///< Requests queued for a submission
+        std::atomic<u64> now{};         ///< Requests bound at once (fence wait)
+        std::atomic<u64> binds{};       ///< Memory binds (blocks, tails, buffer ranges)
+        std::atomic<u64> batches{};     ///< Queued batches bound
+        std::atomic<u64> failed{};      ///< vkQueueBindSparse failures
+        std::atomic<u64> waited_ns{};   ///< Fence waits of the binds made at once
+        std::atomic<u64> unwaited_ns{}; ///< GPU time of queued batches nothing waited for
+    } sparse_stats;
 
     VideoCommon::QueryCacheBase<QueryCacheParams>* query_cache = nullptr;
 

@@ -2773,6 +2773,10 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
 Image::Image(const VideoCommon::NullImageParams& params) : VideoCommon::ImageBase{params} {}
 
 Image::~Image() {
+    if (sparse_serial != 0 && scheduler != nullptr) {
+        // Binds of this image no submission took yet go to the queue before it is destroyed.
+        scheduler->FlushSparseBinds(sparse_serial);
+    }
     DetachFromRuntime();
 }
 
@@ -3335,7 +3339,6 @@ bool Image::InitSparseTiles() {
 
 bool Image::BindZeroBlock() {
     SparseLayerMemory& s = sparse_layers;
-    const Device& device = runtime->device;
     const u64 tile = s.requirements.alignment;
     VkDeviceMemory memory{};
     VkDeviceSize offset{};
@@ -3395,46 +3398,15 @@ bool Image::BindZeroBlock() {
             .flags = 0,
         });
     }
-    const VkSparseImageMemoryBindInfo image_bind_info{
-        .image = *original_image,
-        .bindCount = static_cast<u32>(image_binds.size()),
-        .pBinds = image_binds.data(),
-    };
-    const VkSparseImageOpaqueMemoryBindInfo opaque_bind_info{
-        .image = *original_image,
-        .bindCount = static_cast<u32>(opaque_binds.size()),
-        .pBinds = opaque_binds.data(),
-    };
-    const VkBindSparseInfo bind_info{
-        .sType = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO,
-        .pNext = nullptr,
-        .waitSemaphoreCount = 0,
-        .pWaitSemaphores = nullptr,
-        .bufferBindCount = 0,
-        .pBufferBinds = nullptr,
-        .imageOpaqueBindCount = opaque_binds.empty() ? 0U : 1U,
-        .pImageOpaqueBinds = opaque_binds.empty() ? nullptr : &opaque_bind_info,
-        .imageBindCount = image_binds.empty() ? 0U : 1U,
-        .pImageBinds = image_binds.empty() ? nullptr : &image_bind_info,
-        .signalSemaphoreCount = 0,
-        .pSignalSemaphores = nullptr,
-    };
-    vk::Fence fence = device.GetLogical().CreateFence(VkFenceCreateInfo{
-        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-    });
-    VkResult result;
-    {
-        std::scoped_lock lock{scheduler->submit_mutex};
-        result = device.GetGraphicsQueue().BindSparse(bind_info, *fence);
-    }
-    if (result != VK_SUCCESS) {
-        LOG_ERROR(Render_Vulkan, "Sparse tiled image {:#x}: binding the zeroed block failed ({})",
-                  gpu_addr, static_cast<int>(result));
+    // At once: the image falls back to other paths when this fails (InitSparseTiles).
+    SparseBindBatch batch;
+    batch.AddImage(*original_image, image_binds);
+    batch.AddImageOpaque(*original_image, opaque_binds);
+    if (!scheduler->BindSparse(std::move(batch), true)) {
+        LOG_ERROR(Render_Vulkan, "Sparse tiled image {:#x}: binding the zeroed block failed",
+                  gpu_addr);
         return false;
     }
-    fence.Wait();
     // Every block now reads the shared block (and the tail its own memory): zero them all.
     ClearTiles();
     return true;
@@ -3499,7 +3471,8 @@ bool Image::BackTilesWhole() {
         rects.push_back({static_cast<s32>(level), 0, 0, (std::max)(s.width >> level, 1U),
                          (std::max)(s.height >> level, 1U)});
     }
-    if (!BindTiles(rects)) {
+    // At once: the shared block is freed below.
+    if (!BindTiles(rects, true)) {
         return false;
     }
     // No block reads the shared one any more.
@@ -3510,12 +3483,11 @@ bool Image::BackTilesWhole() {
     return true;
 }
 
-bool Image::BindTiles(std::span<const VideoCommon::LevelRect> rects) {
+bool Image::BindTiles(std::span<const VideoCommon::LevelRect> rects, bool now) {
     SparseLayerMemory& s = sparse_layers;
     if (s.allocator == nullptr) {
         return false;
     }
-    const Device& device = runtime->device;
     const u64 tile = s.requirements.alignment;
     const VkMemoryRequirements tile_requirements{
         .size = tile,
@@ -3615,48 +3587,19 @@ bool Image::BindTiles(std::span<const VideoCommon::LevelRect> rects) {
     if (image_binds.empty() && opaque_binds.empty()) {
         return true;
     }
-    const VkSparseImageMemoryBindInfo image_bind_info{
-        .image = *original_image,
-        .bindCount = static_cast<u32>(image_binds.size()),
-        .pBinds = image_binds.data(),
-    };
-    const VkSparseImageOpaqueMemoryBindInfo opaque_bind_info{
-        .image = *original_image,
-        .bindCount = static_cast<u32>(opaque_binds.size()),
-        .pBinds = opaque_binds.data(),
-    };
-    const VkBindSparseInfo bind_info{
-        .sType = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO,
-        .pNext = nullptr,
-        .waitSemaphoreCount = 0,
-        .pWaitSemaphores = nullptr,
-        .bufferBindCount = 0,
-        .pBufferBinds = nullptr,
-        .imageOpaqueBindCount = opaque_binds.empty() ? 0U : 1U,
-        .pImageOpaqueBinds = opaque_binds.empty() ? nullptr : &opaque_bind_info,
-        .imageBindCount = image_binds.empty() ? 0U : 1U,
-        .pImageBinds = image_binds.empty() ? nullptr : &image_bind_info,
-        .signalSemaphoreCount = 0,
-        .pSignalSemaphores = nullptr,
-    };
-    // Bound before the command buffer that uploads the blocks is submitted (as BindLayers).
-    vk::Fence fence = device.GetLogical().CreateFence(VkFenceCreateInfo{
-        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-    });
-    VkResult result;
-    {
-        std::scoped_lock lock{scheduler->submit_mutex};
-        result = device.GetGraphicsQueue().BindSparse(bind_info, *fence);
-    }
-    if (result != VK_SUCCESS) {
-        LOG_ERROR(Render_Vulkan, "Sparse tiled image {:#x}: binding failed ({})", gpu_addr,
-                  static_cast<int>(result));
+    // Bound before the command buffer that uploads the blocks runs: with the next submission,
+    // which waits for them (A/B bit SparseBindAsync), or at once.
+    SparseBindBatch batch;
+    batch.AddImage(*original_image, image_binds);
+    batch.AddImageOpaque(*original_image, opaque_binds);
+    if (!scheduler->BindSparse(std::move(batch), now)) {
+        LOG_ERROR(Render_Vulkan, "Sparse tiled image {:#x}: binding failed", gpu_addr);
         roll_back();
         return false;
     }
-    fence.Wait();
+    if (const u64 serial = scheduler->PendingSparseSerial(); serial != 0) {
+        sparse_serial = serial;
+    }
     return true;
 }
 
@@ -3774,49 +3717,18 @@ std::vector<u32> Image::BindLayers(std::span<const u32> layers) {
     if (image_binds.empty() && opaque_binds.empty()) {
         return bound;
     }
-    const VkSparseImageMemoryBindInfo image_bind_info{
-        .image = *original_image,
-        .bindCount = static_cast<u32>(image_binds.size()),
-        .pBinds = image_binds.data(),
-    };
-    const VkSparseImageOpaqueMemoryBindInfo opaque_bind_info{
-        .image = *original_image,
-        .bindCount = static_cast<u32>(opaque_binds.size()),
-        .pBinds = opaque_binds.data(),
-    };
-    const VkBindSparseInfo bind_info{
-        .sType = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO,
-        .pNext = nullptr,
-        .waitSemaphoreCount = 0,
-        .pWaitSemaphores = nullptr,
-        .bufferBindCount = 0,
-        .pBufferBinds = nullptr,
-        .imageOpaqueBindCount = opaque_binds.empty() ? 0U : 1U,
-        .pImageOpaqueBinds = opaque_binds.empty() ? nullptr : &opaque_bind_info,
-        .imageBindCount = image_binds.empty() ? 0U : 1U,
-        .pImageBinds = image_binds.empty() ? nullptr : &image_bind_info,
-        .signalSemaphoreCount = 0,
-        .pSignalSemaphores = nullptr,
-    };
-    // Bound before the command buffer that uploads the layers is submitted (as the multi-range
-    // buffer cache does).
-    vk::Fence fence = device.GetLogical().CreateFence(VkFenceCreateInfo{
-        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-    });
-    VkResult result;
-    {
-        std::scoped_lock lock{scheduler->submit_mutex};
-        result = device.GetGraphicsQueue().BindSparse(bind_info, *fence);
-    }
-    if (result != VK_SUCCESS) {
-        LOG_ERROR(Render_Vulkan, "Sparse layered image {:#x}: binding failed ({})", gpu_addr,
-                  static_cast<int>(result));
+    // Bound before the command buffer that uploads the layers runs (as BindTiles).
+    SparseBindBatch batch;
+    batch.AddImage(*original_image, image_binds);
+    batch.AddImageOpaque(*original_image, opaque_binds);
+    if (!scheduler->BindSparse(std::move(batch), false)) {
+        LOG_ERROR(Render_Vulkan, "Sparse layered image {:#x}: binding failed", gpu_addr);
         roll_back();
         return {};
     }
-    fence.Wait();
+    if (const u64 serial = scheduler->PendingSparseSerial(); serial != 0) {
+        sparse_serial = serial;
+    }
     return bound;
 }
 

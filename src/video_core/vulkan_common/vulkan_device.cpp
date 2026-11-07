@@ -30,6 +30,7 @@
 #include "common/settings_enums.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "video_core/texture_cache/memory_priority.h"
+#include "video_core/vulkan_common/sparse_bind_batch.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -820,6 +821,15 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 
     graphics_queue = logical.GetQueue(graphics_family);
     present_queue = logical.GetQueue(present_family);
+    if (has_own_sparse_queue) {
+        sparse_queue = logical.GetQueue(sparse_family);
+    }
+    LOG_INFO(Render_Vulkan, "Sparse binds (A/B bit SparseBindAsync): {}",
+             has_own_sparse_queue
+                 ? fmt::format("queue 0 of family {}, apart from the graphics queue", sparse_family)
+             : Common::Nx2Ab::On(Common::Nx2Ab::SparseBindAsync)
+                 ? std::string{"the graphics queue (no other family with sparse binding)"}
+                 : std::string{"the graphics queue (the bit is off)"});
 
 #ifdef EGLANTINE_STREAMLINE
     if (streamline_extensions) {
@@ -1818,6 +1828,16 @@ void Device::SetupFamilies(VkSurfaceKHR surface) {
     present_choice = ChoosePresentQueue(graphics_family, present_family,
                                         queue_family_properties[graphics_family].queueCount,
                                         WantsOwnPresentQueue());
+    // A/B bit SparseBindAsync: sparse binds on a queue of their own where another family has
+    // sparse binding, so that they don't queue behind the frame's work on the graphics queue.
+    if (Common::Nx2Ab::On(Common::Nx2Ab::SparseBindAsync) && features.features.sparseBinding &&
+        graphics_family_sparse_binding) {
+        if (const auto family = ChooseSparseQueueFamily(queue_family_properties, graphics_family,
+                                                        present_family)) {
+            sparse_family = *family;
+            has_own_sparse_queue = true;
+        }
+    }
 }
 
 bool Device::TryReserveCustomBorderColorSamplers(size_t count) const {
@@ -1991,6 +2011,9 @@ std::vector<VkDeviceQueueCreateInfo> Device::GetDeviceQueueCreateInfos() const {
     static constexpr std::array<float, 2> QUEUE_PRIORITIES{1.0f, 1.0f};
 
     ::Common::unordered_set<u32> unique_queue_families{graphics_family, present_family};
+    if (has_own_sparse_queue) {
+        unique_queue_families.insert(sparse_family);
+    }
     std::vector<VkDeviceQueueCreateInfo> queue_cis;
     queue_cis.reserve(unique_queue_families.size());
 

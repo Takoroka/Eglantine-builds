@@ -64,6 +64,7 @@ add_executable(tests
     video_core/method_tally.cpp
     video_core/texture_cache_memory_limit.cpp
     video_core/vram_priority_timestamps.cpp
+    video_core/sparse_bind_batch.cpp
     input_common/calibration_configuration_job.cpp
 )
 
