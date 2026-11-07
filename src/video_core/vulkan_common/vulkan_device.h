@@ -500,6 +500,12 @@ FN_MAX_LIMIT_LIST
         return features.shader_float16_int8.shaderFloat16;
     }
 
+    /// Returns true if game shaders keep their float16 math (EDEN_NX2_FLOAT16=1). Otherwise the
+    /// shader recompiler lowers it to float32.
+    bool IsGuestFloat16Enabled() const {
+        return guest_float16;
+    }
+
     /// Returns true if the device can run shaders built against the Vulkan memory model.
     bool IsVulkanMemoryModelSupported() const {
         return features.vulkan_memory_model.vulkanMemoryModel;
@@ -1349,6 +1355,7 @@ private:
     bool is_integrated{};                      ///< Is GPU an iGPU.
     bool is_virtual{};                         ///< Is GPU a virtual GPU.
     bool is_non_gpu{};                         ///< Is SoftwareRasterizer, FPGA, non-GPU device.
+    bool guest_float16{};                      ///< Game shaders keep float16 (EDEN_NX2_FLOAT16=1).
     bool has_broken_compute{};                 ///< Compute shaders can cause crashes
     bool has_broken_cube_compatibility{};      ///< Has broken cube compatibility bit
     bool has_broken_descriptor_aliasing{};     ///< Miscompiles descriptors aliased on one binding

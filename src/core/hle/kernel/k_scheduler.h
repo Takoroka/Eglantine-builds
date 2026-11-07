@@ -8,6 +8,8 @@
 
 #include <atomic>
 
+#include <boost/container/small_vector.hpp>
+
 #include "common/common_types.h"
 #include "core/hle/kernel/global_scheduler_context.h"
 #include "core/hle/kernel/k_priority_queue.h"
@@ -100,6 +102,13 @@ public:
     static void EnableScheduling(KernelCore& kernel, u64 cores_needing_scheduling);
 
     static u64 UpdateHighestPriorityThreads(KernelCore& kernel);
+
+    /// Host (dummy) threads made runnable under the scheduler lock that are still to be woken.
+    using DummyThreadWakeList = boost::container::small_vector<KThread*, 8>;
+    /// Moves them into out; with the scheduler lock held.
+    static void TakeDummyThreadsToWake(KernelCore& kernel, DummyThreadWakeList& out);
+    /// Wakes them; after the scheduler lock is released.
+    static void WakeDummyThreads(const DummyThreadWakeList& threads);
 
     static void ClearPreviousThread(KernelCore& kernel, KThread* thread);
 

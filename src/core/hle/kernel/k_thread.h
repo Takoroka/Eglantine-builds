@@ -663,6 +663,8 @@ public:
     void RequestDummyThreadWait(KernelCore& kernel);
     void DummyThreadBeginWait(KernelCore& kernel);
     void DummyThreadEndWait(KernelCore& kernel);
+    /// DummyThreadEndWait for after the scheduler lock is released (KScheduler::WakeDummyThreads).
+    void DummyThreadWakeAfterUnlock();
 
     uintptr_t GetArgument() const {
         return m_argument;

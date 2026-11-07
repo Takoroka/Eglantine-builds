@@ -608,6 +608,9 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 #endif
     }
 
+    // Before the workarounds below turn it off (EDEN_NX2_FLOAT16).
+    const bool driver_float16 = features.shader_float16_int8.shaderFloat16;
+
     if (is_nvidia) {
         const auto arch = GetNvidiaArch();
         if (arch >= NvidiaArchitecture::Arch_AmpereOrNewer) {
@@ -671,6 +674,22 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         // Intel's compiler crashes when using fp16 on Astral Chain, disable it for the time being.
         LOG_WARNING(Render_Vulkan, "Intel has broken float16 math");
         features.shader_float16_int8.shaderFloat16 = false;
+    }
+
+    // Game shaders' float16 math is lowered to float32 unless EDEN_NX2_FLOAT16=1 (=0 is the
+    // default): Splatoon Raiders' ink only registered on drivers without float16, and RADV (Steam
+    // Deck) kept it. The device feature stays as the workarounds above leave it, for the present
+    // shaders (FSR, ScaleForce; LSFG frame generation needs it). =1 gives game shaders the
+    // driver's float16, also where a workaround turned it off.
+    const char* const float16_value = std::getenv("EDEN_NX2_FLOAT16");
+    if (float16_value != nullptr && float16_value[0] == '1') {
+        features.shader_float16_int8.shaderFloat16 = driver_float16;
+        guest_float16 = driver_float16;
+        LOG_INFO(Render_Vulkan, "EDEN_NX2_FLOAT16=1: float16 shader math {}",
+                 driver_float16 ? "on" : "off (the driver has no float16)");
+    } else {
+        LOG_INFO(Render_Vulkan, "float16 shader math off (default; EDEN_NX2_FLOAT16=1 to use "
+                                "the driver's float16)");
     }
 
     has_broken_compute =
@@ -1456,8 +1475,12 @@ bool Device::GetSuitability(bool requires_swapchain) {
     // Disable VertexInputDynamicState on old Intel Windows drivers
     if (extensions.vertex_input_dynamic_state) {
         const u32 version = (properties.properties.driverVersion << 3) >> 3;
+        // NVIDIA packs driverVersion as 10 bits major, 8 bits minor, 8 bits secondary and 6 bits
+        // tertiary. Through VK_MAKE_API_VERSION, 580 landed in the 3-bit variant field and every
+        // NVIDIA driver compared as older.
+        constexpr u32 nvidia_580_119_02 = (580u << 22) | (119u << 14) | (2u << 6);
         if ((driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && version < VK_MAKE_API_VERSION(27, 20, 100, 0))
-        || (driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY && version < VK_MAKE_API_VERSION(580, 119, 02, 0))) {
+        || (driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY && properties.properties.driverVersion < nvidia_580_119_02)) {
             LOG_WARNING(Render_Vulkan, "Disabling broken VK_EXT_vertex_input_dynamic_state");
             RemoveExtensionFeature(extensions.vertex_input_dynamic_state, features.vertex_input_dynamic_state, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
         }

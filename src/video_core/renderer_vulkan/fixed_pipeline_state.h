@@ -263,6 +263,10 @@ struct FixedPipelineState {
 
     void Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFeatures& features);
 
+    /// Rewrites a state refreshed without dynamic vertex input as Refresh makes it with it: the
+    /// attribute type classes replace the vertex layout.
+    void ConvertToDynamicVertexInput() noexcept;
+
     size_t Hash() const noexcept;
 
     bool operator==(const FixedPipelineState& rhs) const noexcept;

@@ -13,6 +13,7 @@
 #include <memory>
 #include <span>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 #include <bit>
 #include <numeric>
@@ -568,7 +569,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .max_descriptor_set_storage_images = device.GetMaxDescriptorSetStorageImages(),
         .max_descriptor_set_input_attachements = device.GetMaxDescriptorSetInputAttachments(),
         .support_float64 = device.IsFloat64Supported(),
-        .support_float16 = device.IsFloat16Supported(),
+        .support_float16 = device.IsGuestFloat16Enabled(),
         .support_int64 = device.IsShaderInt64Supported(),
         .needs_demote_reorder = driver_id == VK_DRIVER_ID_AMD_PROPRIETARY ||
                                 driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE ||
@@ -892,6 +893,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         ++state.total;
     }};
     bool loading_mesh_file = false;
+    std::unordered_set<u64> queued_hashes;
     const auto load_graphics{[&](std::ifstream& file, std::vector<FileEnvironment> envs) {
         GraphicsPipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
@@ -903,6 +905,14 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                        env.ShaderStage() == Shader::Stage::Mesh;
             })) {
             return;
+        }
+
+        // Saved without dynamic vertex input (a broken driver version check disabled it on every
+        // NVIDIA driver): rewrite the key as Refresh makes it now instead of dropping the whole
+        // cache. Saved keys that differ only in vertex layout become one pipeline.
+        const u64 saved_hash = key.Hash();
+        if (key.state.dynamic_vertex_input == 0 && dynamic_features.has_dynamic_vertex_input) {
+            key.state.ConvertToDynamicVertexInput();
         }
 
         if ((key.state.extended_dynamic_state != 0) !=
@@ -936,14 +946,19 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         const u64 hash = key.Hash();
         disk_pipelines.insert(hash);
         // Switch 2 titles stutter on pipelines built mid-game, so all of them are built at boot.
+        // The used list of a session before the conversion has the saved keys' hashes.
         if (!PreloadAllPipelines() && !Settings::CurrentProgramIsSwitch2() &&
             (used_pipelines.empty() ? queued_graphics >= MaxPipelinesWithoutUsedList
-                                    : !used_pipelines.contains(hash))) {
+                                    : !used_pipelines.contains(hash) &&
+                                          !used_pipelines.contains(saved_hash))) {
             ++skipped_pipelines;
             if (BackgroundPipelinesEnabled()) {
                 deferred_graphics.emplace_back(key, std::move(envs));
             }
             return;
+        }
+        if (!queued_hashes.insert(hash).second) {
+            return; // Another saved key became this one
         }
         ++queued_graphics;
 

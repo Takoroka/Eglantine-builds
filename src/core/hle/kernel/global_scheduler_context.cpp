@@ -8,6 +8,7 @@
 #include <ranges>
 
 #include "common/assert.h"
+#include "common/nx2_ab.h"
 #include "core/core.h"
 #include "core/hle/kernel/global_scheduler_context.h"
 #include "core/hle/kernel/k_scheduler.h"
@@ -75,6 +76,12 @@ void GlobalSchedulerContext::UnregisterDummyThreadForWakeup(KThread* thread) noe
 
 void GlobalSchedulerContext::WakeupWaitingDummyThreads(KernelCore& kernel) noexcept {
     ASSERT(this->IsLocked());
+    // Each wake is a futex call; made here, every other core waits for the lock through it.
+    // KAbstractSchedulerLock::Unlock takes the list and wakes them once the spin lock is
+    // released (A/B bit 58; off: here, as before). Idea: MythosOfs/Orchid 7c9a94c184.
+    if (Common::Nx2Ab::On(Common::Nx2Ab::WakeAfterUnlock)) {
+        return;
+    }
     if (m_woken_dummy_threads.size() > 0) {
         for (auto* thread : m_woken_dummy_threads)
             thread->DummyThreadEndWait(kernel);

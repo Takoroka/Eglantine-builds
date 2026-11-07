@@ -59,9 +59,17 @@ public:
             const u64 cores_needing_scheduling =
                 SchedulerType::UpdateHighestPriorityThreads(m_kernel);
 
+            // Host threads made runnable under the lock and not woken yet (A/B bit 58): woken
+            // below, once the other cores can take the lock.
+            typename SchedulerType::DummyThreadWakeList dummy_threads;
+            SchedulerType::TakeDummyThreadsToWake(m_kernel, dummy_threads);
+
             // Note that we no longer hold the lock, and unlock the spinlock.
             m_owner_thread = nullptr;
             m_spin_lock.Unlock();
+
+            // Before scheduling: a host thread going to sleep in it must not keep them waiting.
+            SchedulerType::WakeDummyThreads(dummy_threads);
 
             // Enable scheduling, and perform a rescheduling operation.
             SchedulerType::EnableScheduling(m_kernel, cores_needing_scheduling);
@@ -72,6 +80,8 @@ private:
     friend class GlobalSchedulerContext;
 
     KernelCore& m_kernel;
+    // On a cache line of its own (KAlignedSpinLock), so the count and owner the holder writes
+    // start the next line.
     KAlignedSpinLock m_spin_lock{};
     s32 m_lock_count{};
     std::atomic<KThread*> m_owner_thread{};
