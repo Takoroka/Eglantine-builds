@@ -65,6 +65,10 @@ enum Feature : u64 {
     // lockless_exclusive_monitor). Read when a core's JIT is made. Changes little under
     // Auto CPU accuracy, which already skips the lock (Unsafe_IgnoreGlobalMonitor).
     LockFreeMonitor = 1ull << 25,
+    // frontprep (11-06, play-dkb8 idea 26 step 2, narrowed): an NVN2 draw-loop macro call whose
+    // six parameters are known draws its N >= 2 instances in one draw: the first End holds its
+    // instance for the loop's batch, which covers it (Tegra::Engines::InstanceLoopHold).
+    DrawLoopOneDraw = 1ull << 17,
     // fences (11-05): direct draws with no vertices or no instances skip the draw setup.
     ZeroDrawSkip = 1ull << 40,
     // vkoff (11-05): draws with none of the dynamic states' dirty flags set skip their updates.

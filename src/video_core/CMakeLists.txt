@@ -48,6 +48,7 @@ add_library(video_core STATIC
     engines/engine_interface.h
     engines/engine_upload.cpp
     engines/engine_upload.h
+    engines/instance_loop_hold.h
     engines/fermi_2d.cpp
     engines/fermi_2d.h
     engines/kepler_compute.cpp

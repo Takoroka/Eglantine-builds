@@ -70,6 +70,7 @@ add_executable(tests
     video_core/front_pipeline_key.cpp
     video_core/pipeline_cache_migration.cpp
     video_core/sparse_bind_batch.cpp
+    video_core/instance_loop_hold.cpp
     input_common/calibration_configuration_job.cpp
 )
 
