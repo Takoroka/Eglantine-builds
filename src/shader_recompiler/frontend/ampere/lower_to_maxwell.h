@@ -1876,11 +1876,15 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             }
             const bool target_between = std::any_of(relocations.begin(), relocations.end(),
                 [&](const Relocation& relocation) { return relocation.target > compare && relocation.target <= index; });
+            // The clamp's UISETP.GT.U32 may write any uniform predicate (Pokopia's sky shader uses
+            // UP1): the USEL must read the one it writes (bits 81-83 of the compare, 87-89 here).
+            const u32 compare_predicate = compare < index ? code[compare].Bits(81, 3) : 7U;
             if (opcode == 0x887 && native_predicate == 7 && compare < index && !target_between &&
-                condition == 0 && insn.words[1] <= 0x7ffff &&
+                condition == compare_predicate && insn.words[1] <= 0x7ffff &&
                 code[compare].Bits(12, 4) == 7 && code[compare].Bits(24, 8) == insn.Bits(24, 8) &&
-                code[compare].words[1] == insn.words[1] && code[compare].words[2] == 0x0bf01070 &&
-                insn.words[2] == 0x08000000) {
+                code[compare].words[1] == insn.words[1] &&
+                (code[compare].words[2] & ~(7U << 17)) == 0x0bf01070 &&
+                (insn.words[2] & ~(7U << 23)) == 0x08000000) {
                 // Preserve the unsigned clamp idiom for indirect-table analysis.
                 emit(0x3820000000070000ULL | target | (u64{a} << 8) |
                      (u64{insn.words[1]} << 20) | (u64{7} << 39));
