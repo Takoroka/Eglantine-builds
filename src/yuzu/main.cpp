@@ -11,6 +11,7 @@
 
 #include "common/fs/fs_paths.h"
 #include "common/fs/path_util.h"
+#include "common/thread.h"
 #include "startup_checks.h"
 
 #if YUZU_ROOM
@@ -162,6 +163,12 @@ static void LoadNx2Switches(const char* argv0) {
 }
 
 int main(int argc, char* argv[]) {
+#ifdef _WIN32
+    // The Qt main thread (event loop, input pump, UI): profilers and thread lists showed it as an
+    // unnamed thread. Windows only: on Linux and macOS the main thread's name is the process name
+    // that ps, top and pkill go by.
+    Common::SetCurrentThreadName("QtMain");
+#endif
     LoadNx2Switches(argv[0]);
 #if YUZU_ROOM
     bool launch_room = false;
