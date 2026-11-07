@@ -256,7 +256,9 @@ public:
     void PushGPUEntries(s32 channel, Tegra::CommandList&& entries);
 
     /// Notify rasterizer that any caches of the specified region should be flushed to Switch memory
-    [[nodiscard]] VideoCore::RasterizerDownloadArea OnCPURead(DAddr addr, u64 size);
+    /// (`flushed`, if given: whether this read flushed GPU data).
+    [[nodiscard]] VideoCore::RasterizerDownloadArea OnCPURead(DAddr addr, u64 size,
+                                                              bool* flushed = nullptr);
 
     /// Notify rasterizer that any caches of the specified region should be flushed to Switch memory
     void FlushRegion(DAddr addr, u64 size);

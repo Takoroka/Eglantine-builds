@@ -25,6 +25,7 @@
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/guest_memory.h"
+#include "video_core/guest_read_areas.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/samples_helper.h"
@@ -3083,6 +3084,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             continue;
         }
         if (True(overlap.flags & ImageFlagBits::GpuModified)) {
+            if (False(new_image.flags & ImageFlagBits::GpuModified)) {
+                VideoCore::BumpGuestReadEpoch();
+            }
             new_image.flags |= ImageFlagBits::GpuModified;
             const auto& resolution = Settings::values.resolution_info;
             const SubresourceBase base = new_image.TryFindBase(overlap.gpu_addr).value();
@@ -3858,6 +3862,10 @@ void TextureCache<P>::RemoveFramebuffers(std::span<const ImageViewId> removed_vi
 
 template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
+    if (False(image.flags & ImageFlagBits::GpuModified)) {
+        // Guest reads of its pages ask GetFlushArea again (GuestReadAreaTable).
+        VideoCore::BumpGuestReadEpoch();
+    }
     image.flags |= ImageFlagBits::GpuModified;
     image.modification_tick = ++modification_tick;
     if (!image.aliased_images.empty()) {
@@ -3925,6 +3933,9 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     image.modification_tick = most_recent_tick;
     RaiseAliasTickBounds(image);
     if (any_modified) {
+        if (False(image.flags & ImageFlagBits::GpuModified)) {
+            VideoCore::BumpGuestReadEpoch();
+        }
         image.flags |= ImageFlagBits::GpuModified;
     }
     std::ranges::sort(aliased_images, [this](const AliasedImage* lhs, const AliasedImage* rhs) {

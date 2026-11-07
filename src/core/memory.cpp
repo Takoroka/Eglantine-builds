@@ -7,12 +7,14 @@
 
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <mutex>
 #include <set>
 #include <span>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -23,6 +25,7 @@
 #include "common/common_types.h"
 #include "common/heap_tracker.h"
 #include "common/logging.h"
+#include "common/nx2_ab.h"
 #include "common/page_table.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -35,6 +38,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/memory.h"
 #include "video_core/gpu.h"
+#include "video_core/guest_read_areas.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/rasterizer_download_area.h"
@@ -50,6 +54,13 @@ static inline bool AddressSpaceContains(const Common::PageTable& table, const Co
     const Common::ProcessAddress max_addr = 1ULL << table.GetAddressSpaceBits();
     return addr + size >= addr && addr + size <= max_addr;
 }
+
+// EDEN_NX2_READ_AREA_VERIFY=1: reads a remembered area answers ask GetFlushArea too
+// (Impl::VerifyReadAreaHit).
+static const bool read_area_verify = [] {
+    const char* const value = std::getenv("EDEN_NX2_READ_AREA_VERIFY");
+    return value != nullptr && value[0] == '1';
+}();
 
 // Implementation class used to keep the specifics of the memory subsystem hidden
 // from outside classes. This also allows modification to the internals of the memory
@@ -833,6 +844,27 @@ struct Memory::Impl {
         return true;
     }
 
+    /// A core's guest read areas (A/B bit 3 GuestReadAreas) and its "Guest read areas" counters
+    /// (only its core writes them; hits_newest and misses count without the bit too).
+    struct alignas(64) ReadAreaSlot {
+        VideoCore::GuestReadAreaTable table;
+        std::atomic<u64> hits_newest{};
+        std::atomic<u64> hits_older{};
+        std::atomic<u64> misses{};
+        std::atomic<u64> verified{};
+        std::atomic<u64> mismatches_newest{};
+        std::atomic<u64> mismatches_older{};
+    };
+    struct ReadAreaTotals {
+        u64 hits_newest{};
+        u64 hits_older{};
+        u64 misses{};
+        u64 verified{};
+        u64 mismatches_newest{};
+        u64 mismatches_older{};
+        u64 non_core{};
+    };
+
     void HandleRasterizerDownload(VAddr v_address, size_t size) {
         const auto* p = GetPointerImpl(
             v_address, []() {}, []() {});
@@ -851,11 +883,17 @@ struct Memory::Impl {
                 DisarmReadTraps(v_address, size);
                 (void)system.GPU().OnCPURead(address, size);
             });
+            non_core_reads.fetch_add(1, std::memory_order_relaxed);
             return;
         }
+        ReadAreaSlot& slot = read_area_slots[core];
         auto& current_area = rasterizer_read_areas[core];
-        if (const u64 generation = read_trap_generation.load(std::memory_order_acquire);
-            read_area_generations[core] != generation) {
+        const u64 generation = read_trap_generation.load(std::memory_order_acquire);
+        if (Common::Nx2Ab::On(Common::Nx2Ab::GuestReadAreas)) {
+            HandleRasterizerDownloadAreas(slot, core, generation, v_address, p, size);
+            return;
+        }
+        if (read_area_generations[core] != generation) {
             current_area = {};
             read_area_generations[core] = generation;
         }
@@ -863,11 +901,126 @@ struct Memory::Impl {
             const DAddr end_address = address + size;
             if (current_area.start_address <= address && end_address <= current_area.end_address)
                 [[likely]] {
+                CountReadAreaHit(slot.hits_newest);
                 return;
             }
             DisarmReadTraps(v_address, size);
             current_area = system.GPU().OnCPURead(address, size);
+            CountRead(slot.misses);
+            MaybeLogReadAreas();
         });
+    }
+
+    /// HandleRasterizerDownload with A/B bit 3 GuestReadAreas: up to 8 areas per core.
+    void HandleRasterizerDownloadAreas(ReadAreaSlot& slot, size_t core, u64 generation,
+                                       VAddr v_address, const u8* p, size_t size) {
+        slot.table.Restamp({
+            .trap_generation = generation,
+            .image_epoch = VideoCore::g_guest_read_epoch.load(std::memory_order_acquire),
+            .ab_epoch = Common::Nx2Ab::Epoch(),
+        });
+        gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
+            const DAddr end_address = address + size;
+            using Hit = VideoCore::GuestReadAreaTable::Hit;
+            if (const Hit hit = slot.table.Find(address, end_address); hit != Hit::None) [[likely]] {
+                CountReadAreaHit(hit == Hit::Newest ? slot.hits_newest : slot.hits_older);
+                if (read_area_verify) [[unlikely]] {
+                    VerifyReadAreaHit(slot, hit == Hit::Older, v_address, address, size);
+                }
+                return;
+            }
+            DisarmReadTraps(v_address, size);
+            const VideoCore::RasterizerDownloadArea area = system.GPU().OnCPURead(address, size);
+            slot.table.Insert(area);
+            // The single area as the path without the bit has it now, should the bit turn off.
+            rasterizer_read_areas[core] = area;
+            read_area_generations[core] = generation;
+            CountRead(slot.misses);
+            MaybeLogReadAreas();
+        });
+    }
+
+    /// EDEN_NX2_READ_AREA_VERIFY=1: a read a remembered area answered asks GetFlushArea too (and
+    /// flushes as a miss would). A flush there is a mismatch: the area skipped GPU data.
+    void VerifyReadAreaHit(ReadAreaSlot& slot, bool older, VAddr v_address, DAddr address,
+                           size_t size) {
+        DisarmReadTraps(v_address, size);
+        bool flushed = false;
+        (void)system.GPU().OnCPURead(address, size, &flushed);
+        CountRead(slot.verified);
+        if (!flushed) {
+            return;
+        }
+        CountRead(older ? slot.mismatches_older : slot.mismatches_newest);
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+            LOG_WARNING(HW_Memory,
+                        "Guest read areas verify: read [{:#x}, {:#x}) answered by the {} area "
+                        "needed a flush",
+                        address, address + size, older ? "an older" : "newest");
+        }
+    }
+
+    /// A counter only its core writes.
+    static void CountRead(std::atomic<u64>& counter) noexcept {
+        counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    }
+
+    void CountReadAreaHit(std::atomic<u64>& counter) {
+        const u64 count = counter.load(std::memory_order_relaxed) + 1;
+        counter.store(count, std::memory_order_relaxed);
+        if ((count & 0xffff) == 0) [[unlikely]] {
+            MaybeLogReadAreas();
+        }
+    }
+
+    /// "Guest read areas" line, every 30 s at most (on misses, and every 65536 hits of a core).
+    void MaybeLogReadAreas() {
+        using namespace std::chrono;
+        const s64 now = duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+        s64 next = next_read_area_log.load(std::memory_order_relaxed);
+        if (now < next ||
+            !next_read_area_log.compare_exchange_strong(next, now + duration_cast<nanoseconds>(30s).count(),
+                                                        std::memory_order_relaxed)) {
+            return;
+        }
+        // Only this thread is here until the next window.
+        ReadAreaTotals totals{};
+        for (const ReadAreaSlot& s : read_area_slots) {
+            totals.hits_newest += s.hits_newest.load(std::memory_order_relaxed);
+            totals.hits_older += s.hits_older.load(std::memory_order_relaxed);
+            totals.misses += s.misses.load(std::memory_order_relaxed);
+            totals.verified += s.verified.load(std::memory_order_relaxed);
+            totals.mismatches_newest += s.mismatches_newest.load(std::memory_order_relaxed);
+            totals.mismatches_older += s.mismatches_older.load(std::memory_order_relaxed);
+        }
+        totals.non_core = non_core_reads.load(std::memory_order_relaxed);
+        const ReadAreaTotals last = std::exchange(last_read_area_totals, totals);
+        const s64 start = std::exchange(last_read_area_log, now);
+        if (start == 0) {
+            return; // The first window starts here.
+        }
+        const double seconds = static_cast<double>(now - start) / 1e9;
+        const auto rate = [seconds](u64 value, u64 before) {
+            return static_cast<double>(value - before) / seconds;
+        };
+        std::string verify;
+        if (read_area_verify) {
+            verify = fmt::format("; verify: {} checked, {} needed a flush ({} newest area, {} older)",
+                                 totals.verified - last.verified,
+                                 (totals.mismatches_newest - last.mismatches_newest) +
+                                     (totals.mismatches_older - last.mismatches_older),
+                                 totals.mismatches_newest - last.mismatches_newest,
+                                 totals.mismatches_older - last.mismatches_older);
+        }
+        LOG_INFO(HW_Memory,
+                 "Guest read areas (bit 3 {}) {:.0f} s: {:.0f}/s answered by a remembered area "
+                 "({:.0f}/s by an older one), {:.0f}/s missed (GetFlushArea), {:.0f}/s from "
+                 "threads that are not cores{}",
+                 Common::Nx2Ab::On(Common::Nx2Ab::GuestReadAreas) ? "on" : "off", seconds,
+                 rate(totals.hits_newest + totals.hits_older, last.hits_newest + last.hits_older),
+                 rate(totals.hits_older, last.hits_older), rate(totals.misses, last.misses),
+                 rate(totals.non_core, last.non_core), verify);
     }
 
     void HandleRasterizerWrite(VAddr v_address, size_t size) {
@@ -941,6 +1094,11 @@ struct Memory::Impl {
     std::array<VideoCore::RasterizerDownloadArea, Core::Hardware::NUM_CPU_CORES> rasterizer_read_areas{};
     std::array<u64, Core::Hardware::NUM_CPU_CORES> read_area_generations{};
     std::atomic<u64> read_trap_generation{};
+    std::array<ReadAreaSlot, Core::Hardware::NUM_CPU_CORES> read_area_slots{};
+    std::atomic<u64> non_core_reads{};
+    std::atomic<s64> next_read_area_log{};
+    s64 last_read_area_log{}; ///< Written by the thread whose MaybeLogReadAreas took the window
+    ReadAreaTotals last_read_area_totals{};
     std::set<u64> armed_read_traps;
     std::atomic<size_t> armed_read_trap_count{};
     std::mutex read_trap_mutex;
