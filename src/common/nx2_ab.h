@@ -165,6 +165,11 @@ enum Feature : u64 {
     // briefly (precise wait on the core's event), and SEV/SEVL and interrupts end it
     // (Core::WfePark). A set event register still returns at once.
     WfePark = 1ull << 24,
+    // backperf (11-06, play-dkb8 idea 30b): a guest read of a cached page that needed no flush
+    // gives the page back to direct reads (its marked bit cleared; JIT stores test
+    // PageTable::WRITE_MARKED_MASK, so writes still trap) until the GPU writes it again. With
+    // bit 3 only (its read path). Bit forced off: the JITs don't check the store mask at all.
+    FastmemRestore = 1ull << 18,
 };
 
 inline const u64 g_mask = [] {

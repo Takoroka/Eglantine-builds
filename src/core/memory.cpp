@@ -12,6 +12,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <mutex>
+#include <map>
+#include <optional>
 #include <set>
 #include <span>
 #include <string>
@@ -62,13 +64,43 @@ static const bool read_area_verify = [] {
     return value != nullptr && value[0] == '1';
 }();
 
+// EDEN_NX2_FASTMEM_RESTORE_VERIFY=1: Impl::VerifyRestoredPages.
+static const bool fastmem_restore_verify = [] {
+    const char* const value = std::getenv("EDEN_NX2_FASTMEM_RESTORE_VERIFY");
+    return value != nullptr && value[0] == '1';
+}();
+
+// A/B bit 18 FastmemRestore: a JIT was configured to send stores to pages with
+// WRITE_MARKED_MASK bits to the callbacks (TakeFastmemRestoreMask), so pages may be restored.
+static std::atomic<bool> fastmem_restore_jits{false};
+
+std::optional<u64> TakeFastmemRestoreMask() {
+#ifdef ARCHITECTURE_x86_64
+    // Not with the bit off for the whole run: then no JIT checks the mask, and none may need to.
+    // A/B phases may turn it off later; the JITs keep checking (stores only, cheap).
+    if ((Common::Nx2Ab::g_forced_off & Common::Nx2Ab::FastmemRestore) == 0) {
+        fastmem_restore_jits.store(true, std::memory_order_relaxed);
+        return Common::PageTable::WRITE_MARKED_MASK;
+    }
+#endif
+    return std::nullopt;
+}
+
 // Implementation class used to keep the specifics of the memory subsystem hidden
 // from outside classes. This also allows modification to the internals of the memory
 // subsystem without needing to rebuild all files that make use of the memory interface.
 struct Memory::Impl {
     explicit Impl(Core::System& system_) : system{system_} {}
 
+    ~Impl() {
+        // The page table may be gone already: only the global count follows.
+        VideoCore::g_restored_read_pages.fetch_sub(restored_count.load(), std::memory_order_seq_cst);
+    }
+
     void SetCurrentPageTable(Kernel::KProcess& process) {
+        if (current_page_table != nullptr) {
+            RemarkAllRestored(); // They are the old table's entries.
+        }
         current_page_table = &process.GetPageTable().GetImpl();
 
         if (process.IsApplication() && Settings::IsFastmemEnabled()) {
@@ -491,6 +523,9 @@ struct Memory::Impl {
         if (vaddr == 0 || !AddressSpaceContains(*current_page_table, vaddr, size)) {
             return;
         }
+        // Pages restored to direct reads (A/B bit 18) are marked again here: cached anew, or
+        // uncached below (both start from a marked entry).
+        RemarkRestored(vaddr, size);
 
         if (current_page_table->fastmem_arena) {
             Common::MemoryPermission perm{};
@@ -589,9 +624,15 @@ struct Memory::Impl {
 
     void RasterizerArmReadTraps(u64 vaddr, u64 size) {
         // Clean cached read areas also need invalidation when reactive flushing is enabled.
-        read_trap_generation.fetch_add(1, std::memory_order_release);
-        if (vaddr == 0 || size == 0 || !AddressSpaceContains(*current_page_table, vaddr, size) ||
-            !ReadTrapsEnabled()) {
+        // Sequentially consistent with TryRestorePage's count and stamp (A/B bit 18).
+        read_trap_generation.fetch_add(1, std::memory_order_seq_cst);
+        if (vaddr == 0 || size == 0 || !AddressSpaceContains(*current_page_table, vaddr, size)) {
+            return;
+        }
+        // The GPU wrote these pages: those restored to direct reads take the rasterizer path
+        // again, whether or not read traps are on.
+        RemarkRestored(vaddr, size);
+        if (!ReadTrapsEnabled()) {
             return;
         }
         const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
@@ -671,6 +712,11 @@ struct Memory::Impl {
 
         const auto end = base + size;
         ASSERT_MSG(end <= page_table.entries.size(), "out of range mapping at {:016X}", base + page_table.entries.size());
+        // Pages restored to direct reads (A/B bit 18) are forgotten before their entries change
+        // (an unmap may decommit that part of the table).
+        if (&page_table == current_page_table) {
+            RemarkRestored(base << YUZU_PAGEBITS, size << YUZU_PAGEBITS);
+        }
 
         if (!target) {
             ASSERT_MSG(type != Common::PageType::Memory,
@@ -707,14 +753,19 @@ struct Memory::Impl {
         }
     }
 
-    template<typename F, typename G>
+    /// IsWrite: a cached page restored to direct reads (A/B bit 18, unmarked but still of the
+    /// rasterizer-cached type) takes the rasterizer path for writes, as the JITs' stores do.
+    template<bool IsWrite = false, typename F, typename G>
     [[nodiscard]] u8* GetPointerImpl(u64 vaddr, F&& on_unmapped, G&& on_rasterizer) const {
         // AARCH64 masks the upper 16 bit of all memory accesses
         vaddr &= 0xffffffffffffULL;
         if (AddressSpaceContains(*current_page_table, vaddr, 1)) [[likely]] {
             // Avoid adding any extra logic to this fast-path block
             const auto raw = current_page_table->entries[vaddr >> YUZU_PAGEBITS].Raw();
-            if (auto pointer = Common::PageTable::PageEntryData::ExtractPointer(raw); pointer) [[likely]] {
+            if (auto pointer = Common::PageTable::PageEntryData::ExtractPointer(raw);
+                pointer &&
+                (!IsWrite || static_cast<Common::PageType>(raw.type) !=
+                                 Common::PageType::RasterizerCachedMemory)) [[likely]] {
                 return reinterpret_cast<u8*>(pointer + vaddr);
             } else {
                 switch (static_cast<Common::PageType>(raw.type)) {
@@ -809,7 +860,7 @@ struct Memory::Impl {
     template <typename T>
     inline void Write(Common::ProcessAddress vaddr, const T data) noexcept requires(std::is_trivially_copyable_v<T>) {
         const u64 addr = GetInteger(vaddr);
-        if (auto const ptr = GetPointerImpl(addr, [addr, data]() {
+        if (auto const ptr = GetPointerImpl<true>(addr, [addr, data]() {
             LOG_ERROR(HW_Memory, "Unmapped Write{} @ {:#016x} = {:#016x}", sizeof(T) * 8, addr, u64(data));
         }, [&]() { HandleRasterizerWrite(addr, sizeof(T)); }); ptr) [[likely]]
             std::memcpy(ptr, &data, sizeof(T));
@@ -817,7 +868,7 @@ struct Memory::Impl {
 
     template <typename T>
     bool WriteExclusive(Common::ProcessAddress vaddr, const T data, const T expected) {
-        u8* const ptr = GetPointerImpl(
+        u8* const ptr = GetPointerImpl<true>(
             GetInteger(vaddr),
             [vaddr, data]() {
                 LOG_ERROR(HW_Memory, "Unmapped WriteExclusive{} @ {:#016x} = {:#016x}",
@@ -831,7 +882,7 @@ struct Memory::Impl {
     }
 
     bool WriteExclusive128(Common::ProcessAddress vaddr, const u128 data, const u128 expected) {
-        u8* const ptr = GetPointerImpl(
+        u8* const ptr = GetPointerImpl<true>(
             GetInteger(vaddr),
             [vaddr, data]() {
                 LOG_ERROR(HW_Memory, "Unmapped WriteExclusive128 @ {:#016x} = {:#016x}{:016X}",
@@ -914,11 +965,16 @@ struct Memory::Impl {
     /// HandleRasterizerDownload with A/B bit 3 GuestReadAreas: up to 8 areas per core.
     void HandleRasterizerDownloadAreas(ReadAreaSlot& slot, size_t core, u64 generation,
                                        VAddr v_address, const u8* p, size_t size) {
-        slot.table.Restamp({
+        const VideoCore::GuestReadAreaTable::Stamp stamp{
             .trap_generation = generation,
             .image_epoch = VideoCore::g_guest_read_epoch.load(std::memory_order_acquire),
             .ab_epoch = Common::Nx2Ab::Epoch(),
-        });
+        };
+        slot.table.Restamp(stamp);
+        const bool restore = FastmemRestoreActive();
+        if (!restore && restored_count.load(std::memory_order_relaxed) != 0) [[unlikely]] {
+            RemarkAllRestored(); // The bit turned off.
+        }
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
             const DAddr end_address = address + size;
             using Hit = VideoCore::GuestReadAreaTable::Hit;
@@ -927,17 +983,164 @@ struct Memory::Impl {
                 if (read_area_verify) [[unlikely]] {
                     VerifyReadAreaHit(slot, hit == Hit::Older, v_address, address, size);
                 }
+                if (restore) {
+                    TryRestorePage(v_address, size, address, stamp);
+                }
                 return;
             }
             DisarmReadTraps(v_address, size);
-            const VideoCore::RasterizerDownloadArea area = system.GPU().OnCPURead(address, size);
+            bool flushed = false;
+            const VideoCore::RasterizerDownloadArea area =
+                system.GPU().OnCPURead(address, size, &flushed);
             slot.table.Insert(area);
             // The single area as the path without the bit has it now, should the bit turn off.
             rasterizer_read_areas[core] = area;
             read_area_generations[core] = generation;
             CountRead(slot.misses);
+            if (restore && !flushed) {
+                TryRestorePage(v_address, size, address, stamp);
+            }
+            if (restore && fastmem_restore_verify) [[unlikely]] {
+                VerifyRestoredPages();
+            }
             MaybeLogReadAreas();
         });
+    }
+
+    /// A/B bit 18 FastmemRestore: on with JITs that check WRITE_MARKED_MASK for stores.
+    bool FastmemRestoreActive() const {
+        return fastmem_restore_jits.load(std::memory_order_relaxed) &&
+               Common::Nx2Ab::On(Common::Nx2Ab::FastmemRestore);
+    }
+
+    /// A/B bit 18 FastmemRestore: a read that needed no flush, by an answer valid for `stamp`,
+    /// gives its page back to direct reads (UnmarkCachedReads: writes still trap) until the GPU
+    /// writes it again: a read trap armed (RasterizerArmReadTraps), an image becoming
+    /// GPU-modified there (RasterizerRemarkRestoredReads) or the page cached anew or uncached.
+    /// Those are the events the stamp counts: the read areas' rule (bit 3), for the page alone.
+    void TryRestorePage(VAddr v_address, size_t size, DAddr address,
+                        const VideoCore::GuestReadAreaTable::Stamp& stamp) {
+        const u64 vpage = v_address >> YUZU_PAGEBITS;
+        if (((v_address + size - 1) >> YUZU_PAGEBITS) != vpage ||
+            !AddressSpaceContains(*current_page_table, v_address, size)) {
+            return;
+        }
+        // Through the committed-aware accessor first: GetUnchecked indexes the reserve directly.
+        const auto& peek = std::as_const(current_page_table->entries)[vpage];
+        if (peek.CachedReadsUnmarked() || peek.Type() != Common::PageType::RasterizerCachedMemory) {
+            return;
+        }
+        auto& entry = current_page_table->entries.GetUnchecked(vpage);
+        std::scoped_lock lock{restored_mutex};
+        // Counted before the stamp is read again, and the GPU-write events bump the stamp before
+        // they read the count (all sequentially consistent): either this sees the new stamp, or
+        // the event sees the count, waits for the lock and marks the page again.
+        restored_count.fetch_add(1, std::memory_order_seq_cst);
+        VideoCore::g_restored_read_pages.fetch_add(1, std::memory_order_seq_cst);
+        const VideoCore::GuestReadAreaTable::Stamp now{
+            .trap_generation = read_trap_generation.load(std::memory_order_seq_cst),
+            .image_epoch = VideoCore::g_guest_read_epoch.load(std::memory_order_seq_cst),
+            .ab_epoch = Common::Nx2Ab::Epoch(),
+        };
+        bool restored = now == stamp;
+        if (restored && armed_read_trap_count.load(std::memory_order_relaxed) != 0) {
+            std::scoped_lock trap_lock{read_trap_mutex};
+            restored = !armed_read_traps.contains(vpage);
+        }
+        if (restored && entry.UnmarkCachedReads()) {
+            fastmem_restore_stats.restored.fetch_add(1, std::memory_order_relaxed);
+            if (restored_pages.insert_or_assign(vpage, address >> YUZU_PAGEBITS).second) {
+                return; // Counted above.
+            }
+            // Listed already (marked again since, without RemarkRestored): counted then.
+        } else {
+            fastmem_restore_stats.aborted.fetch_add(1, std::memory_order_relaxed);
+        }
+        restored_count.fetch_sub(1, std::memory_order_seq_cst);
+        VideoCore::g_restored_read_pages.fetch_sub(1, std::memory_order_seq_cst);
+    }
+
+    /// A listed page back to the rasterizer path, if its entry still is a restored one (it may have
+    /// been unmapped, its part of the table decommitted: the const accessor reads zero there).
+    void RemarkPage(u64 vpage) {
+        if (std::as_const(current_page_table->entries)[vpage].CachedReadsUnmarked()) {
+            (void)current_page_table->entries.GetUnchecked(vpage).MarkCachedReads();
+        }
+    }
+
+    /// The pages of [vaddr, vaddr + size) restored to direct reads take the rasterizer path again.
+    void RemarkRestored(u64 vaddr, u64 size) {
+        if (restored_count.load(std::memory_order_seq_cst) == 0 || size == 0) {
+            return;
+        }
+        std::scoped_lock lock{restored_mutex};
+        const u64 first = vaddr >> YUZU_PAGEBITS;
+        const u64 last = (vaddr + size - 1) >> YUZU_PAGEBITS;
+        for (auto it = restored_pages.lower_bound(first);
+             it != restored_pages.end() && it->first <= last;) {
+            RemarkPage(it->first);
+            it = restored_pages.erase(it);
+            restored_count.fetch_sub(1, std::memory_order_seq_cst);
+            VideoCore::g_restored_read_pages.fetch_sub(1, std::memory_order_seq_cst);
+            fastmem_restore_stats.remarked.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    void RemarkAllRestored() {
+        if (restored_count.load(std::memory_order_seq_cst) == 0) {
+            return;
+        }
+        std::scoped_lock lock{restored_mutex};
+        for (const auto& [vpage, dpage] : restored_pages) {
+            RemarkPage(vpage);
+        }
+        const u64 count = restored_pages.size();
+        restored_pages.clear();
+        restored_count.fetch_sub(count, std::memory_order_seq_cst);
+        VideoCore::g_restored_read_pages.fetch_sub(count, std::memory_order_seq_cst);
+        fastmem_restore_stats.remarked.fetch_add(count, std::memory_order_relaxed);
+    }
+
+    /// EDEN_NX2_FASTMEM_RESTORE_VERIFY=1: about once a second, up to 64 restored pages ask
+    /// GetFlushArea (flushing as a miss would). A flush there is a mismatch: the page read
+    /// directly while the GPU held newer data. It takes the rasterizer path again.
+    void VerifyRestoredPages() {
+        using namespace std::chrono;
+        const s64 now = duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+        s64 next = next_restore_verify.load(std::memory_order_relaxed);
+        if (now < next || !next_restore_verify.compare_exchange_strong(
+                              next, now + duration_cast<nanoseconds>(1s).count(),
+                              std::memory_order_relaxed)) {
+            return;
+        }
+        std::vector<std::pair<u64, u64>> pages;
+        pages.reserve(64);
+        {
+            std::scoped_lock lock{restored_mutex};
+            for (const auto& page : restored_pages) {
+                if (pages.size() == 64) {
+                    break;
+                }
+                pages.push_back(page);
+            }
+        }
+        for (const auto& [vpage, dpage] : pages) {
+            bool flushed = false;
+            (void)system.GPU().OnCPURead(dpage << YUZU_PAGEBITS, YUZU_PAGESIZE, &flushed);
+            fastmem_restore_stats.verified.fetch_add(1, std::memory_order_relaxed);
+            if (!flushed) {
+                continue;
+            }
+            fastmem_restore_stats.mismatched.fetch_add(1, std::memory_order_relaxed);
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                LOG_WARNING(HW_Memory,
+                            "Fastmem restore verify: restored page {:#x} (device {:#x}) needed a "
+                            "flush",
+                            vpage << YUZU_PAGEBITS, dpage << YUZU_PAGEBITS);
+            }
+            RemarkRestored(vpage << YUZU_PAGEBITS, YUZU_PAGESIZE);
+        }
     }
 
     /// EDEN_NX2_READ_AREA_VERIFY=1: a read a remembered area answered asks GetFlushArea too (and
@@ -1021,6 +1224,42 @@ struct Memory::Impl {
                  rate(totals.hits_newest + totals.hits_older, last.hits_newest + last.hits_older),
                  rate(totals.hits_older, last.hits_older), rate(totals.misses, last.misses),
                  rate(totals.non_core, last.non_core), verify);
+        // A/B bit 18 FastmemRestore, same window.
+        const auto load = [](const std::atomic<u64>& counter) {
+            return counter.load(std::memory_order_relaxed);
+        };
+        const FastmemRestoreTotals restore{
+            .restored = load(fastmem_restore_stats.restored),
+            .aborted = load(fastmem_restore_stats.aborted),
+            .remarked = load(fastmem_restore_stats.remarked),
+            .verified = load(fastmem_restore_stats.verified),
+            .mismatched = load(fastmem_restore_stats.mismatched),
+        };
+        const FastmemRestoreTotals restore_last = std::exchange(last_restore_totals, restore);
+        std::string restore_verify;
+        if (fastmem_restore_verify) {
+            restore_verify = fmt::format("; verify: {} checked, {} needed a flush",
+                                         restore.verified - restore_last.verified,
+                                         restore.mismatched - restore_last.mismatched);
+        }
+        LOG_INFO(HW_Memory,
+                 "Fastmem restore (bit 18 {}, JIT store check {}) {:.0f} s: {:.0f} pages/s back "
+                 "to direct reads, {:.0f}/s not (the GPU wrote meanwhile, or a read trap), "
+                 "{:.0f}/s back to the rasterizer path, {} restored now{}",
+                 FastmemRestoreActive() ? "on" : "off",
+                 fastmem_restore_jits.load(std::memory_order_relaxed) ? "on" : "off", seconds,
+                 rate(restore.restored, restore_last.restored),
+                 rate(restore.aborted, restore_last.aborted),
+                 rate(restore.remarked, restore_last.remarked),
+                 restored_count.load(std::memory_order_relaxed), restore_verify);
+    }
+
+    /// Public RasterizerRemarkRestoredReads (an image became GPU-modified).
+    void RasterizerRemarkRestoredReads(u64 vaddr, u64 size) {
+        if (vaddr == 0 || !AddressSpaceContains(*current_page_table, vaddr, size)) {
+            return;
+        }
+        RemarkRestored(vaddr, size);
     }
 
     void HandleRasterizerWrite(VAddr v_address, size_t size) {
@@ -1096,6 +1335,22 @@ struct Memory::Impl {
     std::atomic<u64> read_trap_generation{};
     std::array<ReadAreaSlot, Core::Hardware::NUM_CPU_CORES> read_area_slots{};
     std::atomic<u64> non_core_reads{};
+    /// A/B bit 18 FastmemRestore: cached pages read directly (TryRestorePage), virtual page ->
+    /// the device page of the read that restored it (for the verify env), and their counters.
+    std::map<u64, u64> restored_pages;
+    std::mutex restored_mutex;
+    std::atomic<u64> restored_count{}; ///< restored_pages.size(), read without the lock
+    std::atomic<s64> next_restore_verify{};
+    struct FastmemRestoreStats {
+        std::atomic<u64> restored{};
+        std::atomic<u64> aborted{};  ///< The stamp moved, a read trap is armed, or not a marked page
+        std::atomic<u64> remarked{}; ///< Back to the rasterizer path
+        std::atomic<u64> verified{};
+        std::atomic<u64> mismatched{};
+    } fastmem_restore_stats;
+    struct FastmemRestoreTotals {
+        u64 restored{}, aborted{}, remarked{}, verified{}, mismatched{};
+    } last_restore_totals{};
     std::atomic<s64> next_read_area_log{};
     s64 last_read_area_log{}; ///< Written by the thread whose MaybeLogReadAreas took the window
     ReadAreaTotals last_read_area_totals{};
@@ -1298,6 +1553,10 @@ void Memory::RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size) {
     impl->RasterizerArmReadTraps(GetInteger(vaddr), size);
 }
 
+void Memory::RasterizerRemarkRestoredReads(Common::ProcessAddress vaddr, u64 size) {
+    impl->RasterizerRemarkRestoredReads(GetInteger(vaddr), size);
+}
+
 void Memory::MarkRegionDebug(Common::ProcessAddress vaddr, u64 size, bool debug) {
     impl->MarkRegionDebug(GetInteger(vaddr), size, debug);
 }
@@ -1306,7 +1565,7 @@ bool Memory::InvalidateNCE(Common::ProcessAddress vaddr, size_t size) {
     [[maybe_unused]] bool mapped = true;
     [[maybe_unused]] bool rasterizer = false;
 
-    u8* const ptr = impl->GetPointerImpl(
+    u8* const ptr = impl->GetPointerImpl<true>(
         GetInteger(vaddr),
         [&] {
             LOG_ERROR(HW_Memory, "Unmapped InvalidateNCE for {} bytes @ {:#x}", size,

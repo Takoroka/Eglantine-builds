@@ -41,6 +41,11 @@ namespace Core::Memory {
 /// Counts unmapped reads on this host thread since the CPU callbacks last checked (debug aid).
 u32& UnmappedReadFlag();
 
+/// A/B bit 18 FastmemRestore: the page_table_write_marked_mask a JIT on this host takes (its
+/// stores to pages with those bits go to the callbacks), letting cached pages be restored to
+/// direct reads. None where the JIT backend doesn't check it, or with the bit off for the run.
+std::optional<u64> TakeFastmemRestoreMask();
+
 /**
  * Page size used by the ARM architecture. This is the smallest granularity with which memory can
  * be mapped.
@@ -488,6 +493,12 @@ public:
      * (fastmem only), so that the read reaches the GPU's reactive flush once.
      */
     void RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size);
+
+    /**
+     * The GPU writes these pages now (an image became GPU-modified): those of them restored to
+     * direct reads (A/B bit 18 FastmemRestore) take the rasterizer path again.
+     */
+    void RasterizerRemarkRestoredReads(Common::ProcessAddress vaddr, u64 size);
 
     /**
      * Marks each page within the specified address range as debug or non-debug.

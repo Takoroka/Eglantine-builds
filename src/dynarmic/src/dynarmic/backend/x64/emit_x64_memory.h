@@ -73,11 +73,25 @@ void EmitDetectMisalignedVAddr(BlockOfCode& code, EmitContext& ctx, size_t bitsi
     }
 }
 
+// Marked page: use as unmapped. Stores check page_table_write_marked_mask in place of the marked
+// bit when it is set.
+template<typename UserConfig>
+void EmitMarkedPageCheck(BlockOfCode& code, const UserConfig& conf, Xbyak::Label& abort, Xbyak::Reg64 page, bool is_write) {
+    if (is_write && conf.page_table_write_marked_mask) {
+        ASSERT(*conf.page_table_write_marked_mask <= 0x7fffffff);
+        code.test(page, u32(*conf.page_table_write_marked_mask));
+        code.jnz(abort, code.T_NEAR);
+    } else if (conf.page_table_marked_bit) {
+        code.bt(page, *conf.page_table_marked_bit);
+        code.jc(abort, code.T_NEAR);
+    }
+}
+
 template<typename EmitContext>
-Xbyak::RegExp EmitVAddrLookup(BlockOfCode& code, EmitContext& ctx, size_t bitsize, Xbyak::Label& abort, Xbyak::Reg64 vaddr);
+Xbyak::RegExp EmitVAddrLookup(BlockOfCode& code, EmitContext& ctx, size_t bitsize, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool is_write = false);
 
 template<>
-[[maybe_unused]] Xbyak::RegExp EmitVAddrLookup<A32EmitContext>(BlockOfCode& code, A32EmitContext& ctx, size_t bitsize, Xbyak::Label& abort, Xbyak::Reg64 vaddr) {
+[[maybe_unused]] Xbyak::RegExp EmitVAddrLookup<A32EmitContext>(BlockOfCode& code, A32EmitContext& ctx, size_t bitsize, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool is_write) {
     const Xbyak::Reg64 page = ctx.reg_alloc.ScratchGpr(code);
     const Xbyak::Reg64 tmp = ctx.conf.absolute_offset_page_table && ctx.conf.page_table_pointer_mask == 0 ? page : ctx.reg_alloc.ScratchGpr(code);
 
@@ -94,10 +108,7 @@ template<>
     }
 
     // check for marked bit, use as unmapped if marked
-	if (ctx.conf.page_table_marked_bit) {
-        code.bt(page, *ctx.conf.page_table_marked_bit);
-        code.jc(abort, code.T_NEAR);
-	}
+    EmitMarkedPageCheck(code, ctx.conf, abort, page, is_write);
     // mask away attributes
     if (ctx.conf.page_table_pointer_mask == 0) {
         code.test(page, page);
@@ -123,7 +134,7 @@ template<>
 }
 
 template<>
-[[maybe_unused]] Xbyak::RegExp EmitVAddrLookup<A64EmitContext>(BlockOfCode& code, A64EmitContext& ctx, size_t bitsize, Xbyak::Label& abort, Xbyak::Reg64 vaddr) {
+[[maybe_unused]] Xbyak::RegExp EmitVAddrLookup<A64EmitContext>(BlockOfCode& code, A64EmitContext& ctx, size_t bitsize, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool is_write) {
     const size_t valid_page_index_bits = ctx.conf.page_table_address_space_bits - page_table_const_bits;
     const size_t unused_top_bits = 64 - ctx.conf.page_table_address_space_bits;
 
@@ -169,10 +180,7 @@ template<>
     }
 
     // check for marked bit, use as unmapped if marked
-    if (ctx.conf.page_table_marked_bit) {
-        code.bt(page, *ctx.conf.page_table_marked_bit);
-        code.jc(abort, code.T_NEAR);
-    }
+    EmitMarkedPageCheck(code, ctx.conf, abort, page, is_write);
     // mask away attributes
     if (ctx.conf.page_table_pointer_mask == 0) {
         code.test(page, page);

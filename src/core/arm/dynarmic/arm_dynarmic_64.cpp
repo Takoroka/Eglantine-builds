@@ -15,6 +15,7 @@
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
 #include "common/nx2_ab.h"
+#include "core/memory.h"
 #include "core/core_timing.h"
 #include "core/hardware_properties.h"
 #include "core/hle/kernel/k_process.h"
@@ -289,6 +290,8 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         config.page_table_address_space_bits = std::uint32_t(address_space_bits);
         config.page_table_pointer_mask = Common::PageTable::ATTRIBUTE_MASK;
         config.page_table_marked_bit = uint8_t(0);
+        // Stores to cached pages restored to direct reads still reach the rasterizer (A/B bit 18).
+        config.page_table_write_marked_mask = Core::Memory::TakeFastmemRestoreMask();
         config.silently_mirror_page_table = false;
         config.absolute_offset_page_table = true;
         config.detect_misaligned_access_via_page_table = 16 | 32 | 64 | 128;

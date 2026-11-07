@@ -3098,6 +3098,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         if (True(overlap.flags & ImageFlagBits::GpuModified)) {
             if (False(new_image.flags & ImageFlagBits::GpuModified)) {
                 VideoCore::BumpGuestReadEpoch();
+                if (VideoCore::AnyRestoredReadPages()) {
+                    device_memory.RemarkRestoredReads(new_image.cpu_addr,
+                                                      new_image.cpu_addr_end - new_image.cpu_addr);
+                }
             }
             new_image.flags |= ImageFlagBits::GpuModified;
             const auto& resolution = Settings::values.resolution_info;
@@ -3882,8 +3886,12 @@ void TextureCache<P>::RemoveFramebuffers(std::span<const ImageViewId> removed_vi
 template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     if (False(image.flags & ImageFlagBits::GpuModified)) {
-        // Guest reads of its pages ask GetFlushArea again (GuestReadAreaTable).
+        // Guest reads of its pages ask GetFlushArea again (GuestReadAreaTable), and its pages
+        // restored to direct reads (A/B bit 18) take the rasterizer path again.
         VideoCore::BumpGuestReadEpoch();
+        if (VideoCore::AnyRestoredReadPages()) {
+            device_memory.RemarkRestoredReads(image.cpu_addr, image.cpu_addr_end - image.cpu_addr);
+        }
     }
     image.flags |= ImageFlagBits::GpuModified;
     image.modification_tick = ++modification_tick;
@@ -3954,6 +3962,10 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     if (any_modified) {
         if (False(image.flags & ImageFlagBits::GpuModified)) {
             VideoCore::BumpGuestReadEpoch();
+            if (VideoCore::AnyRestoredReadPages()) {
+                device_memory.RemarkRestoredReads(image.cpu_addr,
+                                                  image.cpu_addr_end - image.cpu_addr);
+            }
         }
         image.flags |= ImageFlagBits::GpuModified;
     }

@@ -16,8 +16,20 @@ namespace VideoCore {
 /// that. The guest read area tables (A/B bit 3 GuestReadAreas) are stamped with it.
 inline std::atomic<u64> g_guest_read_epoch{0};
 
+/// Guest pages restored to direct reads (A/B bit 18 FastmemRestore, Core::Memory), all processes:
+/// with none, an image becoming GPU-modified needn't look for them.
+inline std::atomic<u64> g_restored_read_pages{0};
+
+/// Sequentially consistent: a page restore counts itself, then reads the epoch; this bumps the
+/// epoch, then reads the count (Core::Memory's TryRestorePage). One of them sees the other.
 inline void BumpGuestReadEpoch() noexcept {
-    g_guest_read_epoch.fetch_add(1, std::memory_order_release);
+    g_guest_read_epoch.fetch_add(1, std::memory_order_seq_cst);
+}
+
+/// Whether an image that just became GPU-modified must mark restored pages again
+/// (DeviceMemoryManager::RemarkRestoredReads), after BumpGuestReadEpoch.
+[[nodiscard]] inline bool AnyRestoredReadPages() noexcept {
+    return g_restored_read_pages.load(std::memory_order_seq_cst) != 0;
 }
 
 /// A guest core's remembered flush areas (A/B bit 3 GuestReadAreas, Core::Memory's

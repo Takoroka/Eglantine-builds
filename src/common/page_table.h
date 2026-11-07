@@ -49,6 +49,13 @@ struct PageTable {
     /// Specifies sign bit for page table entries.
     static constexpr u64 SIGN_BIT = 45 + 12; // 44 bits of data + page offset
 
+    /// The entry bits that send a JIT store to the callbacks (A/B bit 18 FastmemRestore,
+    /// Dynarmic's page_table_write_marked_mask): the marked bit, as for loads, and the high type
+    /// bit, which only debug pages (always marked) and rasterizer-cached pages have. So a cached
+    /// page with its marked bit clear (PageEntryData::UnmarkCachedReads) is read directly while
+    /// its writes still reach the rasterizer.
+    static constexpr u64 WRITE_MARKED_MASK = 0b101;
+
     /**
      * Atomic tuple of host pointer, page type, and block id.
      * This uses the lower bits of a given pointer to store the attributes.
@@ -114,6 +121,38 @@ struct PageTable {
 
         inline void MarkRasterizerCached() noexcept {
             data_raw.fetch_or(0b111);
+        }
+
+        /// A/B bit 18 FastmemRestore: a marked rasterizer-cached page's reads go to memory
+        /// directly from now on, its writes still to the rasterizer (WRITE_MARKED_MASK): clears
+        /// the marked bit. False, with nothing changed, if the page isn't a marked cached one.
+        inline bool UnmarkCachedReads() noexcept {
+            u64 raw = data_raw.load(std::memory_order_relaxed);
+            do {
+                if ((raw & 0b111) != 0b111) {
+                    return false;
+                }
+            } while (!data_raw.compare_exchange_weak(raw, raw & ~u64{1}, std::memory_order_acq_rel,
+                                                     std::memory_order_relaxed));
+            return true;
+        }
+
+        /// Undoes UnmarkCachedReads: false, with nothing changed, if the page isn't a cached one
+        /// with its marked bit clear.
+        inline bool MarkCachedReads() noexcept {
+            u64 raw = data_raw.load(std::memory_order_relaxed);
+            do {
+                if ((raw & 0b111) != 0b110) {
+                    return false;
+                }
+            } while (!data_raw.compare_exchange_weak(raw, raw | 1, std::memory_order_acq_rel,
+                                                     std::memory_order_relaxed));
+            return true;
+        }
+
+        /// Whether the page is cached with its reads restored (UnmarkCachedReads).
+        [[nodiscard]] bool CachedReadsUnmarked() const noexcept {
+            return (data_raw.load(std::memory_order_relaxed) & 0b111) == 0b110;
         }
 
         inline void MarkDebug(u64 ptr, u16 block) noexcept {
