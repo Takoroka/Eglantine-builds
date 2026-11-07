@@ -3081,7 +3081,7 @@ public:
         RegisterHandlersTipc({
             {1, &INx2VideoSession::CreateDecoderService, "CreateVideoDecoderSession"},
             {3, &INx2VideoSession::GetEvent, "GetInputEvent"},
-            {6, &INx2VideoSession::Succeed, "Start"},
+            {6, &INx2VideoSession::Start, "Start"},
             {8, &INx2VideoSession::Flush, "Flush"},
             {101, &INx2VideoSession::Configure, "Configure"},
             {109, &INx2VideoSession::SubmitInput, "Decode"},
@@ -3194,6 +3194,22 @@ private:
 
     void Succeed(HLERequestContext& ctx) {
         Log(ctx, "");
+        TipcReplyWords(ctx, {});
+    }
+
+    static bool StopQuiet() {
+        return Common::Nx2Ab::On(Common::Nx2Ab::VdecStopQuiet);
+    }
+
+    // Start (6): the input-ready event is signalled again while the queue has room.
+    void Start(HLERequestContext& ctx) {
+        Log(ctx, "start");
+        if (StopQuiet()) {
+            std::scoped_lock lk{m_mutex};
+            m_stopped = false;
+            m_ready->room.store(!m_stream_ended && m_inputs.size() < MaxQueuedInputs,
+                                std::memory_order_relaxed);
+        }
         TipcReplyWords(ctx, {});
     }
 
@@ -3357,6 +3373,7 @@ private:
             std::scoped_lock lk{m_mutex};
             m_inputs.push_back(std::move(input));
             m_stream_ended = false;
+            m_stopped = false;
             m_ready->room.store(!end && m_inputs.size() < MaxQueuedInputs, std::memory_order_relaxed);
         }
         m_cv.notify_one();
@@ -3375,7 +3392,11 @@ private:
             m_stream_ended = false;
             m_clock_offset.reset();
             m_held.clear();
-            m_ready->room.store(true, std::memory_order_relaxed);
+            // A stopped decoder asks for no input until Start (or a submission): Kirby Air Riders
+            // destroys its copy of the event after Finalize, and a later signal woke a worker job
+            // that cleared it (nn::os::ClearSystemEvent aborts on a destroyed event, 2162-0001).
+            m_stopped = ctx.GetCommand() == 207 && StopQuiet();
+            m_ready->room.store(!m_stopped, std::memory_order_relaxed);
             // Only Stop: Bananza flushes (8) after its movies end and treats every completed
             // fence as a frame to acquire.
             if (ctx.GetCommand() == 207) {
@@ -3393,6 +3414,10 @@ private:
             CompleteHandedFences();
             m_clock_offset.reset();
             m_held.clear();
+            if (StopQuiet()) {
+                m_stopped = true;
+                m_ready->room.store(false, std::memory_order_relaxed);
+            }
         }
         TipcReplyWords(ctx, {});
     }
@@ -3608,7 +3633,7 @@ private:
             }
             Input input = std::move(m_inputs.front());
             m_inputs.pop_front();
-            if (!m_stream_ended) {
+            if (!m_stream_ended && !m_stopped) {
                 m_ready->room.store(m_inputs.size() < MaxQueuedInputs, std::memory_order_relaxed);
             }
             std::string codec = m_codec;
@@ -3785,6 +3810,7 @@ private:
     std::map<u32, Fence> m_release_fences;
     std::deque<Output> m_outputs;      ///< Finished, for 213
     bool m_stream_ended{};             ///< End-of-stream frame handed out, nothing submitted since
+    bool m_stopped{};                  ///< Stop or Finalize since the last Start or submission
     bool m_flush{};
     bool m_quit{};
     std::thread m_worker;
