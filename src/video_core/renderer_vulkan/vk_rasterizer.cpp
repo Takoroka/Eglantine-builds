@@ -1903,6 +1903,10 @@ const std::string* RasterizerVulkan::DispatchCompute() {
 
     ComputePipeline* const pipeline{pipeline_cache.CurrentComputePipeline()};
     if (!pipeline) {
+        if (pipeline_cache.ComputeDispatchDeferred()) {
+            // Its pipeline is still being prebuilt (A/B bit AsyncComputePrebuild): skipped.
+            return nullptr;
+        }
         if (const std::string* const rejection = pipeline_cache.ComputeRejection()) {
             return rejection;
         }

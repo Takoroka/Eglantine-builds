@@ -1055,7 +1055,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
 }
 
 ComputePipeline* PipelineCache::CurrentComputePipeline() {
-
+    compute_deferred = false;
     const ShaderInfo* const shader{ComputeShader()};
     if (!shader) {
         return nullptr;
@@ -1072,6 +1072,13 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
         return pipeline.get();
     }
     if (Common::Nx2Ab::On(Common::Nx2Ab::PipelinePrebuild)) {
+        if (use_asynchronous_shaders && Common::Nx2Ab::On(Common::Nx2Ab::AsyncComputePrebuild) &&
+            DeferWhilePrebuilding(key)) {
+            // Skipped like a draw whose pipeline builds; the next dispatch looks again.
+            compute_cache.erase(pair);
+            compute_deferred = true;
+            return nullptr;
+        }
         pipeline = TakeComputePrebuild(key, shader);
     }
     if (!pipeline) {
@@ -1198,8 +1205,34 @@ std::unique_ptr<ComputePipeline> PipelineCache::TakeComputePrebuild(
     return std::move(job->pipeline);
 }
 
+bool PipelineCache::DeferWhilePrebuilding(const ComputePipelineCacheKey& key) {
+    std::scoped_lock lock{prebuilds.mutex};
+    const auto it{prebuilds.by_key.find(key)};
+    if (it == prebuilds.by_key.end() ||
+        it->second->state.load(std::memory_order_acquire) == ComputePrebuild::State::Done) {
+        return false;
+    }
+    // Kirby Air Riders' native compute programs take the NVIDIA compiler about a second each, and
+    // its first races meet dozens: GPUBack waited 22-53% of the time for them. A dispatch whose
+    // pipeline nothing has yet is skipped instead, as asynchronous shaders skip draws.
+    ++prebuilds.deferred;
+    if (prebuilds.deferred_since.try_emplace(key, std::chrono::steady_clock::now()).second) {
+        ++prebuilds.deferred_programs;
+    }
+    return true;
+}
+
 void PipelineCache::NoteComputeKey(const ComputePipelineCacheKey& key) {
     std::scoped_lock lock{prebuilds.mutex};
+    if (const auto it{prebuilds.deferred_since.find(key)}; it != prebuilds.deferred_since.end()) {
+        const auto skipped{std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now() - it->second)
+                               .count()};
+        ++prebuilds.resumed;
+        prebuilds.resumed_us += static_cast<u64>(skipped);
+        prebuilds.resumed_max_us = (std::max)(prebuilds.resumed_max_us, static_cast<u64>(skipped));
+        prebuilds.deferred_since.erase(it);
+    }
     prebuilds.known.insert(key);
     if (const auto it{prebuilds.by_key.find(key)}; it != prebuilds.by_key.end()) {
         // Built otherwise (its own dispatch came first, or its answers differed): the prebuild
@@ -1229,6 +1262,34 @@ void PipelineCache::LogPrebuildCounters() {
     const u64 wait_us{take(prebuilds.wait_us)};
     const u64 mismatched{take(prebuilds.mismatched)};
     const u64 unused{take(prebuilds.unused)};
+    u64 deferred{};
+    u64 deferred_programs{};
+    u64 resumed{};
+    u64 resumed_us{};
+    u64 resumed_max_us{};
+    size_t not_since{};
+    {
+        std::scoped_lock lock{prebuilds.mutex};
+        deferred = std::exchange(prebuilds.deferred, 0);
+        deferred_programs = std::exchange(prebuilds.deferred_programs, 0);
+        resumed = std::exchange(prebuilds.resumed, 0);
+        resumed_us = std::exchange(prebuilds.resumed_us, 0);
+        resumed_max_us = std::exchange(prebuilds.resumed_max_us, 0);
+        not_since = prebuilds.deferred_since.size();
+    }
+    if (deferred != 0 || resumed != 0) {
+        // Programs skipped and never dispatched again lost what they would have written once.
+        LOG_INFO(Render_Vulkan,
+                 "Compute dispatches skipped while prebuilding ({:.0f} s): {} dispatches of {} new "
+                 "programs; {} programs built at a later dispatch, {:.0f} ms after their first skip "
+                 "(max {} ms); {} skipped programs not dispatched since [AsyncComputePrebuild {}]",
+                 seconds, deferred, deferred_programs, resumed,
+                 resumed != 0 ? static_cast<double>(resumed_us) / 1000.0 /
+                                    static_cast<double>(resumed)
+                              : 0.0,
+                 resumed_max_us / 1000, not_since,
+                 Common::Nx2Ab::On(Common::Nx2Ab::AsyncComputePrebuild) ? "on" : "off");
+    }
     if (offered == 0 && built == 0 && adopted == 0 && mismatched == 0 && unused == 0) {
         return;
     }
