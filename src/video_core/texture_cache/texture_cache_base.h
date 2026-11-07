@@ -7,6 +7,8 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <concepts>
 #include <deque>
 #include <limits>
 #include <map>
@@ -184,6 +186,12 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     using Framebuffer = typename P::Framebuffer;
     using AsyncBuffer = typename P::AsyncBuffer;
     using BufferType = typename P::BufferType;
+
+    /// The backend can change the priority of an image's memory (A/B bit VramPriority).
+    static constexpr bool HAS_RESIDENCY = requires(Runtime& runtime_, Image& image_) {
+        runtime_.SetResidencyTier(image_, ResidencyTier::Normal);
+        { runtime_.ResidencyActive() } -> std::convertible_to<bool>;
+    };
 
     static constexpr u32 LayerUploadMinSize = 64U << 20;
     static constexpr size_t LargeScratchCapacity = 64U << 20;
@@ -650,6 +658,12 @@ private:
     /// MaxCriticalMemory while it is off or unknown.
     u64 CriticalMemoryCap() const;
 
+    /// VRAM priority: moves a tracked image to a tier (its memory's priority follows).
+    void SetResidencyTier(Image& image, ResidencyTier tier);
+
+    /// VRAM priority, once a frame: the cold scan, and the log line every 30 s.
+    void TickResidency();
+
     /// True when the collector follows the driver's budget past MaxCriticalMemory (discrete GPU,
     /// a budget read, no threshold override).
     bool UseBudgetThresholds() const;
@@ -737,6 +751,12 @@ private:
     u64 modification_tick = 0;
     u64 frame_tick = 0;
     u64 texture_set_generation = 0;
+
+    /// VRAM priority tier changes since the last log line (TickResidency).
+    u64 residency_raised = 0;
+    u64 residency_rewarmed = 0;
+    u64 residency_lowered = 0;
+    std::chrono::steady_clock::time_point residency_next_log{};
 
     Common::ThreadWorker texture_decode_worker{1, "TextureDecoder", {},
                                                Common::ThreadPlacement::Efficiency};

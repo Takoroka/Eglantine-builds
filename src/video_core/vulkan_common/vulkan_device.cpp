@@ -29,6 +29,7 @@
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "video_core/texture_cache/memory_priority.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -864,6 +865,17 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     if (extensions.buffer_device_address) {
         flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
     }
+    if (extensions.memory_priority) {
+        flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT;
+    }
+    LOG_INFO(Render_Vulkan,
+             "VRAM priority (A/B bit VramPriority): memory priority {}, pageable device memory {}",
+             extensions.memory_priority ? "on"
+             : Common::Nx2Ab::On(Common::Nx2Ab::VramPriority) ? "unsupported"
+                                                               : "off",
+             extensions.pageable_device_local_memory ? "on (texture priorities by recency)"
+             : extensions.memory_priority            ? "unsupported (priorities fixed at allocation)"
+                                                     : "off");
     // EDEN_NX2_VRAM_LIMIT_MIB: VMA fails allocations past the limit, like a smaller card.
     std::array<VkDeviceSize, VK_MAX_MEMORY_HEAPS> heap_size_limits;
     heap_size_limits.fill(VK_WHOLE_SIZE);
@@ -927,13 +939,15 @@ VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
     std::scoped_lock lk{separate_pools_mutex};
     VmaPool& pool = separate_pools[static_cast<u32>(kind)][memory_type];
     if (pool == VK_NULL_HANDLE) {
+        // With VK_EXT_memory_priority: sparse texture pages as textures, buffers above them.
         const VmaPoolCreateInfo ci{
             .memoryTypeIndex = memory_type,
             .flags = 0,
             .blockSize = SeparatePoolBlockSize,
             .minBlockCount = 0,
             .maxBlockCount = 0,
-            .priority = 0.f,
+            .priority = kind == SeparatePool::DeviceBuffers ? VideoCommon::MemoryPriority::Buffers
+                                                            : VideoCommon::MemoryPriority::Normal,
             .minAllocationAlignment = 0,
             .pMemoryAllocateNext = nullptr,
         };
@@ -1689,6 +1703,27 @@ void Device::RemoveUnsuitableExtensions() {
     extensions.mesh_shader = features.mesh_shader.taskShader && features.mesh_shader.meshShader;
     RemoveExtensionFeatureIfUnsuitable(extensions.mesh_shader, features.mesh_shader,
                                        VK_EXT_MESH_SHADER_EXTENSION_NAME);
+
+    // VK_EXT_memory_priority and VK_EXT_pageable_device_local_memory (A/B bit VramPriority):
+    // allocations carry a priority, and with pageable memory the texture cache can change an
+    // image's later (VideoCommon::MemoryPriority). Off: neither is enabled, as before.
+    if (Common::Nx2Ab::On(Common::Nx2Ab::VramPriority)) {
+        extensions.memory_priority = features.memory_priority.memoryPriority;
+        RemoveExtensionFeatureIfUnsuitable(extensions.memory_priority, features.memory_priority,
+                                           VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+        extensions.pageable_device_local_memory =
+            extensions.memory_priority &&
+            features.pageable_device_local_memory.pageableDeviceLocalMemory;
+        RemoveExtensionFeatureIfUnsuitable(extensions.pageable_device_local_memory,
+                                           features.pageable_device_local_memory,
+                                           VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
+    } else {
+        RemoveExtensionFeature(extensions.memory_priority, features.memory_priority,
+                               VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+        RemoveExtensionFeature(extensions.pageable_device_local_memory,
+                               features.pageable_device_local_memory,
+                               VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
+    }
 
     // VK_KHR_shader_quad_control
     extensions.shader_quad_control = features.shader_quad_control.shaderQuadControl;

@@ -15,17 +15,20 @@
 
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 
+#include "common/cityhash.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2.h"
 #include "video_core/renderer_vulkan/vk_command_pool.h"
+#include "video_core/renderer_vulkan/vk_gpu_timestamps.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
+#include "video_core/texture_cache/formatter.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -49,7 +52,8 @@ void Scheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf,
 Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
     : device{device_}, state_tracker{state_tracker_},
       master_semaphore{std::make_unique<MasterSemaphore>(device)},
-      command_pool{std::make_unique<CommandPool>(*master_semaphore, device)} {
+      command_pool{std::make_unique<CommandPool>(*master_semaphore, device)},
+      timestamps{GpuTimestamps::Create(device_)} {
 
     AcquireNewChunk();
     AllocateWorkerCommandBuffer();
@@ -190,6 +194,9 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     state.renderpass = renderpass;
     state.framebuffer = framebuffer_handle;
     state.render_area = render_area;
+    if (timestamps) [[unlikely]] {
+        TimePassBegin(framebuffer);
+    }
 
     if (GPU::Logging::IsActive() && Settings::values.gpu_log_vulkan_calls.GetValue()) {
         const std::string render_pass_info =
@@ -439,11 +446,17 @@ void Scheduler::AllocateWorkerCommandBuffer() {
 
 u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
     EndPendingOperations();
+    if (timestamps) [[unlikely]] {
+        // Segments end with their command buffers.
+        CloseTimed(timed_outside);
+        CloseTimed(timed_upload);
+        CloseTimed(timed_present);
+    }
     InvalidateState();
 
     const u64 signal_value = master_semaphore->NextTick();
-    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,
-                            this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
+    RecordImpl([signal_semaphore, wait_semaphore, signal_value,
+                this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
         static constexpr VkMemoryBarrier WRITE_BARRIER{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .pNext = nullptr,
@@ -578,10 +591,181 @@ void Scheduler::EndRenderPass()
             }
         });
 
+        if (timed_pass.open) [[unlikely]] {
+            CloseTimed(timed_pass);
+        }
         state.renderpass = VkRenderPass{};
         num_renderpass_images = 0;
     }
 
+
+void Scheduler::WriteTimestamp(VkQueryPool pool, u32 query, bool upload) {
+    // Bottom of the pipe at both ends: each mark waits for what was recorded before it, so a
+    // segment's time is what the GPU took to finish its commands after the earlier ones.
+    if (upload) {
+        RecordImpl([pool, query](vk::CommandBuffer, vk::CommandBuffer upload_cmdbuf) {
+            upload_cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, query);
+        });
+    } else {
+        RecordImpl([pool, query](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
+            cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, query);
+        });
+    }
+}
+
+void Scheduler::OpenTimed(TimedSegment& segment, u64 key, bool upload) {
+    const auto reserved = timestamps->Reserve(key);
+    if (!reserved) {
+        return;
+    }
+    segment = TimedSegment{
+        .open = true,
+        .upload = upload,
+        .pool = reserved->pool,
+        .end_query = reserved->begin_query + 1,
+        .index = reserved->segment,
+        .key = key,
+        .work = 0,
+    };
+    WriteTimestamp(reserved->pool, reserved->begin_query, upload);
+}
+
+void Scheduler::CloseTimed(TimedSegment& segment) {
+    if (!segment.open) {
+        return;
+    }
+    WriteTimestamp(segment.pool, segment.end_query, segment.upload);
+    timestamps->SetWork(segment.index, segment.work);
+    segment.open = false;
+}
+
+namespace {
+/// Segment keys: the kind in the top bits, so that kinds never share a key.
+u64 TimedKey(VideoCommon::GpuSegmentKind kind, u64 value) {
+    return (static_cast<u64>(kind) << 60) ^ (value & ((u64{1} << 60) - 1));
+}
+} // Anonymous namespace
+
+void Scheduler::TimePassBegin(const Framebuffer* framebuffer) {
+    CloseTimed(timed_outside);
+    CloseTimed(timed_pass);
+    // A pass is known by its size and attachment formats: the same pass of every frame.
+    const RenderPassKey& base = framebuffer->RenderPassKeyBase();
+    const VkExtent2D area = framebuffer->RenderArea();
+    std::array<u32, 12> fields{};
+    fields[0] = area.width;
+    fields[1] = area.height;
+    for (size_t slot = 0; slot < base.color_formats.size(); ++slot) {
+        fields[2 + slot] = static_cast<u32>(base.color_formats[slot]);
+    }
+    fields[10] = static_cast<u32>(base.depth_format);
+    fields[11] = static_cast<u32>(base.samples);
+    const u64 key = TimedKey(VideoCommon::GpuSegmentKind::Pass,
+                             Common::CityHash64(reinterpret_cast<const char*>(fields.data()),
+                                                sizeof(fields)));
+    if (!timestamps->Known(key)) {
+        std::string label = fmt::format("pass {}x{}", area.width, area.height);
+        const char* separator = " c:";
+        for (const auto format : base.color_formats) {
+            if (format != VideoCore::Surface::PixelFormat::Invalid) {
+                label += fmt::format("{}{}", separator, format);
+                separator = ",";
+            }
+        }
+        if (base.depth_format != VideoCore::Surface::PixelFormat::Invalid) {
+            label += fmt::format(" d:{}", base.depth_format);
+        }
+        if (base.samples != VK_SAMPLE_COUNT_1_BIT) {
+            label += fmt::format(" x{}", static_cast<u32>(base.samples));
+        }
+        timestamps->Name(key, VideoCommon::GpuSegmentKind::Pass, std::move(label));
+    }
+    timed_pass_key = key;
+    OpenTimed(timed_pass, key, false);
+}
+
+void Scheduler::TimeOutside(u64 value, VideoCommon::GpuSegmentKind kind, const char* name) {
+    const u64 key = TimedKey(kind, value);
+    if (timed_outside.open && timed_outside.key == key) {
+        ++timed_outside.work;
+        return;
+    }
+    CloseTimed(timed_outside);
+    if (!timestamps->Known(key)) {
+        timestamps->Name(key, kind,
+                         name != nullptr ? std::string{name}
+                                         : fmt::format("compute {:016x}", value));
+    }
+    OpenTimed(timed_outside, key, false);
+    timed_outside.work = 1;
+}
+
+void Scheduler::TimeInternal(TimedWork work) {
+    const auto [kind, name] = [work]() -> std::pair<VideoCommon::GpuSegmentKind, const char*> {
+        using Kind = VideoCommon::GpuSegmentKind;
+        switch (work) {
+        case TimedWork::TextureUpload:
+            return {Kind::Upload, "texture uploads"};
+        case TimedWork::VertexRepack:
+            return {Kind::Compute, "vertex repack"};
+        case TimedWork::Uint8Index:
+            return {Kind::Compute, "8-bit index conversion"};
+        case TimedWork::QuadIndex:
+            return {Kind::Compute, "quad index conversion"};
+        case TimedWork::ConditionalResolve:
+            return {Kind::Compute, "conditional rendering resolve"};
+        case TimedWork::QueryPrefixScan:
+            return {Kind::Compute, "query prefix scan"};
+        case TimedWork::AstcDecode:
+            return {Kind::Compute, "ASTC decode"};
+        case TimedWork::BcEncode:
+            return {Kind::Compute, "BC encode"};
+        case TimedWork::Unswizzle3D:
+            return {Kind::Compute, "3D unswizzle"};
+        }
+        return {Kind::Compute, "internal"};
+    }();
+    TimeOutside(static_cast<u64>(work), kind, name);
+}
+
+void Scheduler::TimeUploadBuffer() {
+    if (timed_upload.open) {
+        return;
+    }
+    static const u64 key = TimedKey(VideoCommon::GpuSegmentKind::Upload, 1);
+    if (!timestamps->Known(key)) {
+        timestamps->Name(key, VideoCommon::GpuSegmentKind::Upload,
+                         "buffer uploads (upload command buffer)");
+    }
+    OpenTimed(timed_upload, key, true);
+}
+
+void Scheduler::TimePresent(bool begin) {
+    if (!begin) {
+        CloseTimed(timed_present);
+        return;
+    }
+    CloseTimed(timed_outside);
+    static const u64 key = TimedKey(VideoCommon::GpuSegmentKind::Present, 1);
+    if (!timestamps->Known(key)) {
+        timestamps->Name(key, VideoCommon::GpuSegmentKind::Present,
+                         "present (post-processing, upscaling, swapchain blit)");
+    }
+    OpenTimed(timed_present, key, false);
+}
+
+void Scheduler::TimeFrameEnd() {
+    const bool pass_active = timed_pass.open;
+    CloseTimed(timed_pass);
+    CloseTimed(timed_outside);
+    CloseTimed(timed_upload);
+    CloseTimed(timed_present);
+    timestamps->EndFrame(*this);
+    if (pass_active && state.renderpass) {
+        // The render pass goes on into the next frame: its rest is a segment of that frame.
+        OpenTimed(timed_pass, timed_pass_key, false);
+    }
+}
 
 void Scheduler::AcquireNewChunk() {
     std::scoped_lock rl{reserve_mutex};

@@ -138,6 +138,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdSetStencilWriteMask);
     X(vkCmdSetViewport);
     X(vkCmdWaitEvents);
+    X(vkCmdWriteTimestamp);
     X(vkCmdBindVertexBuffers2EXT);
     X(vkCmdSetCullModeEXT);
     X(vkCmdSetDepthBoundsTestEnableEXT);
@@ -238,6 +239,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkResetQueryPool);
     X(vkSetDebugUtilsObjectNameEXT);
     X(vkSetDebugUtilsObjectTagEXT);
+    X(vkSetDeviceMemoryPriorityEXT);
     X(vkUnmapMemory);
     X(vkUpdateDescriptorSetWithTemplate);
     X(vkUpdateDescriptorSets);
@@ -537,6 +539,15 @@ Image::MemoryBlock Image::GetMemoryBlock() const noexcept {
     }
     return {reinterpret_cast<u64>(info.allocationInfo.deviceMemory), info.blockSize,
             info.allocationInfo.size};
+}
+
+VkDeviceMemory Image::DedicatedMemory() const noexcept {
+    if (allocation == nullptr) {
+        return VK_NULL_HANDLE;
+    }
+    VmaAllocationInfo2 info{};
+    vmaGetAllocationInfo2(allocator, allocation, &info);
+    return info.dedicatedMemory ? info.allocationInfo.deviceMemory : VK_NULL_HANDLE;
 }
 
 void Buffer::Flush() const {

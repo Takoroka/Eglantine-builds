@@ -25,6 +25,10 @@ enum Feature : u64 {
     // texlookup (11-06): the Texture Cache Memory Limit setting caps the collector's thresholds
     // (TextureCache::ApplyThresholdOverrides) in place of MaxCriticalMemory.
     TcMemoryLimit = 1ull << 1,
+    // texlookup (11-06): VK_EXT_memory_priority / VK_EXT_pageable_device_local_memory: render
+    // targets, buffers and the stream buffer high, texture cache images by recency
+    // (VideoCommon::MemoryPriority). Read once, at device creation.
+    VramPriority = 1ull << 6,
     // fences (11-05): direct draws with no vertices or no instances skip the draw setup.
     ZeroDrawSkip = 1ull << 40,
     // vkoff (11-05): draws with none of the dynamic states' dirty flags set skip their updates.

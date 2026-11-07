@@ -284,6 +284,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdSetColorBlendEnableEXT vkCmdSetColorBlendEnableEXT{};
     PFN_vkCmdSetColorBlendEquationEXT vkCmdSetColorBlendEquationEXT{};
     PFN_vkCmdWaitEvents vkCmdWaitEvents{};
+    PFN_vkCmdWriteTimestamp vkCmdWriteTimestamp{};
     PFN_vkCreateBuffer vkCreateBuffer{};
     PFN_vkCreateBufferView vkCreateBufferView{};
     PFN_vkCreateCommandPool vkCreateCommandPool{};
@@ -354,6 +355,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkResetQueryPool vkResetQueryPool{};
     PFN_vkSetDebugUtilsObjectNameEXT vkSetDebugUtilsObjectNameEXT{};
     PFN_vkSetDebugUtilsObjectTagEXT vkSetDebugUtilsObjectTagEXT{};
+    PFN_vkSetDeviceMemoryPriorityEXT vkSetDeviceMemoryPriorityEXT{};
     PFN_vkUnmapMemory vkUnmapMemory{};
     PFN_vkUpdateDescriptorSetWithTemplate vkUpdateDescriptorSetWithTemplate{};
     PFN_vkGetBufferDeviceAddress vkGetBufferDeviceAddress{};
@@ -745,6 +747,10 @@ public:
         u64 size;
     };
     [[nodiscard]] MemoryBlock GetMemoryBlock() const noexcept;
+
+    /// The image's own device memory when VMA gave it a dedicated allocation, null when it lies in
+    /// a shared block or has no memory.
+    [[nodiscard]] VkDeviceMemory DedicatedMemory() const noexcept;
 
 private:
     void Release() const noexcept;
@@ -1383,6 +1389,11 @@ public:
 
     void DispatchIndirect(VkBuffer indirect_buffer, VkDeviceSize offset) const noexcept {
         dld->vkCmdDispatchIndirect(handle, indirect_buffer, offset);
+    }
+
+    void WriteTimestamp(VkPipelineStageFlagBits stage, VkQueryPool query_pool,
+                        u32 query) const noexcept {
+        dld->vkCmdWriteTimestamp(handle, stage, query_pool, query);
     }
 
     void PipelineBarrier(VkPipelineStageFlags src_stage_mask, VkPipelineStageFlags dst_stage_mask,

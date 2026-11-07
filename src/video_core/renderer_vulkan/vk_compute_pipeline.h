@@ -58,6 +58,11 @@ public:
         return static_cast<bool>(pipeline);
     }
 
+    /// The compute program's hash (EDEN_NX2_GPU_TIMESTAMPS keys dispatches by it).
+    [[nodiscard]] u64 ShaderHash() const noexcept {
+        return shader_hash;
+    }
+
     /// Built on a worker nothing waits for (PipelineCache matrix_workers) and not built yet, or
     /// the driver failed it: its dispatches are skipped.
     bool SkipsDispatches() const noexcept {

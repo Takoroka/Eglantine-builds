@@ -54,6 +54,7 @@ add_executable(tests
     video_core/fragment_barrier_defer.cpp
     video_core/present_queue.cpp
     video_core/texture_cache_memory_limit.cpp
+    video_core/vram_priority_timestamps.cpp
     input_common/calibration_configuration_job.cpp
 )
 

@@ -963,6 +963,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
                     Profile::Scope scope{Profile::Zone::DrawRecord};
                     draw_func();
                 }
+                scheduler.TimestampDraw();
                 submitted = true;
                 if (repeat_draw) {
                     repeat.record_serial = scheduler.RecordSerial();
@@ -1076,6 +1077,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         Profile::Scope scope{Profile::Zone::DrawRecord};
         draw_func();
     }
+    scheduler.TimestampDraw();
     if (diag_query >= 0) {
         scheduler.Record([pool = **g_diag_pool, diag_query](vk::CommandBuffer cmdbuf) {
             cmdbuf.EndQuery(pool, static_cast<u32>(diag_query));
@@ -1870,6 +1872,7 @@ void RasterizerVulkan::DispatchCompute() {
         const auto [buffer, offset] =
             buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
         scheduler.RequestOutsideRenderPassOperationContext();
+        scheduler.TimestampOutside(pipeline->ShaderHash(), VideoCommon::GpuSegmentKind::Compute);
         if (barriers) {
             record_barrier(VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
         }
@@ -1892,6 +1895,7 @@ void RasterizerVulkan::DispatchCompute() {
         return;
     }
     scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.TimestampOutside(pipeline->ShaderHash(), VideoCommon::GpuSegmentKind::Compute);
     if (barriers) {
         record_barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     } else {
@@ -2433,6 +2437,8 @@ void RasterizerVulkan::TickFrame() {
     SCOPE_EXIT {
         NoteSetupChange();
     };
+    // EDEN_NX2_GPU_TIMESTAMPS: the frame's timed segments end here.
+    scheduler.TimestampFrameEnd();
     fence_manager.FlushDeferredDownloads(true);
     draw_counter = 0;
     if (VideoCommon::Nx2Diag::Active()) {

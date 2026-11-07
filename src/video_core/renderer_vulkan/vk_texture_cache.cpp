@@ -443,7 +443,8 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
 [[nodiscard]] vk::Image MakeImage(const Device& device, const MemoryAllocator& allocator,
                                   const ImageInfo& info, std::span<const VkFormat> view_formats,
                                   std::optional<VkFormat> format_override = {},
-                                  bool unbacked = false, bool aliased = false) {
+                                  bool unbacked = false, bool aliased = false,
+                                  float priority = VideoCommon::MemoryPriority::Normal) {
     if (info.type == ImageType::Buffer) {
         return vk::Image{};
     }
@@ -476,7 +477,7 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
             return image;
         }
     }
-    return allocator.CreateImage(image_ci);
+    return allocator.CreateImage(image_ci, false, priority);
 }
 
 [[nodiscard]] vk::ImageView MakeStorageView(const vk::Device& device, u32 level, VkImage image,
@@ -2535,6 +2536,14 @@ bool TextureCacheRuntime::IsIntegratedGpu() const {
     return device.IsIntegrated();
 }
 
+void TextureCacheRuntime::SetResidencyTier(Image& image, VideoCommon::ResidencyTier tier) {
+    device.SetMemoryPriority(image.ResidencyMemory(), VideoCommon::ResidencyPriority(tier));
+}
+
+bool TextureCacheRuntime::ResidencyActive() const {
+    return device.IsMemoryPrioritySupported();
+}
+
 bool TextureCacheRuntime::CopiesColorFeedbackTargets() const {
     // The garbage was seen on RADV; AMD's own drivers compress colour targets the same way. Other
     // drivers keep the loop (and skip the copies).
@@ -2660,7 +2669,9 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                                    UsesSparseTiles(runtime_.device, info, gpu_addr_) ||
                                    IsUnwrittenSparse(runtime_.device, info, gpu_addr_),
                                UsesSparseTiles(runtime_.device, info, gpu_addr_) &&
-                                   SparseTilesModeOf(runtime_.device) == SparseTilesMode::Aliased)),
+                                   SparseTilesModeOf(runtime_.device) == SparseTilesMode::Aliased,
+                               runtime_.render_target_hint ? VideoCommon::MemoryPriority::Frame
+                                                           : VideoCommon::MemoryPriority::Normal)),
       aspect_mask(ImageAspectMask(info.format)) {
     if (original_image.IsUnbacked()) {
         flags |= VideoCommon::ImageFlagBits::Unbacked;
@@ -2709,6 +2720,29 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
         original_image.SetObjectNameEXT(VideoCommon::Name(*this).c_str());
     }
     memory_block = original_image.GetMemoryBlock();
+    if (runtime->device.IsMemoryPrioritySupported() && original_image &&
+        !original_image.IsUnbacked()) {
+        // VRAM priority (A/B bit VramPriority): an image with memory of its own got its priority
+        // above (Frame for render targets), and with pageable memory it follows the image's use.
+        const bool target = runtime->render_target_hint;
+        auto& created = runtime->residency_created;
+        if (memory_block.block == 0) {
+            ++created.dedicated;
+            created.dedicated_bytes += memory_block.size;
+            created.dedicated_targets += target ? 1 : 0;
+            if (runtime->device.IsPageableDeviceLocalMemorySupported()) {
+                residency_memory = original_image.DedicatedMemory();
+                residency_tracked = residency_memory != VK_NULL_HANDLE;
+                residency_bytes = memory_block.size;
+                residency_tier =
+                    target ? VideoCommon::ResidencyTier::Frame : VideoCommon::ResidencyTier::Normal;
+            }
+        } else {
+            ++created.blocks;
+            created.block_bytes += memory_block.size;
+            created.block_targets += target ? 1 : 0;
+        }
+    }
     current_image = &Image::original_image;
     const s32 host_levels = info.resources.levels - static_cast<s32>(host_level_offset);
     storage_image_views.resize(host_levels);
@@ -2813,6 +2847,7 @@ void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
         const VkImage temp_vk_image = runtime->AcquireMsaaScratchImage(image_ci);
 
         scheduler->RequestOutsideRenderPassOperationContext();
+        scheduler->TimestampInternal(TimedWork::TextureUpload);
         auto vk_copies = TransformBufferImageCopies(copies, offset, upload_aspect_mask);
         const VkBuffer src_buffer = buffer;
         const VkImageAspectFlags vk_aspect_mask = upload_aspect_mask;
@@ -2865,6 +2900,7 @@ void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
     }
 
     scheduler->RequestOutsideRenderPassOperationContext();
+    scheduler->TimestampInternal(TimedWork::TextureUpload);
     auto vk_copies = TransformBufferImageCopies(copies, offset, aspect_mask);
     const VkBuffer src_buffer = buffer;
     const VkImage vk_image = *original_image;
