@@ -41,6 +41,10 @@ enum Feature : u64 {
     // targets, buffers and the stream buffer high, texture cache images by recency
     // (VideoCommon::MemoryPriority). Read once, at device creation.
     VramPriority = 1ull << 6,
+    // frontprep (11-06, play-dkb7 idea 22): the split's front makes each draw's graphics pipeline
+    // state from its copy of the registers and sends it before the draw; the back's pipeline
+    // lookup takes it in place of FixedPipelineState::Refresh (vk_front_pipeline_key.h).
+    FrontPipelineKey = 1ull << 10,
     // fences (11-05): direct draws with no vertices or no instances skip the draw setup.
     ZeroDrawSkip = 1ull << 40,
     // vkoff (11-05): draws with none of the dynamic states' dirty flags set skip their updates.

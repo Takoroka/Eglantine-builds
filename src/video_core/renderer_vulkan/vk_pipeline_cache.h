@@ -34,6 +34,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
+#include "video_core/renderer_vulkan/vk_front_pipeline_key.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
@@ -49,6 +50,10 @@ struct Program;
 
 namespace VideoCore {
 class ShaderNotify;
+}
+
+namespace VideoCommon {
+class GpuSplit;
 }
 
 namespace Vulkan {
@@ -137,6 +142,16 @@ public:
     /// Waits for the translations running on workers and starts no more: guest GPU memory, which
     /// they read texture descriptors from, goes away at shutdown.
     void StopTranslation();
+
+    /// Split GPU thread, on its front (A/B bit FrontPipelineKey): the pipeline state of the draw
+    /// `engine`'s next method makes, from the front's copy of its registers, sent ahead of that
+    /// method (vk_front_pipeline_key.h). False when this device's state can't be made there.
+    bool SendFrontKey(VideoCommon::GpuSplit& split, Tegra::Engines::EngineInterface* engine,
+                      const u32* regs);
+
+    /// The back, running a FrontKeyEntry: `size` bytes of state for the draw in the ring entry
+    /// that starts at `valid_at`.
+    void SetFrontKey(const u64* words, u32 size, u64 valid_at) noexcept;
 
 private:
     /// A graphics pipeline translated and built on a pipeline worker (asynchronous shaders).
@@ -227,6 +242,30 @@ private:
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};
     mutable const char* graphics_miss{"no-pipeline"};
+
+    /// A/B bit FrontPipelineKey: puts the front's state for this draw into graphics_key in place
+    /// of FixedPipelineState::Refresh, when one came for the ring entry running now. With
+    /// EDEN_NX2_FRONT_KEY_VERIFY=<n>, every n-th one is compared with Refresh instead (and not
+    /// used). The back thread only, as everything below.
+    [[nodiscard]] bool TakeFrontKey();
+    void ReportFrontKeys();
+    struct FrontKey {
+        std::array<u64, FrontKeyFullWords> words{};
+        u32 size{};
+        u64 valid_at{~u64{0}}; ///< ~0: none
+    } front_key;
+    struct FrontKeyStats {
+        u64 arrived{};    ///< SetFrontKey
+        u64 lookups{};    ///< CurrentGraphicsPipeline past the shader stages
+        u64 taken{};      ///< ... that took a front key
+        u64 found{};      ///< ... found in the pipeline's transitions (Next)
+        u64 slow{};       ///< ... that went to the cache (CurrentGraphicsPipelineSlowPath)
+        u64 elsewhere{};  ///< Front keys there for another ring entry (a deferred draw, a wrap)
+        u64 compared{};   ///< EDEN_NX2_FRONT_KEY_VERIFY
+        u64 different{};  ///< ... different from Refresh
+        u32 report_tick{};
+        std::chrono::steady_clock::time_point window{std::chrono::steady_clock::now()};
+    } front_stats;
 
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();

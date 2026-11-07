@@ -36,6 +36,7 @@
 #include "common/env_gate.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
@@ -847,12 +848,178 @@ bool PipelineCache::IsIndirectResetShader() const {
            info->lowered_native->diagnostic_key == reset_key;
 }
 
+namespace {
+/// EDEN_NX2_FRONT_KEY_VERIFY=<n>: every n-th front key is compared with Refresh instead of used.
+u32 FrontKeyVerifyEvery() {
+    static const u32 every = [] {
+        const char* value = std::getenv("EDEN_NX2_FRONT_KEY_VERIFY");
+        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
+    }();
+    return every;
+}
+
+template <size_t Words>
+bool SendFrontKeyEntry(VideoCommon::GpuSplit& split, Tegra::Engines::EngineInterface* engine,
+                       PipelineCache* cache, const FixedPipelineState& state, u32 size) {
+    FrontKeyEntry<Words> entry{};
+    entry.cache = cache;
+    entry.size = size;
+    std::memcpy(entry.words.data(), &state, size);
+    split.DeferBeforeMethod(engine, entry);
+    return true;
+}
+} // Anonymous namespace
+
+template <size_t Words>
+void FrontKeyEntry<Words>::operator()() const {
+    // The method's entry starts right after this one (GpuSplit::DeferBeforeMethod).
+    cache->SetFrontKey(words.data(), size,
+                       VideoCommon::GpuSplit::BackEntryPosition() +
+                           VideoCommon::GpuSplit::EntryWords<FrontKeyEntry>());
+}
+
+bool PipelineCache::SendFrontKey(VideoCommon::GpuSplit& split,
+                                 Tegra::Engines::EngineInterface* engine, const u32* regs) {
+    // dynamic_features is set once, in the constructor: the front may read it.
+    const bool supported = FixedPipelineState::FrontRefreshSupported(dynamic_features);
+    if (static bool logged{}; !logged) {
+        // The front's thread only.
+        logged = true;
+        LOG_INFO(Render_Vulkan, "Front pipeline keys: {}",
+                 supported ? "made on the split GPU thread's front (A/B bit FrontPipelineKey)"
+                           : "not made, the device lacks extended dynamic state 2");
+    }
+    if (!supported) {
+        return false;
+    }
+    static_assert(sizeof(Maxwell) == sizeof(u32) * Maxwell::NUM_REGS);
+    // Zeroed like graphics_key: parts this device's Refresh never writes stay zero on both sides.
+    FixedPipelineState state{};
+    state.RefreshFront(*reinterpret_cast<const Maxwell*>(regs), dynamic_features);
+    const u32 size = static_cast<u32>(state.Size());
+    g_front_keys_sent.fetch_add(1, std::memory_order_relaxed);
+    switch (FrontKeyEntryWords(size)) {
+    case FrontKeySmallWords:
+        return SendFrontKeyEntry<FrontKeySmallWords>(split, engine, this, state, size);
+    case FrontKeyMediumWords:
+        return SendFrontKeyEntry<FrontKeyMediumWords>(split, engine, this, state, size);
+    default:
+        return SendFrontKeyEntry<FrontKeyFullWords>(split, engine, this, state, size);
+    }
+}
+
+void PipelineCache::SetFrontKey(const u64* words, u32 size, u64 valid_at) noexcept {
+    ++front_stats.arrived;
+    if (front_key.valid_at != ~u64{0}) {
+        // The last one went unused: its draw was deferred, or a wrap came between.
+        ++front_stats.elsewhere;
+    }
+    std::memcpy(front_key.words.data(), words, size);
+    front_key.size = size;
+    front_key.valid_at = valid_at;
+}
+
+bool PipelineCache::TakeFrontKey() {
+    if (front_key.valid_at == ~u64{0}) {
+        return false;
+    }
+    const u64 valid_at = std::exchange(front_key.valid_at, ~u64{0});
+    if (valid_at != VideoCommon::GpuSplit::BackEntryPosition()) {
+        ++front_stats.elsewhere;
+        return false;
+    }
+    if (!Common::Nx2Ab::On(Common::Nx2Ab::FrontPipelineKey)) {
+        return false;
+    }
+    auto& state = graphics_key.state;
+    if (const u32 every = FrontKeyVerifyEvery(); every != 0 && front_stats.taken % every == 0) {
+        // Then as before, and compared.
+        ++front_stats.taken;
+        state.Refresh(*maxwell3d, dynamic_features);
+        FixedPipelineState front{state};
+        std::memcpy(&front, front_key.words.data(), front_key.size);
+        front.PatchBackFields(maxwell3d->draw_manager.draw_state.topology, maxwell3d->engine_state,
+                              dynamic_features);
+        ++front_stats.compared;
+        const size_t size = state.Size();
+        if (front.Size() != size || std::memcmp(&front, &state, size) != 0) {
+            ++front_stats.different;
+            if (static u32 logged{}; logged < 8) {
+                ++logged;
+                const auto* const a = reinterpret_cast<const u8*>(&front);
+                const auto* const b = reinterpret_cast<const u8*>(&state);
+                size_t first = 0;
+                while (first < size && a[first] == b[first]) {
+                    ++first;
+                }
+                LOG_WARNING(Render_Vulkan,
+                            "Front pipeline key differs from the back's at byte {} of {} (front "
+                            "{} bytes): front raw1 {:#x} raw2 {:#x}, back raw1 {:#x} raw2 {:#x}",
+                            first, size, front.Size(), front.raw1, front.raw2, state.raw1,
+                            state.raw2);
+            }
+        }
+        return false;
+    }
+    ++front_stats.taken;
+    std::memcpy(&state, front_key.words.data(), front_key.size);
+    state.PatchBackFields(maxwell3d->draw_manager.draw_state.topology, maxwell3d->engine_state,
+                          dynamic_features);
+    // What Refresh would have done to the flags, so the next one does what it would have done.
+    FixedPipelineState::ConsumeRefreshFlags(maxwell3d->dirty.flags, dynamic_features);
+    return true;
+}
+
+void PipelineCache::ReportFrontKeys() {
+    if ((++front_stats.report_tick & 255) != 0) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - front_stats.window).count();
+    if (seconds < 30.0) {
+        return;
+    }
+    const auto rate = [seconds](u64 count) { return static_cast<double>(count) / seconds; };
+    const u64 sent = g_front_keys_sent.exchange(0, std::memory_order_relaxed);
+    LOG_INFO(Render_Vulkan,
+             "Front pipeline keys per second (bit 10 {}, verify every {}): {:.0f} sent, {:.0f} "
+             "arrived, {:.0f} of {:.0f} lookups took one ({:.0f} found in the transitions, {:.0f} "
+             "went to the cache), {:.0f} were for another entry; {:.0f} compared, {:.0f} different",
+             Common::Nx2Ab::On(Common::Nx2Ab::FrontPipelineKey) ? "on" : "off",
+             FrontKeyVerifyEvery(), rate(sent), rate(front_stats.arrived),
+             rate(front_stats.taken - front_stats.compared), rate(front_stats.lookups),
+             rate(front_stats.found), rate(front_stats.slow), rate(front_stats.elsewhere),
+             rate(front_stats.compared), rate(front_stats.different));
+    const u32 tick = front_stats.report_tick;
+    front_stats = {};
+    front_stats.report_tick = tick;
+    front_stats.window = now;
+}
+
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
 
     if (!RefreshStages(graphics_key.unique_hashes)) {
         current_pipeline = nullptr;
         graphics_miss = "stage-rejected";
         return nullptr;
+    }
+    ++front_stats.lookups;
+    ReportFrontKeys();
+    if (TakeFrontKey()) {
+        // graphics_key.state is what Refresh would make (A/B bit FrontPipelineKey).
+        if (current_pipeline) {
+            if (GraphicsPipeline* const next{current_pipeline->Next(graphics_key)}) {
+                ++front_stats.found;
+                current_pipeline = next;
+                current_pipeline->MarkUsed(frame_count);
+                return BuiltPipeline(current_pipeline);
+            }
+        }
+        // A pipeline the cache looks up or makes gets the back's own state: Refresh redoes
+        // what it always redoes (the flags were consumed, so it keeps the front's other parts).
+        ++front_stats.slow;
+        graphics_key.state.Refresh(*maxwell3d, dynamic_features);
+        return CurrentGraphicsPipelineSlowPath();
     }
     graphics_key.state.Refresh(*maxwell3d, dynamic_features);
 

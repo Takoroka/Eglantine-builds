@@ -168,6 +168,25 @@ public:
     }
     void DeferFunction(std::function<void()>&& func);
 
+    /// DeferEngineWork for the very next Method or MacroWrite of `engine`: the engine is selected
+    /// first, so no other entry comes between them unless the ring wraps there. On the back, the
+    /// method's entry starts at BackEntryPosition() + EntryWords<Func>() as seen from `func`.
+    template <typename Func>
+    void DeferBeforeMethod(Tegra::Engines::EngineInterface* engine, const Func& func) {
+        SelectEngine(engine);
+        DeferImpl(func, Quiet);
+    }
+    /// The words a Defer of `Func` takes in the ring.
+    template <typename Func>
+    [[nodiscard]] static constexpr u64 EntryWords() noexcept {
+        return 2 + (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
+    }
+    /// On the back, while it runs an entry: where that entry starts in the ring (positions only
+    /// grow; a wrap skips to the next multiple of the ring size). ~0 on any other thread.
+    [[nodiscard]] static u64 BackEntryPosition() noexcept {
+        return t_back_read_position != nullptr ? *t_back_read_position : ~u64{0};
+    }
+
     /// Runs `func` on the back and waits for it: for work on back-owned state, such as a buffer
     /// cache download that records into the Vulkan scheduler. A drained back still submits from
     /// its idle hook, so the front never touches that state itself.

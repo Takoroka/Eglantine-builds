@@ -263,6 +263,35 @@ struct FixedPipelineState {
 
     void Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFeatures& features);
 
+    /// Refresh from `regs` alone, as the back would: `topology` is the draw manager's, `stage`
+    /// the engine's hint, and the parts kept per dirty flag are redone where `flags` says (and
+    /// those flags cleared, as Refresh clears them).
+    void RefreshWith(const Maxwell& regs, Maxwell::PrimitiveTopology topology,
+                     Tegra::Engines::Maxwell3D::EngineHint stage,
+                     const DynamicFeatures& features,
+                     Tegra::Engines::Maxwell3D::DirtyState::Flags& flags);
+
+    /// The split GPU thread's front (A/B bit FrontPipelineKey): the whole state from its copy of
+    /// the registers, every part kept per dirty flag included, leaving the draw manager's
+    /// topology and the engine's hint out (PatchBackFields fills them in on the back).
+    void RefreshFront(const Maxwell& regs, const DynamicFeatures& features);
+
+    /// The back, after taking a state RefreshFront made: the fields only the back knows.
+    void PatchBackFields(Maxwell::PrimitiveTopology topology,
+                         Tegra::Engines::Maxwell3D::EngineHint stage,
+                         const DynamicFeatures& features) noexcept;
+
+    /// The back, in place of Refresh for a state RefreshFront made: clears the dirty flags
+    /// Refresh would have cleared, so the next Refresh does what it would have done.
+    static void ConsumeRefreshFlags(Tegra::Engines::Maxwell3D::DirtyState::Flags& flags,
+                                    const DynamicFeatures& features) noexcept;
+
+    /// Whether RefreshFront can make the state for these features: the topology must not reach
+    /// the packed dynamic state (extended dynamic state 2), only the field PatchBackFields sets.
+    [[nodiscard]] static bool FrontRefreshSupported(const DynamicFeatures& features) noexcept {
+        return features.has_extended_dynamic_state_2;
+    }
+
     /// Rewrites a state refreshed without dynamic vertex input as Refresh makes it with it: the
     /// attribute type classes replace the vertex layout.
     void ConvertToDynamicVertexInput() noexcept;
@@ -298,6 +327,12 @@ struct FixedPipelineState {
     u32 DynamicAttributeType(size_t index) const noexcept {
         return (attribute_types >> (index * 2)) & 0b11;
     }
+
+private:
+    template <typename DirtyAccess>
+    void RefreshImpl(const Maxwell& regs, Maxwell::PrimitiveTopology topology_,
+                     Tegra::Engines::Maxwell3D::EngineHint stage, const DynamicFeatures& features,
+                     DirtyAccess& dirty);
 };
 static_assert(std::has_unique_object_representations_v<FixedPipelineState>);
 static_assert(std::is_trivially_copyable_v<FixedPipelineState>);
