@@ -17,6 +17,7 @@
 #include <intrin.h>
 #endif
 
+#include "common/nx2_ab.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vertex_repack.h"
@@ -633,6 +634,26 @@ void BufferCacheRuntime::PostCopyBarrier() {
     scheduler.Record([](vk::CommandBuffer cmdbuf) {
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
                                0, WRITE_BARRIER);
+    });
+}
+
+void BufferCacheRuntime::HostReadBarrier() {
+    // Waiting for the fence doesn't make device writes visible to the host by itself: the copies'
+    // writes need a dependency on the host stage first. The post-copy barriers only reach the
+    // graphics and compute stages. Download memory is host coherent, so no invalidation follows.
+    if (!Common::Nx2Ab::On(Common::Nx2Ab::HostReadBarrier)) {
+        return;
+    }
+    static constexpr VkMemoryBarrier HOST_READ_BARRIER{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+    };
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([](vk::CommandBuffer cmdbuf) {
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                               HOST_READ_BARRIER);
     });
 }
 
