@@ -25,6 +25,10 @@ enum Feature : u64 {
     // texlookup (11-06): the Texture Cache Memory Limit setting caps the collector's thresholds
     // (TextureCache::ApplyThresholdOverrides) in place of MaxCriticalMemory.
     TcMemoryLimit = 1ull << 1,
+    // vkoff (11-06): in game, graphics pipelines nothing waits for (asynchronous shaders) build on
+    // a few threads of their own; boot and the builds a draw or dispatch waits for keep all of the
+    // pipeline workers (PipelineCache::async_workers).
+    BuilderThreadsByPhase = 1ull << 4,
     // fences (11-05): direct draws with no vertices or no instances skip the draw setup.
     ZeroDrawSkip = 1ull << 40,
     // vkoff (11-05): draws with none of the dynamic states' dirty flags set skip their updates.
