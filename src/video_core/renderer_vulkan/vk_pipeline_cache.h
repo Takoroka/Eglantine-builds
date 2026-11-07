@@ -153,7 +153,15 @@ private:
         /// Translation read engine state the environments did not copy.
         bool needs_gpu_thread{};
         std::atomic<State> state{State::Queued};
+        std::chrono::steady_clock::time_point queued{};
     };
+
+    /// The workers asynchronous graphics builds go to: async_workers in game while A/B bit
+    /// BuilderThreadsByPhase is on, workers otherwise.
+    [[nodiscard]] Common::ThreadWorker& AsyncWorkers();
+
+    /// Logs the in-game build counters (at most every 30 s, on the GPU thread).
+    void LogBuildCounters();
 
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
 
@@ -260,7 +268,30 @@ private:
     std::atomic<size_t> last_cache_size{};
     std::atomic_bool flush_in_flight{};
 
+    /// In-game build counters, logged by LogBuildCounters (before the workers that update them).
+    struct BuildCounters {
+        std::atomic<u64> async_queued{};
+        std::atomic<u64> async_started{};
+        std::atomic<u64> async_wait_us{};
+        std::atomic<u64> async_wait_max_us{};
+        // GPU thread only:
+        u64 backlog_max{};
+        u64 gpu_thread_graphics{};
+        u64 gpu_thread_compute{};
+        u64 queued_logged{};
+        u64 started_logged{};
+        std::chrono::steady_clock::time_point window_start{};
+    } build_counters;
+    size_t worker_count{};
+    size_t async_worker_count{};
+
     Common::ThreadWorker workers;
+    /// In game, graphics pipelines nothing waits for (asynchronous shaders: their draws are
+    /// skipped meanwhile) translate and build here, on a few threads, not on all of workers
+    /// (A/B bit BuilderThreadsByPhase). Boot, and the builds a draw or dispatch waits for, keep
+    /// all of workers, which no longer have that queue in front of them. Null when the bit is
+    /// off at start or the driver can't compile in parallel.
+    std::unique_ptr<Common::ThreadWorker> async_workers;
     Common::ThreadWorker serialization_thread;
     /// Builds software matrix compute pipelines on AMD's own compilers, which nothing waits for
     /// (A/B bit DeferredMatrixPipelines); null elsewhere. Joined before the pipelines it builds go.

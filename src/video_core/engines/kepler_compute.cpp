@@ -8,6 +8,7 @@
 #include <atomic>
 #include <bit>
 #include <bitset>
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <optional>
@@ -544,6 +545,31 @@ void KeplerCompute::CallMultiMethod(Core::System& system, u32 method, const u32*
     }
 }
 
+namespace {
+/// Counts dispatches of rejected programs that were skipped without a throw; logs the count at
+/// most every 30 s while they go on.
+void CountSkippedRejectedDispatch() {
+    using Clock = std::chrono::steady_clock;
+    static std::atomic<u64> skipped{};
+    static std::atomic<Clock::rep> window_start{};
+    skipped.fetch_add(1, std::memory_order_relaxed);
+    const Clock::rep now = Clock::now().time_since_epoch().count();
+    Clock::rep start = window_start.load(std::memory_order_relaxed);
+    if (start == 0) {
+        window_start.compare_exchange_strong(start, now, std::memory_order_relaxed);
+        return;
+    }
+    const auto elapsed = Clock::duration{now - start};
+    if (elapsed >= std::chrono::seconds{30} &&
+        window_start.compare_exchange_strong(start, now, std::memory_order_relaxed)) {
+        const u64 count = skipped.exchange(0, std::memory_order_relaxed);
+        const double seconds = std::chrono::duration<double>(elapsed).count();
+        LOG_INFO(HW_GPU, "Rejected compute dispatches skipped: {} in {:.0f} s ({:.0f}/s)", count,
+                 seconds, static_cast<double>(count) / seconds);
+    }
+}
+} // Anonymous namespace
+
 bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& qmd) {
     launch_description = {};
     launch_description.grid_dim_x.Assign(qmd[12]);
@@ -790,20 +816,13 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     }
 
     bool dispatched = true;
-    try {
-        rasterizer->DispatchCompute();
-        diag_note("ok");
-    } catch (const Shader::Exception& error) {
-        diag_note("failed", error.what());
-        static std::unordered_set<std::string> logged;
-        if (logged.insert(error.what()).second) {
-            LOG_ERROR(HW_GPU, "Native compute shader rejected: {}", error.what());
-        }
+    // A dispatch of a rejected program, by the error it was rejected with. A value is what the
+    // launch returns at once.
+    const auto rejected = [&](std::string_view error) -> std::optional<bool> {
         dispatched = false;
         if (dlss_chain.active) {
             ++dlss_chain.rejected;
-        } else if (std::string_view{error.what()}.find("matrix multiply") !=
-                   std::string_view::npos) {
+        } else if (error.find("matrix multiply") != std::string_view::npos) {
             DescribeNativeResources(qmd);
             // The console runs this on tensor cores; stand in with a plain upscale of its input.
             if (UpscaleInsteadOfNativeProgram()) {
@@ -811,6 +830,32 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
             }
             FollowPhotoUpscale();
             return UpscaleFromConstBuffers();
+        }
+        return std::nullopt;
+    };
+    const std::string* skipped_rejection{};
+    try {
+        skipped_rejection = rasterizer->DispatchCompute();
+        if (!skipped_rejection) {
+            diag_note("ok");
+        }
+    } catch (const Shader::Exception& error) {
+        diag_note("failed", error.what());
+        static std::unordered_set<std::string> logged;
+        if (logged.insert(error.what()).second) {
+            LOG_ERROR(HW_GPU, "Native compute shader rejected: {}", error.what());
+        }
+        if (const std::optional<bool> result = rejected(error.what())) {
+            return *result;
+        }
+    }
+    if (skipped_rejection) {
+        // The program was rejected at an earlier dispatch (and logged then): the rasterizer
+        // skipped it without throwing the error again.
+        CountSkippedRejectedDispatch();
+        diag_note("failed", *skipped_rejection);
+        if (const std::optional<bool> result = rejected(*skipped_rejection)) {
+            return *result;
         }
     }
     if (dispatched && !dlss_chain.active && photo_upscale.window_left != 0) {

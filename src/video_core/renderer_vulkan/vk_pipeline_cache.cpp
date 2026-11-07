@@ -14,6 +14,7 @@
 #include <span>
 #include <thread>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 #include <bit>
 #include <numeric>
@@ -367,6 +368,17 @@ size_t GetTotalPipelineWorkers() {
 #endif
 }
 
+// In game, asynchronous graphics builds (nothing waits for them) share the CPU with the
+// emulator's own threads: a first-run burst on all the workers at once (one per host thread
+// but one) slowed the GPU threads. EDEN_NX2_GAME_PIPELINE_THREADS sets their count (default a
+// quarter of the host's threads, 2 to 6).
+size_t InGamePipelineWorkers() {
+    if (const char* value = std::getenv("EDEN_NX2_GAME_PIPELINE_THREADS")) {
+        return std::clamp<size_t>(static_cast<size_t>(std::strtoull(value, nullptr, 10)), 1, 16);
+    }
+    return std::clamp<size_t>(std::thread::hardware_concurrency() / 4, 2, 6);
+}
+
 } // Anonymous namespace
 
 size_t ComputePipelineCacheKey::Hash() const noexcept {
@@ -436,6 +448,14 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
               "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
       serialization_thread(1, "VkPipelineSerialization", {},
                            Common::ThreadPlacement::Background) {
+    worker_count = device.HasBrokenParallelShaderCompiling() ? 1 : GetTotalPipelineWorkers();
+    if (!device.HasBrokenParallelShaderCompiling() &&
+        Common::Nx2Ab::On(Common::Nx2Ab::BuilderThreadsByPhase)) {
+        async_worker_count = (std::min)(InGamePipelineWorkers(), worker_count);
+        async_workers.reset(new Common::ThreadWorker(async_worker_count, "VkPipelineAsync", {},
+                                                     Common::ThreadPlacement::Background));
+    }
+    build_counters.window_start = std::chrono::steady_clock::now();
     if (DefersSoftwareMatrixPipelines(device) &&
         Common::Nx2Ab::On(Common::Nx2Ab::DeferredMatrixPipelines)) {
         matrix_workers.reset(new Common::ThreadWorker(1, "VkMatrixPipelines", {},
@@ -832,6 +852,7 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     if (!is_new) {
         return pipeline.get();
     }
+    ++build_counters.gpu_thread_compute;
     pipeline = CreateComputePipeline(key, shader);
     return pipeline.get();
 }
@@ -1228,6 +1249,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
 void PipelineCache::TickFrame() {
     ++frame_count;
     CollectPendingPipelines();
+    LogBuildCounters();
     while (!evicted_pipelines.empty() && scheduler.IsFree(evicted_pipelines.front().first)) {
         evicted_pipelines.pop_front();
     }
@@ -1235,6 +1257,41 @@ void PipelineCache::TickFrame() {
     if (frame_count % EvictCheckFrames == 0) {
         EvictUnusedPipelines();
     }
+}
+
+void PipelineCache::LogBuildCounters() {
+    auto& counters{build_counters};
+    const auto now{std::chrono::steady_clock::now()};
+    if (now - counters.window_start < std::chrono::seconds{30}) {
+        return;
+    }
+    const double seconds{std::chrono::duration<double>(now - counters.window_start).count()};
+    counters.window_start = now;
+    // The totals stay (the backlog is queued - started); the window's counts are the differences.
+    const u64 queued{counters.async_queued.load(std::memory_order_relaxed)};
+    const u64 started{counters.async_started.load(std::memory_order_relaxed)};
+    const u64 new_queued{queued - std::exchange(counters.queued_logged, queued)};
+    const u64 new_started{started - std::exchange(counters.started_logged, started)};
+    const u64 wait_us{counters.async_wait_us.exchange(0, std::memory_order_relaxed)};
+    const u64 wait_max_us{counters.async_wait_max_us.exchange(0, std::memory_order_relaxed)};
+    const u64 backlog_max{std::exchange(counters.backlog_max, 0)};
+    const u64 gpu_graphics{std::exchange(counters.gpu_thread_graphics, 0)};
+    const u64 gpu_compute{std::exchange(counters.gpu_thread_compute, 0)};
+    if (new_queued == 0 && new_started == 0 && gpu_graphics == 0 && gpu_compute == 0) {
+        return;
+    }
+    const bool async_lane{async_workers && Common::Nx2Ab::On(Common::Nx2Ab::BuilderThreadsByPhase)};
+    LOG_INFO(Render_Vulkan,
+             "Pipeline builds in game ({:.0f} s): {} asynchronous graphics queued, {} started on {} "
+             "threads (queue wait mean {:.1f} ms, max {:.0f} ms; backlog max {}, now {}); {} graphics "
+             "and {} compute for the GPU thread on {} threads [BuilderThreadsByPhase {}]",
+             seconds, new_queued, new_started, async_lane ? async_worker_count : worker_count,
+             new_started != 0
+                 ? static_cast<double>(wait_us) / 1000.0 / static_cast<double>(new_started)
+                 : 0.0,
+             static_cast<double>(wait_max_us) / 1000.0, backlog_max,
+             queued > started ? queued - started : u64{0}, gpu_graphics, gpu_compute, worker_count,
+             async_lane ? "on" : "off");
 }
 
 void PipelineCache::EvictUnusedPipelines() {
@@ -1388,11 +1445,35 @@ void PipelineCache::QueueGraphicsPipeline() {
         }
     }
     pending_graphics.emplace(graphics_key, job);
-    workers.QueueWork([this, job] { BuildPendingPipeline(*job); });
+    job->queued = std::chrono::steady_clock::now();
+    const u64 queued{build_counters.async_queued.fetch_add(1, std::memory_order_relaxed) + 1};
+    const u64 started{build_counters.async_started.load(std::memory_order_relaxed)};
+    build_counters.backlog_max =
+        (std::max)(build_counters.backlog_max, queued > started ? queued - started : u64{0});
+    AsyncWorkers().QueueWork([this, job] { BuildPendingPipeline(*job); });
+}
+
+Common::ThreadWorker& PipelineCache::AsyncWorkers() {
+    if (async_workers && Common::Nx2Ab::On(Common::Nx2Ab::BuilderThreadsByPhase)) {
+        return *async_workers;
+    }
+    return workers;
 }
 
 void PipelineCache::BuildPendingPipeline(PendingGraphicsPipeline& job) {
     using State = PendingGraphicsPipeline::State;
+    {
+        // Counted as started also when the GPU thread built it meanwhile: the queue moved on.
+        const auto waited{std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - job.queued)};
+        const u64 wait_us{waited.count() > 0 ? static_cast<u64>(waited.count()) : u64{0}};
+        build_counters.async_started.fetch_add(1, std::memory_order_relaxed);
+        build_counters.async_wait_us.fetch_add(wait_us, std::memory_order_relaxed);
+        u64 max_us{build_counters.async_wait_max_us.load(std::memory_order_relaxed)};
+        while (wait_us > max_us && !build_counters.async_wait_max_us.compare_exchange_weak(
+                                       max_us, wait_us, std::memory_order_relaxed)) {
+        }
+    }
     State expected{State::Queued};
     if (!job.state.compare_exchange_strong(expected, State::Running, std::memory_order_acq_rel)) {
         return; // Built on the GPU thread
@@ -1701,6 +1782,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     SCOPE_EXIT {
         ReportRuntimePipeline("Graphics", begin);
     };
+    ++build_counters.gpu_thread_graphics;
     GraphicsEnvironments environments;
     GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
 

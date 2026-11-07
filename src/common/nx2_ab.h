@@ -29,6 +29,10 @@ enum Feature : u64 {
     // per core (VideoCore::GuestReadAreaTable) in place of one, stamped also with the epoch of
     // images becoming GPU-modified, so repeat reads skip GetFlushArea's two cache mutexes.
     GuestReadAreas = 1ull << 3,
+    // vkoff (11-06): in game, graphics pipelines nothing waits for (asynchronous shaders) build on
+    // a few threads of their own; boot and the builds a draw or dispatch waits for keep all of the
+    // pipeline workers (PipelineCache::async_workers).
+    BuilderThreadsByPhase = 1ull << 4,
     // fences (11-05): direct draws with no vertices or no instances skip the draw setup.
     ZeroDrawSkip = 1ull << 40,
     // vkoff (11-05): draws with none of the dynamic states' dirty flags set skip their updates.
