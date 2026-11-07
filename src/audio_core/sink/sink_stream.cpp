@@ -17,6 +17,7 @@
 #include "audio_core/sink/sink_stream.h"
 #include "common/common_types.h"
 #include "common/fixed_point.h"
+#include "common/nx2_ab.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -200,6 +201,19 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
     counters.frames_requested.fetch_add(num_frames, std::memory_order_relaxed);
     Nx2AudioStats::AddMax(counters.frames_requested_max, num_frames);
     {
+        // The device's largest request over the last two windows of 512 callbacks (5-10 s at
+        // 10 ms callbacks): what QueueTarget keeps queued for.
+        constexpr u32 WINDOW_CALLBACKS = 512;
+        request_window_max = (std::max)(request_window_max, static_cast<u32>(num_frames));
+        if (++request_window_callbacks == WINDOW_CALLBACKS) {
+            request_previous_max = request_window_max;
+            request_window_max = 0;
+            request_window_callbacks = 0;
+        }
+        request_max_frames.store((std::max)(request_window_max, request_previous_max),
+                                 std::memory_order_relaxed);
+    }
+    {
         const u64 queued = queued_buffers.load(std::memory_order_relaxed);
         counters.queue_sum.fetch_add(queued, std::memory_order_relaxed);
         Nx2AudioStats::AddMin(counters.queue_min, queued);
@@ -288,16 +302,27 @@ u64 SinkStream::GetExpectedPlayedSampleCount() {
     return std::min<u64>(exp_played_sample_count, max_played_sample_count) + TargetSampleCount * 5;
 }
 
+u32 SinkStream::QueueTarget() const {
+    if (type != StreamType::Render || !Common::Nx2Ab::On(Common::Nx2Ab::AudioQueueFollowsDevice)) {
+        return max_queue_size;
+    }
+    return Nx2AudioStats::QueueTargetFor(max_queue_size,
+                                         request_max_frames.load(std::memory_order_relaxed),
+                                         TargetSampleCount);
+}
+
 void SinkStream::WaitFreeSpace(std::stop_token stop_token) {
     std::unique_lock lk{release_mutex};
 
-    auto can_continue = [this]() {
-        return paused || queued_buffers < max_queue_size;
+    const u32 target = QueueTarget();
+    Nx2AudioStats::AddMax(Stats().queue_target_max, target);
+    auto can_continue = [this, target]() {
+        return paused || queued_buffers < target;
     };
 
     release_cv.wait_for(lk, std::chrono::milliseconds(7), can_continue);
 
-    if (queued_buffers > max_queue_size + 3) {
+    if (queued_buffers > target + 3) {
         release_cv.wait(lk, stop_token, can_continue);
     }
 }

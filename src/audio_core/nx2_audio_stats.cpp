@@ -144,18 +144,19 @@ void MaybeReport() {
         const u64 appended = Take(stream.appended);
         const u64 dropped = Take(stream.dropped_samples);
         const u64 paused = Take(stream.paused_callbacks);
+        const u64 target = Take(stream.queue_target_max);
         if (callbacks + appended == 0) {
             continue;
         }
         streams += fmt::format(
             "{}{}: callbacks {:.0f}/s, frames/callback avg {:.0f} max {}, queue min {} avg {:.1f} "
-            "buffers, underruns {} ({:.1f} ms held), short pops {:.1f} ms, buffers in {:.0f}/s, "
-            "dropped {:.1f} ms, paused callbacks {}",
+            "buffers (target max {}), underruns {} ({:.1f} ms held), short pops {:.1f} ms, "
+            "buffers in {:.0f}/s, dropped {:.1f} ms, paused callbacks {}",
             streams.empty() ? "" : " ; ", stream.name.data(), PerSecond(callbacks, window),
             callbacks != 0 ? static_cast<double>(frames) / static_cast<double>(callbacks) : 0.0,
             frames_max, callbacks != 0 ? queue_min : 0,
             callbacks != 0 ? static_cast<double>(queue_sum) / static_cast<double>(callbacks) : 0.0,
-            underruns, static_cast<double>(underrun_frames) / 48.0,
+            target, underruns, static_cast<double>(underrun_frames) / 48.0,
             static_cast<double>(short_pops) / 48.0, PerSecond(appended, window),
             // 2 channels at 48 kHz: samples / 96 = ms
             static_cast<double>(dropped) / 96.0, paused);

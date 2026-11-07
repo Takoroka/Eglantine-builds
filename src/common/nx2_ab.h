@@ -179,6 +179,11 @@ enum Feature : u64 {
     // PageTable::WRITE_MARKED_MASK, so writes still trap) until the GPU writes it again. With
     // bit 3 only (its read path). Bit forced off: the JITs don't check the store mask at all.
     FastmemRestore = 1ull << 18,
+    // hosttime (11-07, MKW audio stutter): render streams keep enough 5 ms buffers for the
+    // device's largest request of the last 5-10 s plus two (SinkStream::QueueTarget), never fewer
+    // than the ring size of 4, so a device that now and then asks for a big chunk (USB/wireless
+    // clock catch-up) isn't underrun each time. Off: always the ring size.
+    AudioQueueFollowsDevice = 1ull << 28,
 };
 
 inline const u64 g_mask = [] {

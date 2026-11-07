@@ -220,7 +220,7 @@ void AudioRenderer::Main(std::stop_token stop_token) {
                         const s64 wait_start = Nx2AudioStats::NowNs();
                         streams[index]->WaitFreeSpace(stop_token);
                         waited_ns = Nx2AudioStats::NowNs() - wait_start;
-                        if (streams[index]->GetQueueSize() >= 4) {
+                        if (streams[index]->GetQueueSize() >= streams[index]->QueueTarget()) {
                             counters.full_after_wait.fetch_add(1, std::memory_order_relaxed);
                         }
                     }

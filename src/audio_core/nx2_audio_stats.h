@@ -24,6 +24,14 @@ inline s64 NowNs() {
         .count();
 }
 
+/// A/B bit AudioQueueFollowsDevice: the buffers (of buffer_frames) a render stream keeps for a
+/// device whose largest recent request was request_frames: enough for it plus two, never fewer
+/// than ring_size.
+constexpr u32 QueueTargetFor(u32 ring_size, u32 request_frames, u32 buffer_frames) {
+    const u32 needed = (request_frames + buffer_frames - 1) / buffer_frames + 2;
+    return needed > ring_size ? needed : ring_size;
+}
+
 inline void AddMax(std::atomic<u64>& max, u64 value) {
     u64 current = max.load(std::memory_order_relaxed);
     while (value > current &&
@@ -53,6 +61,7 @@ struct StreamCounters {
     std::atomic<u64> appended{};              ///< Buffers appended (rendered)
     std::atomic<u64> dropped_samples{};       ///< Samples the full ring didn't take
     std::atomic<u64> paused_callbacks{};      ///< Callbacks while the system was paused
+    std::atomic<u64> queue_target_max{};      ///< Largest queue target the renderer kept
 };
 
 constexpr size_t MAX_STREAMS = 6;
