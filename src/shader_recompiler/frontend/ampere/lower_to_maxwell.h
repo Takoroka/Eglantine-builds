@@ -81,7 +81,12 @@ struct RegisterPressure {
 // bank 1. For one instruction, each aligned quartet of them it uses is copied into a low quartet
 // the instruction doesn't use (whose own values wait in bank 2), and copied back afterwards.
 // The copies are SSA renames: they cost nothing in the host shader.
-inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 reserved) {
+// `exact_addresses`: the uniform-based LDG/STG address register counts as a pair only with .64
+// (bit 90) rather than whenever the access is 64-bit (bit 72, always set in these forms). The
+// first pass keeps the wider count so programs it accepts lower exactly as before; the exact
+// count is the second try for a lone 32-bit address in the last register of a quartet.
+inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 reserved,
+                                                bool exact_addresses = false) {
     RegisterPressure result{input};
     struct Operand { u32 bit, count; };
     std::vector<Operand> operands;
@@ -143,11 +148,23 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
     case 0x981: case 0x986: {
         const u32 width = input.Bits(73, 3), count = width == 6 ? 4 : width == 5 ? 2 : 1;
         operand(opcode == 0x981 ? 16 : 32, count);
-        operand(24, input.Bits(72, 1) ? 2 : 1); break;
+        operand(24, input.Bits(exact_addresses ? 90 : 72, 1) ? 2 : 1); break;
     }
-    case 0x381: { // LDG with a 64-bit address
+    // Kirby Air Riders' race compute programs use nearly every register, so these meet the
+    // reserved ones too. Each lowering accepts only 32-bit forms: one destination, one source.
+    case 0x305: case 0x307: operand(16); operand(32); break; // F2I, FRND (register source)
+    case 0xb05: case 0xd05: case 0xb07: operand(16); break;   // constant-buffer/uniform source
+    case 0x80b: case 0xa0b: case 0xc0b: operand(24); break; // FSETP (0x20b is above)
+    case 0xa10: operand(16); operand(24); operand(64); break; // IADD3, cbuf b (0xc10 is above)
+    case 0x207: operand(16); operand(24); operand(32); break;              // SEL
+    case 0x807: case 0xa07: case 0xc07: case 0xa08: operand(16); operand(24); break; // SEL, FSEL
+    case 0xb66: // TLD (Hyrule Warriors: TLD.SCR.LZ R232, R232): each register operand counted as
+        // the widest pair any of its forms reads or writes (coordinates/level/offsets in Ra and Rb,
+        // up to two results in Rd and two in the second destination).
+        operand(16, 2); operand(24, 2); operand(32, 2); operand(64, 2); break;
+    case 0x381: case 0x386: { // LDG/STG with a 64-bit address
         const u32 width = input.Bits(73, 3), count = width == 6 ? 4 : width == 5 ? 2 : 1;
-        operand(16, count); operand(24, 2); break;
+        operand(opcode == 0x381 ? 16 : 32, count); operand(24, 2); break;
     }
     default:
         result.valid = false; return result;
@@ -226,7 +243,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         const u32 op = instruction.Bits(0, 12);
         uses_uniform_bank |= op == 0x4a4 || op == 0x2bf || op == 0x499;
         uses_uniform_bank |= op == 0x3c4 || op == 0x2bd || op == 0x896 || op == 0xf60 || op == 0xc11 || op == 0xd08 || op == 0xc0c || op == 0x986 || op == 0x9a8 || op == 0xc12 || op == 0xc17 || op == 0xe24 || op == 0xc24 || op == 0xd00 || op == 0xd09 || op == 0x9c3 || op == 0xc45 || op == 0x2a4 || op == 0x891 || op == 0x890 || op == 0x290 || op == 0x28c || op == 0x88c || op == 0x287 || op == 0x887 || op == 0x958 || op == 0xab9 || op == 0xabb || op == 0x899 || op == 0xc20 || op == 0xe21 || op == 0xe23 || op == 0xc02 ||
-                             op == 0x886 || op == 0x3c2 || op == 0xc82 || op == 0x882 || op == 0x292 || op == 0x892 || op == 0x291 || op == 0x981 || op == 0xc13 || op == 0xc10 || op == 0xc23 || op == 0x526 || op == 0x2be || op == 0x8a4 || op == 0xd05 || (op == 0x984 && instruction.Bits(91, 1)) || (op == 0x988 && instruction.Bits(91, 1)) || op == 0x89c || op == 0x883 || op == 0x2a5 || op == 0xd06 || op == 0xf63 || op == 0xf66 || op == 0xf69 || op == 0xc0b || op == 0x8a5 || op == 0x299 || op == 0xc09 || op == 0xc07 || op == 0xf6c || (op == 0x81c && instruction.Bits(67, 1)) || op == 0xc0a ||
+                             op == 0x886 || op == 0x3c2 || op == 0xc82 || op == 0x882 || op == 0x292 || op == 0x892 || op == 0x291 || op == 0x981 || op == 0xc13 || op == 0xc10 || op == 0xc23 || op == 0x526 || op == 0x2be || op == 0x8a4 || op == 0xd05 || (op == 0x984 && instruction.Bits(91, 1)) || (op == 0x988 && instruction.Bits(91, 1)) || op == 0x987 || (op == 0x983 && instruction.Bits(91, 1)) || op == 0x89c || op == 0x883 || op == 0x2a5 || op == 0xd06 || op == 0xf63 || op == 0xf66 || op == 0xf69 || op == 0xc0b || op == 0x8a5 || op == 0x299 || op == 0xc09 || op == 0xc07 || op == 0xf6c || (op == 0x81c && instruction.Bits(67, 1)) || op == 0xc0a ||
                              (op == 0x83b && instruction.Bits(91, 1));
     }
     const auto address_of = [](u32 index) { return 0x50U + index * 8 + ((index + 1) / 3) * 8; };
@@ -289,6 +306,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         }
         if (requires_shadow) {
             pressure = PrepareRegisterPressure(insn, shadow_boundary);
+            if (!pressure.valid) pressure = PrepareRegisterPressure(insn, shadow_boundary, true);
             if (!pressure.valid) return fail(index, "native program uses lowering scratch registers");
             insn = pressure.instruction;
             result.instructions.insert(result.instructions.end(), pressure.prefix.begin(), pressure.prefix.end());
@@ -2688,19 +2706,35 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             result.instructions.push_back(translated);
             break;
         }
-        case 0x387: case 0x983: { // Local spill at [Ra + immediate byte offset].
+        case 0x387: case 0x983: case 0x987: { // Local spill at [Ra + immediate byte offset].
             // The size is bits 73-75 (0-3 = U8, S8, U16, S16, then 4, 5, 6 = 32, 64, 128 bits), as
             // Maxwell's; wider accesses become 32-bit ones. A load's bit 85 (.LU) is a cache hint.
-            const bool store = opcode == 0x387;
+            // With a uniform base too, [Ra + URb + offset] (bit 91), as in Kirby Air Riders: the
+            // store 0x987 has URb in bits 64-71 (STL.128 [UR8+0x40], R4), the load in bits 32-39
+            // (LDL R47, [UR8+0x6c]).
+            const bool store = opcode != 0x983;
+            const bool uniform_base = opcode == 0x987 || (opcode == 0x983 && insn.Bits(91, 1));
             const u32 size = insn.Bits(73, 3);
-            const u32 data = insn.Bits(32, 8), offset = insn.Bits(40, 24), address = insn.Bits(24, 8);
+            const u32 data = insn.Bits(32, 8), offset = insn.Bits(40, 24);
+            u32 address = insn.Bits(24, 8);
             const u32 words = size == 6 ? 4 : size == 5 ? 2 : 1, value = store ? data : static_cast<u32>(dest);
             const u32 alignment = size < 2 ? 1U : size < 4 ? 2U : 4U;
-            if ((address != 255 && address >= 246) || (store && insn.Bits(16, 8)) || (!store && data) ||
+            const u32 base_register = uniform_base ? uniform_register(insn.Bits(store ? 64 : 32, 8)) : 255U;
+            const u32 ignored = uniform_base ? (store ? 0x080000ffU : 0x08000000U) : 0U;
+            if ((address != 255 && address >= 246) || (store && insn.Bits(16, 8)) || (!store && !uniform_base && data) ||
                 (value != 255 && (value + words > 248 || (value & (words - 1)))) || (!store && value == 255) ||
                 (offset & (alignment - 1)) || offset + 4 * words > 0x800000 || size > 6 ||
-                (insn.words[2] & ~(store ? 0xe00U : 0x200e00U)) != 0x00100000U)
+                (insn.words[2] & ~ignored & ~(store ? 0xe00U : 0x200e00U)) != 0x00100000U ||
+                (uniform_base && (!insn.Bits(91, 1) || base_register == ~0U)))
                 return fail(index, "native local scalar spill mode");
+            if (base_register != 255) {
+                if (address == 255) {
+                    address = base_register;
+                } else {
+                    emit(0x5c10000000000000ULL | predicate | 250 | (u64{address} << 8) | (u64{base_register} << 20));
+                    address = 250;
+                }
+            }
             for (u32 word = 0; word < words; ++word)
                 emit((store ? 0xef50000000000000ULL : 0xef40000000000000ULL) | predicate |
                      (value == 255 ? 255U : value + word) | (u64{address} << 8) |
@@ -3113,7 +3147,10 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 emit(base(0x3828000000000000ULL) | (u64{insn.Bits(24, 8)} << 8) | (u64{insn.words[1]} << 20));
                 break;
             }
-            if ((insn.Bits(73, 2) != 3 && !is_signed) || insn.Bits(75, 1) || !insn.Bits(80, 1) || insn.words[1] > 32) return fail(index, "native funnel-shift mode");
+            // SHF.L.U64.HI (Kirby Air Riders: SHF.L.U64.HI R8, R14, 0x10, R9): with a shift of at
+            // most 32 neither mode clamps it, so the high word is the same as the U32 form's.
+            const bool left_u64 = !insn.Bits(76, 1) && insn.Bits(73, 2) == 1;
+            if ((insn.Bits(73, 2) != 3 && !is_signed && !left_u64) || insn.Bits(75, 1) || !insn.Bits(80, 1) || insn.words[1] > 32) return fail(index, "native funnel-shift mode");
             const u32 low = insn.Bits(24, 8), high = insn.Bits(64, 8), shift = insn.words[1];
             if (insn.Bits(76, 1)) {
                 if (low != 255) return fail(index, "native nonzero low right-shift word");
