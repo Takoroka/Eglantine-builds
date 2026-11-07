@@ -970,6 +970,7 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
         normalized_copies.push_back(second_copy);
     }
     runtime.PostCopyBarrier();
+    runtime.HostReadBarrier();
     pending_downloads.emplace_back(std::move(normalized_copies));
     pending_download_ranges.emplace_back(std::move(download_ranges));
     async_buffers.emplace_back(download_staging);
@@ -2616,6 +2617,7 @@ bool BufferCache<P>::Nx2ReadBack(DAddr device_addr, std::span<u8> out) {
         };
         buffer.MarkUsage(copy.src_offset, copy.size);
         runtime.CopyBuffer(staging.buffer, buffer, std::span{&copy, 1}, true);
+        runtime.HostReadBarrier();
         runtime.Finish();
         std::memcpy(out.data(), staging.mapped_span.data(), size);
         return true;
@@ -3163,6 +3165,7 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
         buffer.MarkUsage(download.copy.src_offset, download.copy.size);
         runtime.CopyBuffer(download_staging.buffer, buffer, std::span{&download.copy, 1}, true);
     }
+    runtime.HostReadBarrier();
     runtime.Finish();
     const u8* const mapped_memory = download_staging.mapped_span.data();
     const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
@@ -3221,6 +3224,7 @@ void BufferCache<P>::DownloadRanges(const Common::RangeSet<DAddr>& ranges) {
             buffer.MarkUsage(download.copy.src_offset, download.copy.size);
             runtime.CopyBuffer(download_staging.buffer, buffer, std::span{&download.copy, 1}, true);
         }
+        runtime.HostReadBarrier();
         runtime.Finish();
         const u8* const mapped_memory = download_staging.mapped_span.data();
         for (const Download& download : downloads) {
@@ -3287,6 +3291,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
             buffer.MarkUsage(copy.src_offset, copy.size);
         }
         runtime.CopyBuffer(download_staging.buffer, buffer, copies_span, true);
+        runtime.HostReadBarrier();
         runtime.Finish();
         for (const BufferCopy& copy : copies) {
             const DAddr copy_device_addr = buffer.CpuAddr() + copy.src_offset;

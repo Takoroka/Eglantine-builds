@@ -175,6 +175,10 @@ public:
 
     void PostCopyBarrier();
 
+    /// After copies into a download staging buffer the CPU will read: their writes made visible
+    /// to the host before the submission's fence (A/B bit 54).
+    void HostReadBarrier();
+
     void ClearBuffer(VkBuffer dest_buffer, u32 offset, size_t size, u32 value);
 
     void BindIndexBuffer(PrimitiveTopology topology, IndexFormat index_format, u32 num_indices,

@@ -39,11 +39,13 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                                  Common::ThreadWorker* thread_worker,
                                  PipelineStatistics* pipeline_statistics,
                                  VideoCore::ShaderNotify* shader_notify, const Shader::Info& info_,
-                                 vk::ShaderModule spv_module_, u64 shader_hash_)
+                                 vk::ShaderModule spv_module_, u64 shader_hash_,
+                                 bool skip_until_built_)
     : device{device_},
       pipeline_cache(pipeline_cache_), guest_descriptor_queue{guest_descriptor_queue_},
       descriptor_buffer_ring{descriptor_buffer_ring_}, info{info_},
-      shader_hash{shader_hash_}, spv_module(std::move(spv_module_)) {
+      shader_hash{shader_hash_}, skip_until_built{skip_until_built_ && thread_worker != nullptr},
+      spv_module(std::move(spv_module_)) {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }

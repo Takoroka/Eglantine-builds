@@ -41,7 +41,8 @@ public:
                              Common::ThreadWorker* thread_worker,
                              PipelineStatistics* pipeline_statistics,
                              VideoCore::ShaderNotify* shader_notify, const Shader::Info& info,
-                             vk::ShaderModule spv_module, u64 shader_hash);
+                             vk::ShaderModule spv_module, u64 shader_hash,
+                             bool skip_until_built = false);
 
     ComputePipeline& operator=(ComputePipeline&&) noexcept = delete;
     ComputePipeline(ComputePipeline&&) noexcept = delete;
@@ -57,6 +58,12 @@ public:
         return static_cast<bool>(pipeline);
     }
 
+    /// Built on a worker nothing waits for (PipelineCache matrix_workers) and not built yet, or
+    /// the driver failed it: its dispatches are skipped.
+    bool SkipsDispatches() const noexcept {
+        return skip_until_built && (!is_built.load(std::memory_order_acquire) || !pipeline);
+    }
+
 private:
     /// Builds the pipeline once, on whichever thread gets here first.
     void RunBuild();
@@ -67,6 +74,7 @@ private:
     DescriptorBufferRing& descriptor_buffer_ring;
     Shader::Info info;
     u64 shader_hash{};
+    bool skip_until_built{};
     u32 num_descriptor_entries{};
 
     VideoCommon::ComputeUniformBufferSizes uniform_buffer_sizes{};

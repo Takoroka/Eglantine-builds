@@ -20,6 +20,7 @@
 #include "common/scope_exit.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
+#include "common/nx2_ab.h"
 #include "common/thread_worker.h"
 #include "core/core.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -155,6 +156,29 @@ Shader::AttributeType AttributeType(const FixedPipelineState& state, size_t inde
         return Shader::AttributeType::UnsignedInt;
     }
     return Shader::AttributeType::Disabled;
+}
+
+// Switch 2 geometry shaders may write all 32 generic outputs next to Position and Layer: 133
+// components where Vulkan devices allow 128 (maxGeometryOutputComponents). AMD's Windows driver
+// closed the emulator compiling such a shader at the Mario Tennis Fever match start. Drop the
+// outputs the fragment shader never reads; skipped where it can't tell (legacy, indexed, XFB) and
+// for passthrough shaders the host runs natively (no IR writes the outputs there).
+void PruneUnreadGeometryOutputs(Shader::IR::Program& geometry, const Shader::IR::Program& fragment,
+                                const GraphicsPipelineCacheKey& key, bool native_passthrough) {
+    const Shader::Info& fs{fragment.info};
+    Shader::VaryingState& stores{geometry.info.stores};
+    if (fragment.stage != Shader::Stage::Fragment || key.state.xfb_enabled ||
+        (geometry.is_geometry_passthrough && native_passthrough) || fs.loads_indexed_attributes ||
+        fs.loads.Legacy() || stores.Legacy()) {
+        return;
+    }
+    for (size_t index = 0; index < Shader::IR::NUM_GENERICS; ++index) {
+        if (!fs.loads.Generic(index)) {
+            for (size_t element = 0; element < 4; ++element) {
+                stores.Set(Shader::IR::Attribute::Generic0X + index * 4 + element, false);
+            }
+        }
+    }
 }
 
 Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> programs,
@@ -380,6 +404,14 @@ bool DriverCachesPipelines(const Device& device) {
         return false;
     }
 }
+
+// AMD's own compilers (the Windows driver, AMDVLK) take minutes over the software HMMA compute
+// programs or fail them with VK_ERROR_OUT_OF_HOST_MEMORY, and the GPU thread waited for them
+// (Ocarina's boot and first movie on an RX 6650 XT). RADV builds them in time.
+bool DefersSoftwareMatrixPipelines(const Device& device) {
+    const VkDriverId driver = device.GetDriverID();
+    return driver == VK_DRIVER_ID_AMD_PROPRIETARY || driver == VK_DRIVER_ID_AMD_OPEN_SOURCE;
+}
 } // Anonymous namespace
 
 PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
@@ -402,6 +434,11 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
               "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
       serialization_thread(1, "VkPipelineSerialization", {},
                            Common::ThreadPlacement::Background) {
+    if (DefersSoftwareMatrixPipelines(device) &&
+        Common::Nx2Ab::On(Common::Nx2Ab::DeferredMatrixPipelines)) {
+        matrix_workers.reset(new Common::ThreadWorker(1, "VkMatrixPipelines", {},
+                                                      Common::ThreadPlacement::Background));
+    }
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
@@ -1547,6 +1584,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         runtime_info.bindless_word_base = bindless_word_base;
         bindless_word_base += Shader::NumDescriptors(program.info.texture_descriptors);
         ConvertLegacyToGeneric(program, runtime_info);
+        if (index == static_cast<size_t>(Maxwell::ShaderType::Geometry)) {
+            PruneUnreadGeometryOutputs(
+                program, programs[static_cast<size_t>(Maxwell::ShaderType::Pixel)], key,
+                device.IsNvGeometryShaderPassthroughSupported());
+        }
         const std::vector<u32> code{EmitSPIRV(profile, runtime_info, program, binding)};
         device.SaveShader(code);
         modules[stage_index] = BuildShader(device, code);
@@ -1759,12 +1801,22 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
         const auto name{fmt::format("Shader {:016x}", key.unique_hash)};
         spv_module.SetObjectNameEXT(name.c_str());
     }
-    Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
+    // Software matrix programs on AMD's own compilers: built on a worker nothing waits for (not
+    // even boot), their dispatches skipped until then (RasterizerVulkan::DispatchCompute).
+    const bool defer_build{matrix_workers && program.info.uses_software_matrix};
+    if (defer_build) {
+        LOG_INFO(Render_Vulkan,
+                 "Compute shader {:016X} runs HMMA in software: built in the background, its "
+                 "dispatches are skipped until it is",
+                 key.unique_hash);
+    }
+    Common::ThreadWorker* const thread_worker{
+        defer_build ? matrix_workers.get() : (build_in_parallel ? &workers : nullptr)};
     return std::make_unique<ComputePipeline>(device, scheduler, vulkan_pipeline_cache, descriptor_pool,
                                              guest_descriptor_queue, descriptor_buffer_ring,
                                              thread_worker, statistics,
                                              &shader_notify, program.info, std::move(spv_module),
-                                             key.unique_hash);
+                                             key.unique_hash, defer_build);
 
 } catch (const Shader::Exception& exception) {
     LOG_ERROR(Render_Vulkan, "{}", exception.what());
