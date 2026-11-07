@@ -14,8 +14,12 @@
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
+#include "common/nx2_ab.h"
 #include "core/core_timing.h"
+#include "core/hardware_properties.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/kernel.h"
+#include "core/hle/kernel/physical_core.h"
 #include "core/nx2_cpu_stats.h"
 #include "dynarmic/interface/A64/config.h"
 
@@ -155,9 +159,29 @@ void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception excep
         // The A64 translator raises every hint instruction (its TranslationOptions default
         // hook_hint_instructions to true and the backends don't pass the config's flag), so
         // each one already ends its block here. Counted for the "nx2 CPU hints" line, then
-        // ignored as before.
+        // ignored as before, except WFE/SEV/SEVL with A/B bit WfePark on: a long WFE spin parks
+        // its core briefly, SEVL arms this core's event register, SEV every core's (and ends
+        // their parks). The JIT stops for a pending interrupt when this returns.
         Nx2CpuStats::CountHint(m_parent.m_core_index, HintOf(exception));
         LOG_TRACE(Core_ARM, "ExceptionRaised(exception = {}, pc = {:08X}, code = {:08X}, cached = {:08X})", std::size_t(exception), pc, m_memory.Read32(pc), MemoryReadCode(pc).value_or(0));
+        if (m_parent.m_uses_wall_clock && Common::Nx2Ab::On(Common::Nx2Ab::WfePark)) {
+            auto& kernel = m_parent.m_system.Kernel();
+            switch (exception) {
+            case Dynarmic::A64::Exception::WaitForEvent:
+                kernel.PhysicalCore(m_parent.m_core_index).WaitForEvent(pc);
+                break;
+            case Dynarmic::A64::Exception::SendEventLocal:
+                kernel.PhysicalCore(m_parent.m_core_index).SendEventLocal();
+                break;
+            case Dynarmic::A64::Exception::SendEvent:
+                for (std::size_t core = 0; core < Core::Hardware::NUM_CPU_CORES; ++core) {
+                    kernel.PhysicalCore(core).SendEvent();
+                }
+                break;
+            default:
+                break;
+            }
+        }
         return;
     case Dynarmic::A64::Exception::NoExecuteFault:
         LOG_CRITICAL(Core_ARM, "Cannot execute instruction at unmapped address {:#016x}", pc);

@@ -146,6 +146,15 @@ enum Feature : u64 {
     // their own (Vulkan::ReadbackQueue) after the GPU tick of the source's last use, and wait for
     // that copy alone instead of Finish() (the whole graphics queue).
     ReadbackQueue = 1ull << 11,
+    // hosttime (11-06, play-dkb8 idea 10): plain address-arbiter signals with no thread waiting
+    // in the address's bucket, and waits whose value already doesn't match, return without the
+    // global scheduler lock (KAddressArbiter::m_waiter_hint). EDEN_NX2_KERNEL_WAKE_VERIFY=1
+    // checks every fast signal against the wait tree.
+    KernelWakeFast = 1ull << 23,
+    // hosttime (11-06, play-dkb8 idea 27 step 2): a WFE that has spun for a while parks its core
+    // briefly (precise wait on the core's event), and SEV/SEVL and interrupts end it
+    // (Core::WfePark). A set event register still returns at once.
+    WfePark = 1ull << 24,
 };
 
 inline const u64 g_mask = [] {

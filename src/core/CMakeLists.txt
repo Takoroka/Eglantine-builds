@@ -23,6 +23,8 @@ add_library(core STATIC
     core_timing.h
     cpu_manager.cpp
     cpu_manager.h
+    nx2_wfe_park.cpp
+    nx2_wfe_park.h
     nx2_cpu_stats.cpp
     nx2_cpu_stats.h
     launch_params.cpp

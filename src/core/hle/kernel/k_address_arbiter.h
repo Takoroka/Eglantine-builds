@@ -6,6 +6,9 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
+
 #include "common/assert.h"
 #include "common/common_types.h"
 #include "core/hle/kernel/k_condition_variable.h"
@@ -56,6 +59,14 @@ public:
         }
     }
 
+    /// TEMP (A/B bit KernelWakeFast): threads waiting on an address of the bucket, counted from
+    /// just before a wait reads the user value until the thread leaves m_tree (kept with the bit
+    /// off too, so the bit can flip in a run). Zero: no thread waits on any address of the bucket.
+    static constexpr size_t WAITER_BUCKETS = 256;
+    static constexpr size_t WaiterBucket(u64 addr) noexcept {
+        return static_cast<size_t>(((addr >> 2) * 0x9E3779B97F4A7C15ULL) >> 56);
+    }
+
 private:
     Result Signal(uint64_t addr, s32 count);
     Result SignalAndIncrementIfEqual(uint64_t addr, s32 value, s32 count);
@@ -63,9 +74,18 @@ private:
     Result WaitIfLessThan(uint64_t addr, s32 value, bool decrement, s64 timeout);
     Result WaitIfEqual(uint64_t addr, s64 value, s64 timeout, bool is_64_bit);
 
+    /// Ends the waits of up to count threads waiting on addr (all of them with count <= 0),
+    /// starting at it; under the scheduler lock. Returns how many it woke.
+    s32 EndWaits(ThreadTree::iterator it, uint64_t addr, s32 count);
+
+    std::atomic<u32>& WaiterHint(u64 addr) noexcept {
+        return m_waiter_hint[WaiterBucket(addr)];
+    }
+
 private:
     ThreadTree m_tree;
     Core::System& system;
+    std::array<std::atomic<u32>, WAITER_BUCKETS> m_waiter_hint{};
 };
 
 } // namespace Kernel
