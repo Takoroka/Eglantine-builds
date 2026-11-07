@@ -47,6 +47,10 @@ enum Feature : u64 {
     ListFlushBatch = 1ull << 51,     ///< List drains download all draw-written list pages at once
     IndirectDrawMacro = 1ull << 52,  ///< GPU-written draw arguments of NVN2's indirect draw macro
                                      ///< drawn from the GPU (Maxwell3D::FrontIndirectDrawMacro)
+    // backperf (11-06): a fragment barrier keeps the render pass going until a draw samples one
+    // of its render targets (RasterizerVulkan::FragmentBarrier). Idea: zortos293/lichii
+    // 60e565c44 + 162a9736f. (53 was AcquireParkEarly, dropped with its code.)
+    FragmentBarrierDefer = 1ull << 53,
     IndirectDrawMacroExtended = 1ull << 55, ///< The same for the macro's variant that also writes
                                             ///< base vertex/instance to the constant buffer
     // backperf (11-06): pipelines whose only writes are storage buffers take the buffer refresh

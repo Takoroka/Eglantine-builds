@@ -291,7 +291,11 @@ void Scheduler::FlushDeferredClear() {
     EndRenderPass();
 }
 
-void Scheduler::RequestRenderpass(const Framebuffer* framebuffer) {
+void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, bool keeps_fragment_barrier) {
+    if (fragment_barrier.EndsPassOnRequest(keeps_fragment_barrier)) {
+        // Blits and texture draws sample a source that may be one of the pass's attachments.
+        EndRenderPass();
+    }
     if (deferred_clear.framebuffer == framebuffer) {
         RealizeDeferredClear();
         return;
@@ -500,6 +504,8 @@ void Scheduler::EndPendingOperations() {
 void Scheduler::EndRenderPass()
     {
         RealizeDeferredClear();
+        // The barrier after the pass (below) is what a deferred fragment barrier waits for.
+        fragment_barrier.OnPassEnd();
         if (!state.renderpass) {
             return;
         }

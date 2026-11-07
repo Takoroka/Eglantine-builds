@@ -20,6 +20,7 @@
 #include "common/polyfill_thread.h"
 #include "common/settings.h"
 #include "video_core/gpu_split.h"
+#include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -74,8 +75,10 @@ public:
     /// Sends currently recorded work to the worker thread.
     void DispatchWork();
 
-    /// Requests to begin a renderpass.
-    void RequestRenderpass(const Framebuffer* framebuffer);
+    /// Requests to begin a renderpass. A fragment barrier deferred in the current pass
+    /// (DeferFragmentBarrier) ends it first, unless keeps_fragment_barrier: the caller has made
+    /// sure what follows doesn't sample the pass's attachments (GraphicsPipeline's setup, clears).
+    void RequestRenderpass(const Framebuffer* framebuffer, bool keeps_fragment_barrier = false);
 
     /// Defers a full-attachment color clear so it becomes the next render pass.
     bool DeferColorClear(const Framebuffer* framebuffer, u32 rt_slot, const VkClearValue& value);
@@ -104,6 +107,26 @@ public:
     /// Returns true when a render pass is currently active in the scheduler state.
     bool IsRenderPassActive() const {
         return state.renderpass != VK_NULL_HANDLE;
+    }
+
+    /// The guest asked for a fragment barrier while a render pass is active (A/B bit
+    /// FragmentBarrierDefer): the pass goes on until something reads what it wrote. Its end
+    /// (EndRenderPass, whatever ends it) records the barrier.
+    void DeferFragmentBarrier() noexcept {
+        fragment_barrier.Defer();
+    }
+
+    /// A deferred fragment barrier has not been recorded yet.
+    [[nodiscard]] bool FragmentBarrierPending() const noexcept {
+        return fragment_barrier.Pending();
+    }
+
+    /// A draw's full setup: ends the pass (recording a deferred fragment barrier) before a draw
+    /// that samples one of its render targets.
+    void BeforeDrawSampling(bool samples_render_target) {
+        if (fragment_barrier.EndsPassForDraw(samples_render_target)) {
+            EndRenderPass();
+        }
     }
 
     /// Update the pipeline to the current execution context.
@@ -382,6 +405,7 @@ private:
     State state;
     u64 record_serial = 0;
     bool compute_barrier_pending = false; ///< RequestComputeBarrier
+    FragmentBarrierState fragment_barrier; ///< DeferFragmentBarrier
 
     u32 num_renderpass_images = 0;
     std::array<VkImage, 9> renderpass_images{};
