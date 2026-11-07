@@ -140,8 +140,8 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
                 RethrowIfRejected(*cpu_shader_addr);
                 GraphicsEnvironment env{*maxwell3d, *gpu_memory, program, native ? shader_addr : base_addr, start_address};
                 shader_info = MakeShaderInfo(env, *cpu_shader_addr);
-            } catch (const Shader::Exception&) {
-                RememberRejection(*cpu_shader_addr);
+            } catch (const Shader::Exception& error) {
+                RememberRejection(*cpu_shader_addr, error.what());
                 // Once per program: which stage slot it is bound to, its header and the slot's
                 // registers (to tell how a pipeline with task/mesh programs is set up).
                 static std::unordered_set<GPUVAddr> described;
@@ -195,6 +195,7 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
 }
 
 const ShaderInfo* ShaderCache::ComputeShader() {
+    compute_rejection = nullptr;
     const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
     const auto& qmd{kepler_compute->launch_description};
     const GPUVAddr shader_addr{program_base + qmd.program_start};
@@ -206,12 +207,21 @@ const ShaderInfo* ShaderCache::ComputeShader() {
     if (const ShaderInfo* const shader = TryGet(*cpu_shader_addr)) {
         return shader;
     }
+    if (kepler_compute->IsNativeMode()) {
+        // A rejected program fails the same way at every dispatch: skip it without throwing its
+        // error again (two C++ throws at each dispatch), as draws of rejected programs are.
+        // Idea: zortos293/lichii 809fb3aa3.
+        if (const std::string* const text = RejectionText(*cpu_shader_addr)) {
+            compute_rejection = text;
+            return nullptr;
+        }
+    }
     try {
         RethrowIfRejected(*cpu_shader_addr);
         ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start};
         return MakeShaderInfo(env, *cpu_shader_addr);
-    } catch (const Shader::Exception&) {
-        RememberRejection(*cpu_shader_addr);
+    } catch (const Shader::Exception& error) {
+        RememberRejection(*cpu_shader_addr, error.what());
         throw;
     }
 }
@@ -219,7 +229,7 @@ const ShaderInfo* ShaderCache::ComputeShader() {
 void ShaderCache::RethrowIfRejected(VAddr addr) {
     std::scoped_lock lock{rejected_mutex};
     if (const auto it = rejected_native.find(addr); it != rejected_native.end()) {
-        std::rethrow_exception(it->second);
+        std::rethrow_exception(it->second.error);
     }
 }
 
@@ -228,9 +238,20 @@ bool ShaderCache::IsRejected(VAddr addr) {
     return rejected_native.contains(addr);
 }
 
-void ShaderCache::RememberRejection(VAddr addr) {
+const std::string* ShaderCache::RejectionText(VAddr addr) {
     std::scoped_lock lock{rejected_mutex};
-    rejected_native.emplace(addr, std::current_exception());
+    const auto it = rejected_native.find(addr);
+    return it != rejected_native.end() ? it->second.text : nullptr;
+}
+
+void ShaderCache::RememberRejection(VAddr addr, std::string_view text) {
+    std::scoped_lock lock{rejected_mutex};
+    if (rejected_native.contains(addr)) {
+        // The first error stays (a rethrow of it lands here too).
+        return;
+    }
+    const std::string* const kept_text{&*rejection_texts.emplace(text).first};
+    rejected_native.emplace(addr, Rejection{std::current_exception(), kept_text});
     rejected_lowest.store((std::min)(rejected_lowest.load(std::memory_order_relaxed), addr),
                           std::memory_order_relaxed);
     rejected_highest.store((std::max)(rejected_highest.load(std::memory_order_relaxed), addr),

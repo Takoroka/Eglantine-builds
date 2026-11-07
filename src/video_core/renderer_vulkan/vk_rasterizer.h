@@ -94,7 +94,7 @@ public:
     void DrawIndirect() override;
     void DrawTexture() override;
     void Clear(u32 layer_count) override;
-    void DispatchCompute() override;
+    const std::string* DispatchCompute() override;
     void ResetCounter(VideoCommon::QueryType type) override;
     void Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) override;
