@@ -78,6 +78,11 @@ enum Feature : u64 {
     // un-inset endpoints too and keeps the pair with less error: two-colour blocks (text, UI,
     // decals) 32 -> 42 dB, like the CPU encoder (BcEncoderPass::Encode).
     GpuBcEncodeEndpoints = 1ull << 26,
+    // backperf (11-07, Kirby Air Riders' intro movie at 2 fps): the video decoder's movie clock
+    // (late-frame drops) is set when the client releases a frame, not when it acquires one, so a
+    // client that acquires ahead and shows frames at their pts isn't handed frames in its future
+    // (INx2VideoSession::ClockFromRelease).
+    VdecReleaseClock = 1ull << 30,
     // fences (11-05): direct draws with no vertices or no instances skip the draw setup.
     ZeroDrawSkip = 1ull << 40,
     // vkoff (11-05): draws with none of the dynamic states' dirty flags set skip their updates.
