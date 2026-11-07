@@ -1,4 +1,5 @@
 name: deck-appimage
+run-name: deck AppImage ${{ inputs.refspec }} ${{ inputs.sha }}
 
 # Manual x86_64 Linux build (tar.gz + AppImage, e.g. for Steam Deck test builds), run with
 #   gh workflow run deck-appimage.yml -f sha=<full sha> -f version=<label> -f refspec=<label> -f tag=<label>
