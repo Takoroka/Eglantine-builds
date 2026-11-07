@@ -322,7 +322,10 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #endif
 
 constexpr int default_mouse_hide_timeout = 2500;
-constexpr int default_input_update_timeout = 1;
+// Input pump (SDL controller polling and the button-mapped sticks' updates): 250 Hz. The stick
+// ramps are timed by the clock, not by the pump, and SDL motion events carry their own
+// timestamps; 1 ms woke the Qt main thread 1000 times a second.
+constexpr int default_input_update_timeout = 4;
 constexpr int EmuThreadStopTimeoutMs = 10'000;
 
 constexpr size_t CopyBufferSize = 1_MiB;
