@@ -77,6 +77,14 @@ struct RenderCounters {
     std::atomic<u64> lock_wait_ns_max{};   ///< SendCommandToDsp waiting for the session lock
     std::atomic<u64> generate_ns_max{};    ///< SendCommandToDsp's whole time
     std::atomic<u64> voices_starved{};     ///< Voice decodes that ran out of wave buffers
+    /// Voices that starved and got data again within 200 ms (a gap in a continuing stream, not
+    /// a sound that ended), the gaps' summed and longest length in passes (5 ms each), and the
+    /// sample format of the voices that starved (index = SampleFormat).
+    std::atomic<u64> starved_resumed{};
+    std::atomic<u64> resumed_gap_passes{};
+    std::atomic<u64> resumed_gap_passes_max{};
+    std::array<std::atomic<u64>, 8> starved_by_format{};
+    std::atomic<u64> pass_index{};         ///< Monotonic ADSP pass count (never reset)
 };
 
 inline RenderCounters g_render{};
@@ -86,5 +94,13 @@ StreamCounters& Stream(std::string_view name);
 
 /// Logs the line when 10 s have passed since the last one (any thread; one wins).
 void MaybeReport();
+
+/// A voice decode ended (the ADSP thread): starved or not, for the resumed-gap counters.
+/// voice: the voice channel's state (its identity), format: the SampleFormat value.
+void CountVoiceDecode(const void* voice, u32 format, bool starved);
+
+/// EDEN_NX2_AUDIO_DUMP=<dir>: appends a render session's final mix (before volume, so a muted
+/// run still has it) to <dir>/<stream name>.pcm as interleaved s16. The ADSP thread only.
+void DumpMix(std::string_view stream_name, const s16* samples, size_t count, u32 channels);
 
 } // namespace AudioCore::Nx2AudioStats

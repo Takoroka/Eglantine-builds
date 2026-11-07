@@ -152,6 +152,11 @@ public:
         device_volume = volume_;
     }
 
+    /// This stream's name (as the sink opened it).
+    const std::string& GetName() const {
+        return name;
+    }
+
     /**
      * Get the number of queued audio buffers.
      *

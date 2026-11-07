@@ -396,10 +396,14 @@ void DecodeFromWaveBuffers(Core::Memory::Memory& memory, const DecodeFromWaveBuf
 
         output_buffer = output_buffer.subspan(samples_to_write);
     }
-    // TEMP ("nx2 audio"): a voice ran out of the game's wave buffers in this render pass.
+    // TEMP ("nx2 audio"): a voice ran out of the game's wave buffers in this render pass, and
+    // whether one that did comes back soon (a gap in a stream, not a sound that ended).
     if (is_buffer_starved) {
         AudioCore::Nx2AudioStats::g_render.voices_starved.fetch_add(1, std::memory_order_relaxed);
     }
+    AudioCore::Nx2AudioStats::CountVoiceDecode(args.voice_state,
+                                               static_cast<u32>(args.sample_format),
+                                               is_buffer_starved);
 
     voice_state.wave_buffers_consumed = wavebuffers_consumed;
     voice_state.played_sample_count = played_sample_count;

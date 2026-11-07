@@ -7,8 +7,10 @@
 #include <algorithm>
 
 #include "audio_core/adsp/apps/audio_renderer/command_list_processor.h"
+#include "audio_core/nx2_audio_stats.h"
 #include "audio_core/renderer/command/sink/device.h"
 #include "audio_core/sink/sink.h"
+#include "audio_core/sink/sink_stream.h"
 
 namespace AudioCore::Renderer {
 
@@ -47,6 +49,9 @@ void DeviceSinkCommand::Process(const AudioRenderer::CommandListProcessor& proce
     }
 
     out_buffer.tag = reinterpret_cast<u64>(samples.data());
+    // TEMP (EDEN_NX2_AUDIO_DUMP): the final mix before the volume (a muted run still has it).
+    Nx2AudioStats::DumpMix(stream->GetName(), samples.data(), out_buffer.frames * input_count,
+                           input_count);
     stream->AppendBuffer(out_buffer, {samples.data(), out_buffer.frames * input_count});
 
     if (stream->IsPaused()) {
