@@ -10,7 +10,9 @@
 #include "audio_core/adsp/apps/audio_renderer/audio_renderer.h"
 #include "audio_core/audio_core.h"
 #include "audio_core/common/common.h"
+#include "audio_core/nx2_audio_stats.h"
 #include "audio_core/sink/sink.h"
+#include "audio_core/sink/sink_stream.h"
 #include "common/logging.h"
 #include "common/thread.h"
 #include "core/core.h"
@@ -159,6 +161,25 @@ void AudioRenderer::Main(std::stop_token stop_token) {
                 mailbox.Send(Direction::Host, Message::RenderResponse);
                 continue;
             }
+            // TEMP ("nx2 audio"): how often and how long the passes are, and how full the
+            // sink was when they started.
+            auto& counters = Nx2AudioStats::g_render;
+            const s64 pass_start = Nx2AudioStats::NowNs();
+            if (last_pass_start != 0) {
+                Nx2AudioStats::AddMax(counters.gap_ns_max,
+                                      static_cast<u64>(pass_start - last_pass_start));
+            }
+            last_pass_start = pass_start;
+            counters.passes.fetch_add(1, std::memory_order_relaxed);
+            if (command_buffers[0].buffer != 0 && streams[0]->GetQueueSize() == 0) {
+                counters.empty_at_start.fetch_add(1, std::memory_order_relaxed);
+            }
+            // Only session 0 waits for the sink: without it, session 1 renders unpaced.
+            if (command_buffers[0].buffer == 0 && command_buffers[1].buffer != 0) {
+                counters.unpaced_passes.fetch_add(1, std::memory_order_relaxed);
+            }
+            s64 waited_ns = 0;
+
             std::array<bool, MaxRendererSessions> buffers_reset{};
             std::array<u64, MaxRendererSessions> render_times_taken{};
             const auto start_time{system.CoreTiming().GetGlobalTimeUs().count()};
@@ -195,7 +216,12 @@ void AudioRenderer::Main(std::stop_token stop_token) {
                     command_list_processor.SetProcessTimeMax(max_time);
 
                     if (index == 0) {
+                        const s64 wait_start = Nx2AudioStats::NowNs();
                         streams[index]->WaitFreeSpace(stop_token);
+                        waited_ns = Nx2AudioStats::NowNs() - wait_start;
+                        if (streams[index]->GetQueueSize() >= 4) {
+                            counters.full_after_wait.fetch_add(1, std::memory_order_relaxed);
+                        }
                     }
 
                     // Process the command list
@@ -209,6 +235,19 @@ void AudioRenderer::Main(std::stop_token stop_token) {
                     command_buffer.remaining_command_count =
                         command_list_processor.GetRemainingCommandCount();
                     command_buffer.render_time_taken_us = end_time - start_time;
+                    if (command_buffer.remaining_command_count != 0) {
+                        counters.unfinished_lists.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+            {
+                const u64 pass_ns =
+                    static_cast<u64>(Nx2AudioStats::NowNs() - pass_start - waited_ns);
+                counters.wait_ns.fetch_add(static_cast<u64>(waited_ns), std::memory_order_relaxed);
+                counters.pass_ns.fetch_add(pass_ns, std::memory_order_relaxed);
+                Nx2AudioStats::AddMax(counters.pass_ns_max, pass_ns);
+                if (pass_ns > 5'000'000) {
+                    counters.slow_passes.fetch_add(1, std::memory_order_relaxed);
                 }
             }
             mailbox.Send(Direction::Host, Message::RenderResponse);

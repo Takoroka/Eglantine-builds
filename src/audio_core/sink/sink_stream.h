@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "audio_core/common/common.h"
+#include "audio_core/nx2_audio_stats.h"
 #include "common/bounded_threadsafe_queue.h"
 #include "common/common_types.h"
 #include "common/polyfill_thread.h"
@@ -248,6 +249,9 @@ private:
     /// EDEN_NX2_AUDIO_LEVEL meter state.
     s32 level_peak{};
     u64 level_frames{};
+    /// TEMP: this stream's "nx2 audio" counters (looked up by name on first use).
+    std::atomic<Nx2AudioStats::StreamCounters*> stats{};
+    Nx2AudioStats::StreamCounters& Stats();
     /// Number of buffers waiting to be played
     std::atomic<u32> queued_buffers{};
     /// The ring size for audio out buffers (usually 4, rarely 2 or 8)

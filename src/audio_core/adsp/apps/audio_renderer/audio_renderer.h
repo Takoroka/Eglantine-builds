@@ -112,6 +112,8 @@ private:
     std::array<Sink::SinkStream*, MaxRendererSessions> streams{};
     /// CPU Tick when the DSP was signalled to process, uses time rather than tick
     u64 signalled_tick{0};
+    /// TEMP ("nx2 audio"): when the previous render pass started (the DSP thread only).
+    s64 last_pass_start{0};
 };
 
 } // namespace ADSP::AudioRenderer

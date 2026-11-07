@@ -14,6 +14,7 @@
 #include "audio_core/common/common.h"
 #include "audio_core/common/feature_support.h"
 #include "audio_core/common/workbuffer_allocator.h"
+#include "audio_core/nx2_audio_stats.h"
 #include "audio_core/renderer/behavior/info_updater.h"
 #include "audio_core/renderer/command/command_buffer.h"
 #include "audio_core/renderer/command/command_generator.h"
@@ -32,6 +33,7 @@
 #include "audio_core/renderer/voice/voice_info.h"
 #include "audio_core/renderer/voice/voice_state.h"
 #include "common/alignment.h"
+#include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_event.h"
@@ -454,6 +456,18 @@ void System::Stop() {
 Result System::Update(std::span<const u8> input, std::span<u8> performance, std::span<u8> output) {
     std::scoped_lock l{lock};
 
+    // TEMP ("nx2 audio"): the game's updates per session and how long they hold the lock.
+    const s64 stats_start = Nx2AudioStats::NowNs();
+    SCOPE_EXIT {
+        if (session_id >= 0 && static_cast<size_t>(session_id) < Nx2AudioStats::MAX_SESSIONS) {
+            auto& counters = Nx2AudioStats::g_render;
+            const u64 taken = static_cast<u64>(Nx2AudioStats::NowNs() - stats_start);
+            counters.updates[static_cast<size_t>(session_id)].fetch_add(1, std::memory_order_relaxed);
+            counters.update_ns[static_cast<size_t>(session_id)].fetch_add(taken, std::memory_order_relaxed);
+            Nx2AudioStats::AddMax(counters.update_ns_max[static_cast<size_t>(session_id)], taken);
+        }
+    };
+
     const auto start_time{core.CoreTiming().GetGlobalTimeNs().count()};
     std::memset(output.data(), 0, output.size());
 
@@ -589,7 +603,17 @@ bool System::IsActive() const {
 }
 
 void System::SendCommandToDsp() {
+    // TEMP ("nx2 audio"): waits for the game's update holding the lock, and the whole call.
+    const s64 stats_start = Nx2AudioStats::NowNs();
     std::scoped_lock l{lock};
+    const s64 stats_locked = Nx2AudioStats::NowNs();
+    SCOPE_EXIT {
+        auto& counters = Nx2AudioStats::g_render;
+        Nx2AudioStats::AddMax(counters.lock_wait_ns_max,
+                              static_cast<u64>(stats_locked - stats_start));
+        Nx2AudioStats::AddMax(counters.generate_ns_max,
+                              static_cast<u64>(Nx2AudioStats::NowNs() - stats_start));
+    };
 
     if (initialized) {
         if (active) {
@@ -602,6 +626,10 @@ void System::SendCommandToDsp() {
                 command_size = command_buffer_size;
             } else {
                 command_size = GenerateCommand(command_workbuffer, command_workbuffer_size);
+                if (session_id >= 0 && static_cast<size_t>(session_id) < Nx2AudioStats::MAX_SESSIONS) {
+                    Nx2AudioStats::g_render.generated[static_cast<size_t>(session_id)].fetch_add(
+                        1, std::memory_order_relaxed);
+                }
             }
 
             auto translated_addr{
