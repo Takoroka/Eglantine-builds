@@ -240,6 +240,8 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkSetDebugUtilsObjectNameEXT);
     X(vkSetDebugUtilsObjectTagEXT);
     X(vkSetDeviceMemoryPriorityEXT);
+    X(vkCopyMemoryToImageEXT);
+    X(vkTransitionImageLayoutEXT);
     X(vkUnmapMemory);
     X(vkUpdateDescriptorSetWithTemplate);
     X(vkUpdateDescriptorSets);
@@ -318,6 +320,7 @@ bool Load(VkInstance instance, InstanceDispatch& dld) noexcept {
     X(vkDestroySurfaceKHR);
     X(vkGetPhysicalDeviceFeatures2);
     X(vkGetPhysicalDeviceFormatProperties2);
+    X(vkGetPhysicalDeviceImageFormatProperties2);
     X(vkGetPhysicalDeviceProperties2);
     X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
     X(vkGetPhysicalDeviceSurfaceFormatsKHR);
@@ -986,6 +989,15 @@ VkFormatProperties3 PhysicalDevice::GetFormatProperties3(VkFormat format) const 
     };
     dld->vkGetPhysicalDeviceFormatProperties2(physical_device, format, &properties2);
     return properties3;
+}
+
+VkResult PhysicalDevice::GetImageFormatProperties2(const VkPhysicalDeviceImageFormatInfo2& info,
+                                                   VkImageFormatProperties2& properties) const
+    noexcept {
+    if (dld->vkGetPhysicalDeviceImageFormatProperties2 == nullptr) {
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    return dld->vkGetPhysicalDeviceImageFormatProperties2(physical_device, &info, &properties);
 }
 
 std::vector<VkExtensionProperties> PhysicalDevice::EnumerateDeviceExtensionProperties() const {

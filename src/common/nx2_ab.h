@@ -116,6 +116,9 @@ enum Feature : u64 {
     // still holds, also under the GPU split (VideoCommon::FlushQueryResults). Idea:
     // zortos293/lichii 7ae3e7401.
     MacroReadQueryWait = 1ull << 9,
+    // switchbrew (11-06): VK_EXT_host_image_copy for the first upload of CPU-produced textures:
+    // the CPU writes them into the image (Image::HostUpload), no staging copy on the GPU.
+    HostImageCopy = 1ull << 16,
 };
 
 inline const u64 g_mask = [] {

@@ -917,6 +917,45 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     InitializeGPULogging();
 }
 
+bool Device::IsHostTransferOptimal(const VkImageCreateInfo& ci) const {
+    constexpr VkImageCreateFlags sparse = VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+                                          VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
+                                          VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
+    if (!IsHostImageCopySupported() || ci.samples != VK_SAMPLE_COUNT_1_BIT ||
+        ci.tiling != VK_IMAGE_TILING_OPTIMAL || (ci.flags & sparse) != 0 ||
+        (ci.usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT) != 0) {
+        return false;
+    }
+    // Formats reach 30 bits (extension formats), the create flags and usage used here 12 and 18.
+    const u64 key = u64{static_cast<u32>(ci.format)} | (u64{static_cast<u32>(ci.imageType)} << 30) |
+                    (u64{ci.flags & 0xfffu} << 32) | (u64{ci.usage & 0x3ffffu} << 44);
+    std::scoped_lock lock{host_transfer_mutex};
+    if (const auto it = host_transfer_optimal.find(key); it != host_transfer_optimal.end()) {
+        return it->second;
+    }
+    bool optimal = (physical.GetFormatProperties3(ci.format).optimalTilingFeatures &
+                    VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT) != 0;
+    if (optimal) {
+        VkHostImageCopyDevicePerformanceQueryEXT performance{};
+        performance.sType = VK_STRUCTURE_TYPE_HOST_IMAGE_COPY_DEVICE_PERFORMANCE_QUERY_EXT;
+        VkImageFormatProperties2 image_properties{};
+        image_properties.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
+        image_properties.pNext = &performance;
+        VkPhysicalDeviceImageFormatInfo2 info{};
+        info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;
+        info.pNext = ci.pNext; // A format list, when the image has one
+        info.format = ci.format;
+        info.type = ci.imageType;
+        info.tiling = ci.tiling;
+        info.usage = ci.usage | VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
+        info.flags = ci.flags;
+        optimal = physical.GetImageFormatProperties2(info, image_properties) == VK_SUCCESS &&
+                  performance.optimalDeviceAccess == VK_TRUE;
+    }
+    host_transfer_optimal.emplace(key, optimal);
+    return optimal;
+}
+
 Device::~Device() {
 #ifdef EGLANTINE_STREAMLINE
     if (streamline_attached) {
@@ -1724,6 +1763,34 @@ void Device::RemoveUnsuitableExtensions() {
                                features.pageable_device_local_memory,
                                VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
     }
+
+    // VK_EXT_host_image_copy (A/B bit HostImageCopy): first uploads of CPU-produced textures are
+    // written into the image from the host (Image::UploadMemory). The texture cache keeps its
+    // images in the general layout, so that must be a host copy destination layout.
+    if (Common::Nx2Ab::On(Common::Nx2Ab::HostImageCopy)) {
+        extensions.host_image_copy = features.host_image_copy.hostImageCopy && [this] {
+            VkPhysicalDeviceHostImageCopyPropertiesEXT host_copy{};
+            host_copy.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_PROPERTIES_EXT;
+            VkPhysicalDeviceProperties2 host_copy_properties{};
+            host_copy_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            host_copy_properties.pNext = &host_copy;
+            physical.GetProperties2(host_copy_properties);
+            std::vector<VkImageLayout> dst_layouts(host_copy.copyDstLayoutCount);
+            host_copy.pCopyDstLayouts = dst_layouts.data();
+            physical.GetProperties2(host_copy_properties);
+            dst_layouts.resize(host_copy.copyDstLayoutCount);
+            return std::ranges::find(dst_layouts, VK_IMAGE_LAYOUT_GENERAL) != dst_layouts.end();
+        }();
+        RemoveExtensionFeatureIfUnsuitable(extensions.host_image_copy, features.host_image_copy,
+                                           VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME);
+    } else {
+        RemoveExtensionFeature(extensions.host_image_copy, features.host_image_copy,
+                               VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME);
+    }
+    LOG_INFO(Render_Vulkan, "Host image copy (A/B bit HostImageCopy): {}",
+             extensions.host_image_copy                              ? "on"
+             : Common::Nx2Ab::On(Common::Nx2Ab::HostImageCopy) ? "unsupported"
+                                                                     : "off");
 
     // VK_KHR_shader_quad_control
     extensions.shader_quad_control = features.shader_quad_control.shaderQuadControl;

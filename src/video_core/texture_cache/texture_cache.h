@@ -2023,7 +2023,16 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     uploaded_bytes += image.guest_size_bytes;
     largest_upload = (std::max<u64>)(largest_upload, image.guest_size_bytes);
     if (!UploadInChunks(image)) {
-        auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
+        // A first upload the Vulkan runtime can write from the host (A/B bit HostImageCopy)
+        // decodes into cached host memory instead of staging.
+        auto staging = [&] {
+            if constexpr (requires { runtime.HostUploadBuffer(image, size_t{}); }) {
+                if (auto host = runtime.HostUploadBuffer(image, MapSizeBytes(image))) {
+                    return *host;
+                }
+            }
+            return runtime.UploadStagingBuffer(MapSizeBytes(image));
+        }();
         UploadImageContents(image, staging);
         runtime.InsertUploadMemoryBarrier();
     }
@@ -3986,6 +3995,11 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
         }
     } else if (!image.aliased_images.empty()) {
         SynchronizeAliases(image_id);
+    }
+    // Commands may use the image from here on: the Vulkan runtime writes no more uploads into it
+    // from the host (A/B bit HostImageCopy).
+    if constexpr (requires { image.NoteDeviceUse(); }) {
+        image.NoteDeviceUse();
     }
     if (is_modification) {
         if constexpr (requires { &Image::BackTilesWhole; }) {

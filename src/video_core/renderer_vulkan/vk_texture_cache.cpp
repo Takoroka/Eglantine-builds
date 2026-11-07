@@ -7,7 +7,10 @@
 #include <algorithm>
 #include <limits>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <span>
 #include <memory>
@@ -20,6 +23,7 @@
 #include "common/bit_util.h"
 #include "common/div_ceil.h"
 #include "common/literals.h"
+#include "common/nx2_ab.h"
 #include "common/settings.h"
 
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
@@ -444,7 +448,8 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
                                   const ImageInfo& info, std::span<const VkFormat> view_formats,
                                   std::optional<VkFormat> format_override = {},
                                   bool unbacked = false, bool aliased = false,
-                                  float priority = VideoCommon::MemoryPriority::Normal) {
+                                  float priority = VideoCommon::MemoryPriority::Normal,
+                                  bool host_uploads = false) {
     if (info.type == ImageType::Buffer) {
         return vk::Image{};
     }
@@ -476,6 +481,12 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
         if (vk::Image image = allocator.CreateUnbackedImage(image_ci, aliased)) {
             return image;
         }
+    }
+    // A/B bit HostImageCopy: a guest image's first upload can be written from the host
+    // (Image::HostUpload), where the usage leaves the device's access as fast.
+    if (host_uploads && Common::Nx2Ab::On(Common::Nx2Ab::HostImageCopy) &&
+        device.IsHostTransferOptimal(image_ci)) {
+        image_ci.usage |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
     }
     return allocator.CreateImage(image_ci, false, priority);
 }
@@ -1200,6 +1211,52 @@ void UseBc3ForSwitch2OnSmallCards(const Device& device) {
                 memory >> 20);
     Settings::SetAstcRecompressionOverride(Settings::AstcRecompression::Bc3);
 }
+
+// Texture uploads by path (A/B bit HostImageCopy), for the log.
+struct UploadStats {
+    std::atomic<u64> host_copies{};
+    std::atomic<u64> host_bytes{};
+    std::atomic<u64> staging_uploads{};
+    std::atomic<u64> host_failures{};
+    std::atomic<s64> interval_start_ns{};
+};
+UploadStats g_upload_stats;
+
+/// Counts an upload; "nx2 texture uploads" logs the rates at most every 30 s (only while uploads
+/// happen).
+void CountUpload(std::atomic<u64>& counter, u64 host_bytes = 0) {
+    counter.fetch_add(1, std::memory_order_relaxed);
+    if (host_bytes != 0) {
+        g_upload_stats.host_bytes.fetch_add(host_bytes, std::memory_order_relaxed);
+    }
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    s64 start = g_upload_stats.interval_start_ns.load(std::memory_order_relaxed);
+    if (start == 0) {
+        g_upload_stats.interval_start_ns.compare_exchange_strong(start, now,
+                                                                 std::memory_order_relaxed);
+        return;
+    }
+    if (now - start < 30'000'000'000 ||
+        !g_upload_stats.interval_start_ns.compare_exchange_strong(start, now,
+                                                                  std::memory_order_relaxed)) {
+        return;
+    }
+    const double seconds = static_cast<double>(now - start) / 1e9;
+    const auto rate = [seconds](std::atomic<u64>& value) {
+        return static_cast<double>(value.exchange(0, std::memory_order_relaxed)) / seconds;
+    };
+    const double host_copies = rate(g_upload_stats.host_copies);
+    const double host_mib = rate(g_upload_stats.host_bytes) / (1024.0 * 1024.0);
+    const double staging_uploads = rate(g_upload_stats.staging_uploads);
+    LOG_INFO(Render_Vulkan,
+             "nx2 texture uploads (A/B bit HostImageCopy), last {:.0f} s: host copies {:.1f}/s "
+             "({:.2f} MiB/s), staging uploads {:.1f}/s, host copies the driver failed (sent "
+             "through staging) {}",
+             seconds, host_copies, host_mib, staging_uploads,
+             g_upload_stats.host_failures.exchange(0, std::memory_order_relaxed));
+}
 } // Anonymous namespace
 
 TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& scheduler_,
@@ -1256,6 +1313,25 @@ void TextureCacheRuntime::Finish() {
 
 StagingBufferRef TextureCacheRuntime::UploadStagingBuffer(size_t size, bool deferred) {
     return staging_buffer_pool.Request(size, MemoryUsage::Upload, deferred);
+}
+
+std::optional<StagingBufferRef> TextureCacheRuntime::HostUploadBuffer(const Image& image,
+                                                                     size_t size) {
+    // Larger ones go through staging: the buffer would stay that big for the session.
+    constexpr size_t MaxBytes = 64ULL << 20;
+    if (size == 0 || size > MaxBytes || !image.CanHostUpload()) {
+        return std::nullopt;
+    }
+    host_upload_buffer.resize_destructive(size);
+    return StagingBufferRef{
+        .buffer = VK_NULL_HANDLE,
+        .device_address = 0,
+        .offset = 0,
+        .mapped_span = std::span<u8>(host_upload_buffer.data(), size),
+        .usage = MemoryUsage::Upload,
+        .log2_level = 0,
+        .index = 0,
+    };
 }
 
 StagingBufferRef TextureCacheRuntime::DownloadStagingBuffer(size_t size, bool deferred) {
@@ -2685,7 +2761,10 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                                UsesSparseTiles(runtime_.device, info, gpu_addr_) &&
                                    SparseTilesModeOf(runtime_.device) == SparseTilesMode::Aliased,
                                runtime_.render_target_hint ? VideoCommon::MemoryPriority::Frame
-                                                           : VideoCommon::MemoryPriority::Normal)),
+                                                           : VideoCommon::MemoryPriority::Normal,
+                               !runtime_.render_target_hint &&
+                                   VideoCore::Surface::GetFormatType(info.format) ==
+                                       VideoCore::Surface::SurfaceType::ColorTexture)),
       aspect_mask(ImageAspectMask(info.format)) {
     if (original_image.IsUnbacked()) {
         flags |= VideoCommon::ImageFlagBits::Unbacked;
@@ -2832,6 +2911,7 @@ void Image::AllocateComputeUnswizzleBuffer(u32 max_slices) {
 
 void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
                          std::span<const VideoCommon::BufferImageCopy> copies) {
+    CountUpload(g_upload_stats.staging_uploads);
     // TODO: Move this to another API
     if (ENABLE_MSAA_RESOLVE_CONSUME && runtime != nullptr) {
         runtime->InvalidateResolveShadow(Handle());
@@ -2932,7 +3012,90 @@ void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
 }
 
 void Image::UploadMemory(const StagingBufferRef& map, std::span<const BufferImageCopy> copies) {
-    UploadMemory(map.buffer, map.offset, copies);
+    if (map.buffer != VK_NULL_HANDLE) {
+        UploadMemory(map.buffer, map.offset, copies);
+        return;
+    }
+    // Host memory from TextureCacheRuntime::HostUploadBuffer.
+    if (HostUpload(map.mapped_span, copies)) {
+        CountUpload(g_upload_stats.host_copies, map.mapped_span.size());
+        return;
+    }
+    CountUpload(g_upload_stats.host_failures);
+    const StagingBufferRef staging = runtime->UploadStagingBuffer(map.mapped_span.size());
+    std::memcpy(staging.mapped_span.data(), map.mapped_span.data(), map.mapped_span.size());
+    UploadMemory(staging.buffer, staging.offset, copies);
+}
+
+bool Image::CanHostUpload() const noexcept {
+    constexpr ImageFlagBits staged = ImageFlagBits::AcceleratedUpload | ImageFlagBits::Rescaled |
+                                     ImageFlagBits::Unbacked | ImageFlagBits::SparseLayers |
+                                     ImageFlagBits::SparseTiles | ImageFlagBits::UnwrittenSparse |
+                                     ImageFlagBits::TrimmedLevels |
+                                     ImageFlagBits::AsynchronousDecode;
+    return !initialized && !handle_given && runtime != nullptr && original_image &&
+           current_image == &Image::original_image && info.num_samples == 1 &&
+           aspect_mask == VK_IMAGE_ASPECT_COLOR_BIT && False(flags & staged) &&
+           (original_image.UsageFlags() & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT) != 0 &&
+           Common::Nx2Ab::On(Common::Nx2Ab::HostImageCopy) &&
+           runtime->device.IsHostImageCopySupported();
+}
+
+bool Image::HostUpload(std::span<const u8> data, std::span<const BufferImageCopy> copies) {
+    if (copies.empty() || !CanHostUpload()) {
+        return false;
+    }
+    const auto vk_copies = TransformBufferImageCopies(copies, 0, aspect_mask);
+    boost::container::small_vector<VkMemoryToImageCopyEXT, 16> regions;
+    regions.reserve(vk_copies.size());
+    for (const VkBufferImageCopy& copy : vk_copies) {
+        if (copy.bufferOffset >= data.size()) {
+            return false;
+        }
+        regions.push_back(VkMemoryToImageCopyEXT{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY_EXT,
+            .pNext = nullptr,
+            .pHostPointer = data.data() + copy.bufferOffset,
+            .memoryRowLength = copy.bufferRowLength,
+            .memoryImageHeight = copy.bufferImageHeight,
+            .imageSubresource = copy.imageSubresource,
+            .imageOffset = copy.imageOffset,
+            .imageExtent = copy.imageExtent,
+        });
+    }
+    // Nothing has used the image (CanHostUpload): its whole range goes from undefined to the
+    // general layout the cache keeps images in, as the first staging upload's barrier does.
+    const VkHostImageLayoutTransitionInfoEXT transition{
+        .sType = VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO_EXT,
+        .pNext = nullptr,
+        .image = *original_image,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .subresourceRange{
+            .aspectMask = aspect_mask,
+            .baseMipLevel = 0,
+            .levelCount = VK_REMAINING_MIP_LEVELS,
+            .baseArrayLayer = 0,
+            .layerCount = VK_REMAINING_ARRAY_LAYERS,
+        },
+    };
+    const VkCopyMemoryToImageInfoEXT copy_info{
+        .sType = VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO_EXT,
+        .pNext = nullptr,
+        .flags = 0,
+        .dstImage = *original_image,
+        .dstImageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .regionCount = static_cast<u32>(regions.size()),
+        .pRegions = regions.data(),
+    };
+    // The writes reach the device with the next submission, before any command using the image.
+    const Device& device = runtime->device;
+    if (device.TransitionImageLayoutOnHost(transition) != VK_SUCCESS ||
+        device.CopyMemoryToImageOnHost(copy_info) != VK_SUCCESS) {
+        return false;
+    }
+    initialized = true;
+    return true;
 }
 
 void Image::DownloadMemory(VkBuffer buffer, size_t offset,
@@ -2948,6 +3111,7 @@ void Image::DownloadMemory(VkBuffer buffer, size_t offset,
 
 void Image::DownloadMemory(std::span<VkBuffer> buffers_span, std::span<size_t> offsets_span,
                             std::span<const VideoCommon::BufferImageCopy> copies) {
+    handle_given = true;
     if (!original_image) {
         LOG_CRITICAL(Render_Vulkan, "Missing image at download: gpu={:#x}, cpu={:#x}, type={}, format={}, flags={:#x}, size={}, dimensions={}x{}",
                      gpu_addr, cpu_addr, static_cast<u32>(info.type), static_cast<u32>(info.format),
@@ -3190,6 +3354,7 @@ void Image::DownloadMemory(const StagingBufferRef& map, std::span<const BufferIm
 }
 
 VkImageView Image::StorageImageView(s32 level) noexcept {
+    handle_given = true;
     auto& view = storage_image_views[level];
     if (!view) {
         auto format_info =
@@ -3866,6 +4031,7 @@ bool Image::ScaleUp(bool ignore) {
     if (aspect_mask == 0) {
         aspect_mask = ImageAspectMask(info.format);
     }
+    handle_given = true; // The blit below reads the original image
     if (NeedsScaleHelper()) {
         if (!BlitScaleHelper(true)) {
             current_image = &Image::original_image;
@@ -3894,6 +4060,7 @@ bool Image::ScaleDown(bool ignore) {
     if (aspect_mask == 0) {
         aspect_mask = ImageAspectMask(info.format);
     }
+    handle_given = true; // The blit below writes the original image
     if (NeedsScaleHelper()) {
         if (!BlitScaleHelper(false)) {
             current_image = &Image::scaled_image;
@@ -3995,7 +4162,7 @@ bool Image::NeedsScaleHelper() const {
 ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewInfo& info,
                      ImageId image_id_, Image& image)
     : VideoCommon::ImageViewBase{info, image.info, image_id_, image.gpu_addr},
-      device{&runtime.device}, image_handle{image.Handle()},
+      device{&runtime.device}, image_handle{image.ViewHandle()},
       samples(ConvertSampleCount(image.info.num_samples)) {
     using Shader::TextureType;
 
@@ -4070,7 +4237,7 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
         .pNext = view_next,
         .flags = 0,
-        .image = image.Handle(),
+        .image = image.ViewHandle(),
         .viewType = VkImageViewType{},
         .format = format_info.format,
         .components = swizzle_mapping,
