@@ -137,12 +137,6 @@ public:
 
     [[nodiscard]] ComputePipeline* CurrentComputePipeline();
 
-    /// The last CurrentComputePipeline() returned null because its pipeline is still being
-    /// prebuilt and the dispatch is skipped meanwhile (A/B bit AsyncComputePrebuild).
-    [[nodiscard]] bool ComputeDispatchDeferred() const noexcept {
-        return compute_deferred;
-    }
-
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback);
 
@@ -192,10 +186,6 @@ private:
     /// (waits for one still building); null otherwise. GPU thread.
     std::unique_ptr<ComputePipeline> TakeComputePrebuild(const ComputePipelineCacheKey& key,
                                                          const ShaderInfo* shader);
-
-    /// With asynchronous shaders (A/B bit AsyncComputePrebuild): true when this key's prebuild
-    /// is still running, so the dispatch is skipped rather than waiting for it. GPU thread.
-    [[nodiscard]] bool DeferWhilePrebuilding(const ComputePipelineCacheKey& key);
 
     /// A compute pipeline with this key exists now (built at boot or for a dispatch).
     void NoteComputeKey(const ComputePipelineCacheKey& key);
@@ -291,7 +281,6 @@ private:
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};
     mutable const char* graphics_miss{"no-pipeline"};
-    bool compute_deferred{}; ///< ComputeDispatchDeferred()
 
     /// A/B bit FrontPipelineKey: puts the front's state for this draw into graphics_key in place
     /// of FixedPipelineState::Refresh, when one came for the ring entry running now. With
@@ -394,15 +383,6 @@ private:
         std::atomic<u64> wait_us{};
         std::atomic<u64> mismatched{}; ///< The dispatch's environment answered otherwise
         std::atomic<u64> unused{};     ///< Dropped: the pipeline was built otherwise
-        // A/B bit AsyncComputePrebuild, under mutex:
-        u64 deferred{};         ///< Dispatches skipped while their prebuild ran
-        u64 deferred_programs{}; ///< Keys skipped for the first time
-        u64 resumed{};          ///< Skipped keys built since (their next dispatch came)
-        u64 resumed_us{};       ///< From a key's first skip to its build
-        u64 resumed_max_us{};
-        /// Keys skipped and not built since: when each was first skipped.
-        std::unordered_map<ComputePipelineCacheKey, std::chrono::steady_clock::time_point>
-            deferred_since;
         std::chrono::steady_clock::time_point window_start{};
     } prebuilds;
 
