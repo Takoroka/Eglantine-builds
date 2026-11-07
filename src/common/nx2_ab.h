@@ -89,6 +89,13 @@ enum Feature : u64 {
     // switchbrew (11-06): the query cache's IsRegionGpuModified stops at the first dirty query
     // (QueryCacheBase::IterateCache). Idea: Orchid d38d025192.
     QueryIterateEarlyStop = 1ull << 63,
+    // switchbrew (11-06), Eglantine #712, fence-delayed releases only (Puller::CanResumeAcquire):
+    // a forced release that didn't land flushes the scheduler first, and a passed AcquireEqual
+    // target is met after 10 ms.
+    SemaphoreRescue = 1ull << 7,
+    // The same PR's ring rescue: an AcquireEqual 100 ms short of a target at most 0x40 ahead
+    // writes the target itself.
+    SemaphoreRingRescue = 1ull << 8,
 };
 
 inline const u64 g_mask = [] {

@@ -61,6 +61,36 @@ void OnBack(const Func& func) {
     }
 }
 
+// Eglantine #712's semaphore rescues (Puller::CanResumeAcquire), for the log.
+struct SemaphoreRescueStats {
+    std::atomic<u64> flushes{};
+    std::atomic<u64> passages{};
+    std::atomic<u64> rings{};
+    std::atomic<s64> last_log_ns{};
+};
+SemaphoreRescueStats g_rescue_stats;
+
+/// Counts a rescue; "nx2 semaphore rescues" logs the counts at the first and then at most every
+/// 30 s (only while rescues happen).
+void CountRescue(std::atomic<u64>& counter) {
+    counter.fetch_add(1, std::memory_order_relaxed);
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    s64 last = g_rescue_stats.last_log_ns.load(std::memory_order_relaxed);
+    if ((last != 0 && now - last < 30'000'000'000) ||
+        !g_rescue_stats.last_log_ns.compare_exchange_strong(last, now,
+                                                            std::memory_order_relaxed)) {
+        return;
+    }
+    LOG_INFO(HW_GPU,
+             "nx2 semaphore rescues (Eglantine #712) since the last line: flushes {}, passages {}, "
+             "ring rounds {}",
+             g_rescue_stats.flushes.exchange(0, std::memory_order_relaxed),
+             g_rescue_stats.passages.exchange(0, std::memory_order_relaxed),
+             g_rescue_stats.rings.exchange(0, std::memory_order_relaxed));
+}
+
 /// An acquire was met: the guest may have written what the commands after it read before
 /// releasing the semaphore.
 void GuestSyncPoint(DmaPusher& dma_pusher) {
@@ -248,10 +278,13 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         // ever recovers (Fast + Balanced/Accurate fences deadlocked about a minute in,
         // Ocarina of Time vistas: channels wanting 0xf259/0xf26b while the GPU counter
         // semaphores sat 13-19 values behind with an empty buffer cache).
-        VideoCommon::GpuSplit::Get().Run([rasterizer = dma_pusher.rasterizer] {
-            rasterizer->FlushCommands();
-            rasterizer->ReleaseFences();
-        });
+        if (Common::Nx2Ab::On(Common::Nx2Ab::SemaphoreRescue)) {
+            VideoCommon::GpuSplit::Get().Run([rasterizer = dma_pusher.rasterizer] {
+                rasterizer->FlushCommands();
+                rasterizer->ReleaseFences();
+            });
+            CountRescue(g_rescue_stats.flushes);
+        }
     }
     if (!pending_acquire->reported &&
         std::chrono::steady_clock::now() - pending_acquire->since > std::chrono::seconds{2}) {
@@ -282,15 +315,24 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     // fires constantly during boot (the ring passes targets by whole rounds there), so the
     // grace must stay far below the 2 s warning — gating it on the warning turned boot into
     // one round per two seconds.
-    if (std::chrono::steady_clock::now() - pending_acquire->since >=
+    // Both rescues only where releases ride fences (the hangs' configuration): elsewhere a release
+    // lands at its method, and an early pass or our own write would only change what the game
+    // sees.
+    if (delayed && Common::Nx2Ab::On(Common::Nx2Ab::SemaphoreRescue) &&
+        std::chrono::steady_clock::now() - pending_acquire->since >=
             std::chrono::milliseconds{10} &&
         static_cast<GpuSemaphoreOperation>(pending_acquire->operation) ==
             GpuSemaphoreOperation::AcquireEqual &&
         current > pending_acquire->value) {
-        LOG_INFO(HW_GPU,
-                 "Channel {} acquire satisfied by passage: semaphore {:#x} wanted {:#x}, now {:#x}",
-                 dma_pusher.channel_state.bind_id, pending_acquire->address,
-                 pending_acquire->value, current);
+        // Boot passes targets by whole rounds: the first lines only, the count says the rest.
+        if (static std::atomic<u32> logged{}; logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+            LOG_INFO(HW_GPU,
+                     "Channel {} acquire satisfied by passage: semaphore {:#x} wanted {:#x}, "
+                     "now {:#x}",
+                     dma_pusher.channel_state.bind_id, pending_acquire->address,
+                     pending_acquire->value, current);
+        }
+        CountRescue(g_rescue_stats.passages);
         return true;
     }
     // A ring round that never lands. The flip-counter semaphores advance in lockstep as a
@@ -302,7 +344,8 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     // the round ourselves: write the target the game already queued, notify the waiters.
     // 100 ms: above normal frame pacing (a legitimate round completes within a frame or
     // two), far below the seconds a real stall would cost.
-    if (std::chrono::steady_clock::now() - pending_acquire->since >=
+    if (delayed && Common::Nx2Ab::On(Common::Nx2Ab::SemaphoreRingRescue) &&
+        std::chrono::steady_clock::now() - pending_acquire->since >=
             std::chrono::milliseconds{100} &&
         static_cast<GpuSemaphoreOperation>(pending_acquire->operation) ==
             GpuSemaphoreOperation::AcquireEqual &&
@@ -311,11 +354,15 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         if (device) {
             dma_pusher.memory_manager.Write<u32>(pending_acquire->address, pending_acquire->value);
             Nx2SemaphoreWaiters::Get().OnWrite(*device, pending_acquire->value, "ring-rescue");
-            LOG_INFO(HW_GPU,
-                     "Channel {} acquire satisfied by ring rescue: semaphore {:#x} advanced "
-                     "{:#x} -> {:#x}",
-                     dma_pusher.channel_state.bind_id, pending_acquire->address, current,
-                     pending_acquire->value);
+            if (static std::atomic<u32> logged{};
+                logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+                LOG_INFO(HW_GPU,
+                         "Channel {} acquire satisfied by ring rescue: semaphore {:#x} advanced "
+                         "{:#x} -> {:#x}",
+                         dma_pusher.channel_state.bind_id, pending_acquire->address, current,
+                         pending_acquire->value);
+            }
+            CountRescue(g_rescue_stats.rings);
             return true;
         }
     }
