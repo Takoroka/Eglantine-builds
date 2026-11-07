@@ -188,6 +188,10 @@ enum Feature : u64 {
     // than the ring size of 4, so a device that now and then asks for a big chunk (USB/wireless
     // clock catch-up) isn't underrun each time. Off: always the ring size.
     AudioQueueFollowsDevice = 1ull << 28,
+    // switchbrew (11-07): the Switch 2 video decoder's input-ready event goes quiet at Stop and
+    // Finalize until the next Start (INx2VideoSession). Kirby Air Riders aborted when it fired
+    // after finalize.
+    VdecStopQuiet = 1ull << 29,
 };
 
 inline const u64 g_mask = [] {
