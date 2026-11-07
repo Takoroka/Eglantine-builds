@@ -77,6 +77,7 @@ add_executable(tests
     video_core/instance_loop_hold.cpp
     video_core/astc_path_stats.cpp
     video_core/bc_encoder_psnr.cpp
+    video_core/strongly_connected.cpp
     input_common/calibration_configuration_job.cpp
 )
 

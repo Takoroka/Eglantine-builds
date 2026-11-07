@@ -6,10 +6,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <deque>
 #include <map>
 #include <optional>
+#include <span>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -25,6 +27,7 @@
 #include "shader_recompiler/frontend/ir/value.h"
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/ir_opt/passes.h"
+#include "shader_recompiler/ir_opt/strongly_connected.h"
 
 namespace Shader::Optimization {
 namespace {
@@ -426,28 +429,32 @@ std::optional<StorageBufferAddr> Track(const IR::Value& value, const Bias* bias,
 /// Finds the one constant buffer word added directly into the low address, which is the base
 /// pointer even when other constant buffer reads feed the computed offset
 std::optional<StorageBufferAddr> TrackAddend(const IR::Value& value) {
+    // An explicit stack, not recursion: an addition chain can be deeper than a thread's stack
+    // (see StronglyConnectedComponents). Terms are visited in the same order, each one as often.
     std::optional<StorageBufferAddr> result;
-    bool ambiguous{};
-    const auto visit{[&](const auto& self, const IR::Value& term) -> void {
-        if (term.IsImmediate() || ambiguous) {
-            return;
+    small_vector<IR::Value, 16> pending{value};
+    while (!pending.empty()) {
+        const IR::Value term{pending.back()};
+        pending.pop_back();
+        if (term.IsImmediate()) {
+            continue;
         }
         const IR::Inst* const inst{term.InstRecursive()};
         if (inst->GetOpcode() == IR::Opcode::IAdd32) {
-            self(self, inst->Arg(0));
-            self(self, inst->Arg(1));
-            return;
+            pending.push_back(inst->Arg(1));
+            pending.push_back(inst->Arg(0));
+            continue;
         }
         if (inst->GetOpcode() != IR::Opcode::GetCbufU32 || !inst->Arg(0).IsImmediate() ||
             !inst->Arg(1).IsImmediate() || !Common::IsAligned(inst->Arg(1).U32(), 8)) {
-            return;
+            continue;
         }
-        const StorageBufferAddr found{.index = inst->Arg(0).U32(), .offset = inst->Arg(1).U32()};
-        ambiguous = result.has_value();
-        result = found;
-    }};
-    visit(visit, value);
-    return ambiguous ? std::nullopt : result;
+        if (result) {
+            return std::nullopt; // A second word: ambiguous
+        }
+        result = StorageBufferAddr{.index = inst->Arg(0).U32(), .offset = inst->Arg(1).U32()};
+    }
+    return result;
 }
 
 /// Returns the constant buffer word an instruction reads, including one half of a 64-bit read
@@ -811,6 +818,21 @@ bool SumWords(const IR::Value& value, const IR::Inst* loop, WordSum& sum) {
 /// Finds the constant buffer words that step strided iterators (CUTLASS-style kernel parameters):
 /// words added to a loop-carried value on its back edge, and words summed with two or more other
 /// words into an offset table. A base pointer is neither.
+/// Logs, at most 16 times a session, a search deeper than its old recursion fit in comfortably:
+/// the iterator-word search took about 600 bytes of stack a level (clang-cl PGO build), and
+/// threads have 1 MiB on Windows.
+void NoteDeepWalk(const char* walk, size_t depth) {
+    static constexpr size_t Deep{1024};
+    static std::atomic<u32> reports{};
+    if (depth < Deep || reports.fetch_add(1, std::memory_order_relaxed) >= 16) {
+        return;
+    }
+    LOG_INFO(Shader,
+             "nx2 shader: the storage buffer pass's {} search went {} instructions deep (walked "
+             "without recursion; the old recursion needed about {} KiB of stack here)",
+             walk, depth, depth * 600 / 1024);
+}
+
 StorageBufferSet CollectIteratorWords(IR::Program& program) {
     StorageBufferSet result;
     for (IR::Block* const block : program.post_order_blocks) {
@@ -831,45 +853,26 @@ StorageBufferSet CollectIteratorWords(IR::Program& program) {
             }
         }
     }
-    std::unordered_map<const IR::Inst*, u32> indices;
-    std::unordered_map<const IR::Inst*, u32> lowlinks;
-    std::unordered_set<const IR::Inst*> on_stack;
-    std::vector<const IR::Inst*> stack;
-    u32 next_index{};
-    const auto visit = [&](auto&& self, const IR::Inst* inst) -> void {
-        if (indices.contains(inst)) {
-            return;
-        }
-        const u32 index = next_index++;
-        indices[inst] = lowlinks[inst] = index;
-        stack.push_back(inst);
-        on_stack.insert(inst);
+    // The add/phi/select cycles through Tarjan's components, walked without recursion: Kirby Air
+    // Riders' chains overflowed a 1 MiB thread stack here (StronglyConnectedComponents).
+    const auto next_child = [](const IR::Inst* inst, size_t& arg, const IR::Inst*& child) {
         const auto op = inst->GetOpcode();
-        if (op == IR::Opcode::IAdd32 || op == IR::Opcode::Phi || op == IR::Opcode::SelectU32) {
-            for (size_t arg = op == IR::Opcode::SelectU32 ? 1 : 0; arg < inst->NumArgs(); ++arg) {
-                if (inst->Arg(arg).IsImmediate()) {
-                    continue;
-                }
-                const IR::Inst* next = inst->Arg(arg).InstRecursive();
-                if (!indices.contains(next)) {
-                    self(self, next);
-                    lowlinks[inst] = std::min(lowlinks[inst], lowlinks[next]);
-                } else if (on_stack.contains(next)) {
-                    lowlinks[inst] = std::min(lowlinks[inst], indices[next]);
-                }
+        if (op != IR::Opcode::IAdd32 && op != IR::Opcode::Phi && op != IR::Opcode::SelectU32) {
+            return false;
+        }
+        if (op == IR::Opcode::SelectU32 && arg == 0) {
+            arg = 1; // Not the condition
+        }
+        while (arg < inst->NumArgs()) {
+            const IR::Value value{inst->Arg(arg++)};
+            if (!value.IsImmediate()) {
+                child = value.InstRecursive();
+                return true;
             }
         }
-        if (lowlinks[inst] != index) {
-            return;
-        }
-        std::vector<const IR::Inst*> component;
-        const IR::Inst* member;
-        do {
-            member = stack.back();
-            stack.pop_back();
-            on_stack.erase(member);
-            component.push_back(member);
-        } while (member != inst);
+        return false;
+    };
+    const auto visit_component = [&](std::span<const IR::Inst* const> component) {
         if (component.size() < 2) {
             return;
         }
@@ -887,13 +890,15 @@ StorageBufferSet CollectIteratorWords(IR::Program& program) {
             }
         }
     };
+    StronglyConnectedComponents<const IR::Inst*> components;
     for (IR::Block* block : program.post_order_blocks) {
         for (IR::Inst& inst : block->Instructions()) {
             if (inst.GetOpcode() == IR::Opcode::Phi) {
-                visit(visit, &inst);
+                components.Visit(&inst, next_child, visit_component);
             }
         }
     }
+    NoteDeepWalk("iterator-word", components.MaxDepth());
     return result;
 }
 
@@ -1068,34 +1073,42 @@ std::optional<std::pair<u32, u32>> DynamicPointerSlots(const IR::Value& offset) 
 /// A stride of zero is a single slot.
 void CollectPointerSlots(const IR::Value& offset, small_vector<std::pair<u32, u32>, 4>& slots,
                          std::unordered_set<const IR::Inst*>& visited) {
-    if (offset.IsImmediate()) {
-        if (std::ranges::find(slots, std::pair{offset.U32(), 0U}) == slots.end()) {
-            slots.emplace_back(offset.U32(), 0U);
+    // Depth first with an explicit stack, not recursion: a phi chain can be deeper than a
+    // thread's stack (see StronglyConnectedComponents). Arguments are pushed in reverse, so the
+    // values are visited, and the slots found, in the recursion's order.
+    small_vector<IR::Value, 16> pending{offset};
+    while (!pending.empty()) {
+        const IR::Value value{pending.back()};
+        pending.pop_back();
+        if (value.IsImmediate()) {
+            if (std::ranges::find(slots, std::pair{value.U32(), 0U}) == slots.end()) {
+                slots.emplace_back(value.U32(), 0U);
+            }
+            continue;
         }
-        return;
-    }
-    const IR::Inst* const inst{offset.InstRecursive()};
-    if (!visited.insert(inst).second) {
-        return;
-    }
-    if (const auto pattern{DynamicPointerSlots(offset)}) {
-        if (std::ranges::find(slots, *pattern) == slots.end()) {
-            slots.push_back(*pattern);
+        const IR::Inst* const inst{value.InstRecursive()};
+        if (!visited.insert(inst).second) {
+            continue;
         }
-        return;
-    }
-    switch (inst->GetOpcode()) {
-    case IR::Opcode::Phi:
-        for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
-            CollectPointerSlots(inst->Arg(arg), slots, visited);
+        if (const auto pattern{DynamicPointerSlots(value)}) {
+            if (std::ranges::find(slots, *pattern) == slots.end()) {
+                slots.push_back(*pattern);
+            }
+            continue;
         }
-        break;
-    case IR::Opcode::SelectU32:
-        CollectPointerSlots(inst->Arg(1), slots, visited);
-        CollectPointerSlots(inst->Arg(2), slots, visited);
-        break;
-    default:
-        break;
+        switch (inst->GetOpcode()) {
+        case IR::Opcode::Phi:
+            for (size_t arg = inst->NumArgs(); arg-- > 0;) {
+                pending.push_back(inst->Arg(arg));
+            }
+            break;
+        case IR::Opcode::SelectU32:
+            pending.push_back(inst->Arg(2));
+            pending.push_back(inst->Arg(1));
+            break;
+        default:
+            break;
+        }
     }
 }
 
