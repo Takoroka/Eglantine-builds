@@ -478,6 +478,9 @@ struct Memory::Impl {
 
         const u64 num_pages = ((vaddr + size - 1) >> YUZU_PAGEBITS) - (vaddr >> YUZU_PAGEBITS) + 1;
 
+        // An unmap on another thread mustn't decommit these entries between the commit and the
+        // writes (entry_writes_mutex).
+        std::scoped_lock entry_lock{entry_writes_mutex};
         current_page_table->entries.CommitRegion(vaddr >> YUZU_PAGEBITS, (vaddr >> YUZU_PAGEBITS) + num_pages);
         for (u64 i = 0; i < num_pages; ++i, vaddr += YUZU_PAGESIZE) {
             auto& entry = current_page_table->entries.GetUnchecked(vaddr >> YUZU_PAGEBITS);
@@ -556,6 +559,10 @@ struct Memory::Impl {
         // is different). This assumes the specified GPU address region is contiguous as well.
 
         const u64 num_pages = ((vaddr + size - 1) >> YUZU_PAGEBITS) - (vaddr >> YUZU_PAGEBITS) + 1;
+        // The GPU side marks pages while the guest unmaps others: an unmap decommitting entry
+        // pages between this commit and the writes below made the writes fault (11-07, Kirby Air
+        // Riders 20 s after boot). entry_writes_mutex orders them.
+        std::scoped_lock entry_lock{entry_writes_mutex};
         current_page_table->entries.CommitRegion(vaddr >> YUZU_PAGEBITS, (vaddr >> YUZU_PAGEBITS) + num_pages);
         for (u64 i = 0; i < num_pages; ++i, vaddr += YUZU_PAGESIZE) {
             auto& entry = current_page_table->entries.GetUnchecked(vaddr >> YUZU_PAGEBITS);
@@ -722,6 +729,9 @@ struct Memory::Impl {
             ASSERT_MSG(type != Common::PageType::Memory,
                        "Mapping memory page without a pointer @ {:016x}", base * YUZU_PAGESIZE);
 
+            // ZeroRegion decommits whole entry pages: not while another thread writes entries
+            // between its commit and its writes (RasterizerMarkRegionCached, MarkRegionDebug).
+            std::scoped_lock entry_lock{entry_writes_mutex};
             page_table.entries.ZeroRegion(base, end);
         } else {
             u64 mapping_id = block_count.load(std::memory_order_relaxed);
@@ -1361,6 +1371,10 @@ struct Memory::Impl {
     std::array<Common::ScratchBuffer<u32>, Core::Hardware::NUM_CPU_CORES> scratch_buffers{};
     std::span<Core::GPUDirtyMemoryManager> gpu_dirty_managers;
     std::mutex sys_core_guard;
+    /// Orders an unmap's decommit of page-table entry pages (SparseLargeVector::ZeroRegion) with
+    /// the entry writes other threads make after committing them. A leaf lock: nothing is taken
+    /// while it is held.
+    std::mutex entry_writes_mutex;
 #ifdef __ANDROID__
     std::optional<Common::HeapTracker> heap_tracker;
     Common::HeapTracker* host_buffer{};
