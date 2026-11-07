@@ -1,14 +1,10 @@
-name: windows-build
-
-# Manual Windows build (artifacts only, no release) for test builds in this private repository: a copy
-# of build-windows.yml with workflow_dispatch instead of workflow_call. pgo=none runs only the MSVC job.
-run-name: windows build ${{ inputs.refspec }} ${{ inputs.sha }}
+name: build-windows
 
 # Reusable: builds the Windows binaries. The MSVC build always runs; with pgo=both the MinGW clang
 # PGO build runs too (MSVC cannot read an LLVM .profdata file, so Windows PGO uses MSYS2's clang
 # like Eden does).
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
       sha:
         type: string
