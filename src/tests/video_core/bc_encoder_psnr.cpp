@@ -359,8 +359,9 @@ public:
         return device_name;
     }
 
-    /// The shader's blocks for one image, or nothing when the device failed.
-    std::optional<std::vector<u8>> Encode(const Rgba& image, bool bc3) {
+    /// The shader's blocks for one image, or nothing when the device failed. `candidates`: the
+    /// endpoint candidates (A/B bit GpuBcEncodeEndpoints).
+    std::optional<std::vector<u8>> Encode(const Rgba& image, bool bc3, bool candidates) {
         const u32 block_bytes = bc3 ? 16 : 8;
         const VkDeviceSize input_size = image.texels.size();
         const VkDeviceSize output_size = VkDeviceSize{Blocks} * Blocks * block_bytes;
@@ -418,7 +419,7 @@ public:
         }
         VkDescriptorPool descriptor_pool{};
         if (ok) {
-            ok = Run(input, output, vk_image, view, bc3, descriptor_pool);
+            ok = Run(input, output, vk_image, view, bc3, candidates, descriptor_pool);
         }
         std::optional<std::vector<u8>> blocks;
         if (ok) {
@@ -679,7 +680,7 @@ private:
     }
 
     bool Run(const Buffer& input, const Buffer& output, VkImage vk_image, VkImageView view,
-             bool bc3, VkDescriptorPool& descriptor_pool) {
+             bool bc3, bool candidates, VkDescriptorPool& descriptor_pool) {
         const std::array<VkDescriptorPoolSize, 2> sizes{{
             {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
             {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
@@ -771,8 +772,10 @@ private:
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0,
                                 nullptr);
-        // blocks_x, blocks_y, width, height, bc3, out_offset (BcEncoderPass::Encode's layout).
-        const std::array<u32, 6> constants{Blocks, Blocks, Size, Size, bc3 ? 1u : 0u, 0u};
+        // blocks_x, blocks_y, width, height, flags, out_offset (BcEncoderPass::Encode's layout;
+        // flags: 1 = BC3, 2 = endpoint candidates).
+        const std::array<u32, 6> constants{Blocks, Blocks, Size, Size,
+                                           (bc3 ? 1u : 0u) | (candidates ? 2u : 0u), 0u};
         vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants),
                            constants.data());
         vkCmdDispatch(cmd, (Blocks + 7) / 8, (Blocks + 7) / 8, 1);
@@ -870,39 +873,43 @@ TEST_CASE("BC encoder: the GPU encoder's PSNR is close to the CPU encoder's",
         Case{Pattern::Detail, true},    Case{Pattern::Edges, false}, Case{Pattern::Edges, true},
         Case{Pattern::AlphaRamp, true}, Case{Pattern::Cutout, false},
     };
-    for (const Case& test : cases) {
-        const Rgba source = MakeImage(test.pattern);
-        const auto gpu_blocks = gpu.Encode(source, test.bc3);
-        REQUIRE(gpu_blocks.has_value());
-        const Quality on_gpu = Measure(source, Decode(*gpu_blocks, test.bc3), test.bc3);
-        const Quality on_cpu = Measure(source, Decode(EncodeCpu(source, test.bc3), test.bc3),
-                                       test.bc3);
-        std::printf("  %-10s %s: RGB %.2f vs %.2f", Name(test.pattern), test.bc3 ? "BC3" : "BC1",
-                    on_gpu.rgb_psnr, on_cpu.rgb_psnr);
-        if (test.bc3) {
-            std::printf(", alpha %.2f vs %.2f", on_gpu.alpha_psnr, on_cpu.alpha_psnr);
-        } else {
-            std::printf(", alpha flips %u vs %u", on_gpu.alpha_flips, on_cpu.alpha_flips);
-        }
-        std::printf("\n");
-        INFO(Name(test.pattern) << (test.bc3 ? " BC3" : " BC1") << ": GPU RGB " << on_gpu.rgb_psnr
-                                << " dB, CPU " << on_cpu.rgb_psnr << " dB");
-        // A single-pass bounding-box encoder against stb's refined one: at most 1.5 dB worse.
-        if (test.pattern == Pattern::Edges) {
-            // Known gap: the shader insets every block's endpoints by 1/16, which moves the two
-            // exact colours of a two-colour block inward (RTX 4070: 32.2 dB vs 42.4 dB; keeping
-            // the un-inset pair where it has less error gives 41.8 dB). Reported, not failed;
-            // the floor still catches a regression.
-            CHECK_NOFAIL(on_gpu.rgb_psnr >= on_cpu.rgb_psnr - 1.5);
-            CHECK(on_gpu.rgb_psnr >= on_cpu.rgb_psnr - 12.0);
-        } else {
-            CHECK(on_gpu.rgb_psnr >= on_cpu.rgb_psnr - 1.5);
-        }
-        if (test.bc3) {
-            CHECK(on_gpu.alpha_psnr >= on_cpu.alpha_psnr - 1.5);
-        } else {
-            // Punch-through alpha is a threshold: no texel may change sides.
-            CHECK(on_gpu.alpha_flips == 0);
+    // Both shader modes: endpoint candidates (A/B bit GpuBcEncodeEndpoints, the default) and the
+    // inset endpoints alone (the bit off).
+    for (const bool candidates : {true, false}) {
+        std::printf(" endpoint candidates %s:\n", candidates ? "on" : "off");
+        for (const Case& test : cases) {
+            const Rgba source = MakeImage(test.pattern);
+            const auto gpu_blocks = gpu.Encode(source, test.bc3, candidates);
+            REQUIRE(gpu_blocks.has_value());
+            const Quality on_gpu = Measure(source, Decode(*gpu_blocks, test.bc3), test.bc3);
+            const Quality on_cpu =
+                Measure(source, Decode(EncodeCpu(source, test.bc3), test.bc3), test.bc3);
+            std::printf("  %-10s %s: RGB %.2f vs %.2f", Name(test.pattern),
+                        test.bc3 ? "BC3" : "BC1", on_gpu.rgb_psnr, on_cpu.rgb_psnr);
+            if (test.bc3) {
+                std::printf(", alpha %.2f vs %.2f", on_gpu.alpha_psnr, on_cpu.alpha_psnr);
+            } else {
+                std::printf(", alpha flips %u vs %u", on_gpu.alpha_flips, on_cpu.alpha_flips);
+            }
+            std::printf("\n");
+            INFO(Name(test.pattern) << (test.bc3 ? " BC3" : " BC1") << " candidates "
+                                    << candidates << ": GPU RGB " << on_gpu.rgb_psnr
+                                    << " dB, CPU " << on_cpu.rgb_psnr << " dB");
+            // A single-pass bounding-box encoder against stb's refined one: at most 1.5 dB worse.
+            if (test.pattern == Pattern::Edges && !candidates) {
+                // The inset endpoints alone: two-colour blocks lose their exact colours (RTX
+                // 4070: 32.2 dB vs 42.4 dB). Known, reported; the floor catches a regression.
+                CHECK_NOFAIL(on_gpu.rgb_psnr >= on_cpu.rgb_psnr - 1.5);
+                CHECK(on_gpu.rgb_psnr >= on_cpu.rgb_psnr - 12.0);
+            } else {
+                CHECK(on_gpu.rgb_psnr >= on_cpu.rgb_psnr - 1.5);
+            }
+            if (test.bc3) {
+                CHECK(on_gpu.alpha_psnr >= on_cpu.alpha_psnr - 1.5);
+            } else {
+                // Punch-through alpha is a threshold: no texel may change sides.
+                CHECK(on_gpu.alpha_flips == 0);
+            }
         }
     }
 }

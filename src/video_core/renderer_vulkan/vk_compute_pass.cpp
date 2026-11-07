@@ -18,6 +18,7 @@
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "common/div_ceil.h"
+#include "common/nx2_ab.h"
 #include "common/vector_math.h"
 #include "video_core/host_shaders/astc_decoder_comp_spv.h"
 #include "video_core/host_shaders/bc_encoder_comp_spv.h"
@@ -234,9 +235,11 @@ struct BcEncoderPushConstants {
     u32 blocks_y;
     u32 width;
     u32 height;
-    u32 bc3;
+    u32 flags; // bc_encoder.comp's FLAG_*
     u32 out_offset; // in 8-byte units
 };
+constexpr u32 BC_ENCODER_FLAG_BC3 = 1;
+constexpr u32 BC_ENCODER_FLAG_ENDPOINT_CANDIDATES = 2;
 
 struct QueriesPrefixScanPushConstants {
     u32 min_accumulation_base;
@@ -864,7 +867,11 @@ void BcEncoderPass::Encode(VkImageView source, u32 width, u32 height, u32 layers
         .blocks_y = Common::DivCeil(height, 4U),
         .width = width,
         .height = height,
-        .bc3 = bc3 ? 1U : 0U,
+        // A/B bit GpuBcEncodeEndpoints: the un-inset endpoints are tried too.
+        .flags = (bc3 ? BC_ENCODER_FLAG_BC3 : 0U) |
+                 (Common::Nx2Ab::On(Common::Nx2Ab::GpuBcEncodeEndpoints)
+                      ? BC_ENCODER_FLAG_ENDPOINT_CANDIDATES
+                      : 0U),
         .out_offset = static_cast<u32>(out_offset / 8),
     };
     const VkPipeline vk_pipeline = *pipeline;

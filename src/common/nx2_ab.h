@@ -46,6 +46,10 @@ enum Feature : u64 {
     // semaphore, instead of a bind and a fence wait each (Scheduler::BindSparse). The bind queue
     // (a transfer queue with sparse binding when there is one) is picked at device creation.
     SparseBindAsync = 1ull << 12,
+    // texlookup (11-06, play-dkb8 idea 9): the GPU BC1/BC3 encoder (bc_encoder.comp) tries the
+    // un-inset endpoints too and keeps the pair with less error: two-colour blocks (text, UI,
+    // decals) 32 -> 42 dB, like the CPU encoder (BcEncoderPass::Encode).
+    GpuBcEncodeEndpoints = 1ull << 26,
     // fences (11-05): direct draws with no vertices or no instances skip the draw setup.
     ZeroDrawSkip = 1ull << 40,
     // vkoff (11-05): draws with none of the dynamic states' dirty flags set skip their updates.
