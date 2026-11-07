@@ -219,6 +219,27 @@ private:
     std::shared_ptr<EngineCopy> engine_copy;
 };
 
+/// The compute engine state a native program's translation reads, copied from a launch (its QMD)
+/// and the engine's registers, so the program can be translated away from the GPU thread
+/// (PipelineCache compute prebuilds).
+struct ComputeEngineState {
+    struct ConstBuffer {
+        GPUVAddr address{};
+        u32 size{};
+    };
+    std::array<ConstBuffer, 8> const_buffers{};
+    u32 const_buffer_enable_mask{};
+    u32 local_memory_size{};
+    u32 shared_memory_size{};
+    std::array<u32, 3> workgroup_size{};
+    GPUVAddr tic_address{};
+    u32 tic_limit{};
+    u32 tex_cb_index{};
+    bool linked_tsc{};
+    bool native_tensor{};
+    bool native_compact_tensor{};
+};
+
 class ComputeEnvironment final : public GenericEnvironment {
 public:
     explicit ComputeEnvironment() = default;
@@ -226,8 +247,17 @@ public:
                                 Tegra::MemoryManager& gpu_memory_, GPUVAddr program_base_,
                                 u32 start_address_,
                                 std::shared_ptr<const LoweredNativeCode> lowered_native_ = {});
+    /// A native program's environment from a copy of the engine state, for a pipeline worker:
+    /// guest memory is only read without flushing, and the program is captured and lowered here.
+    explicit ComputeEnvironment(const ComputeEngineState& state, Tegra::MemoryManager& gpu_memory_,
+                                GPUVAddr program_base_);
 
     ~ComputeEnvironment() override = default;
+
+    /// Whether `current`, built on the GPU thread for a dispatch, has this environment's program
+    /// and sizes and answers every query this environment's translation made the same: then
+    /// translating with it gives the same program.
+    [[nodiscard]] bool SameAnswers(ComputeEnvironment& current);
 
     u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) override;
 
@@ -245,7 +275,15 @@ public:
     }
 
 private:
+    /// Whether the launch enables this constant buffer.
+    [[nodiscard]] bool ConstBufferEnabled(u32 cbuf_index) const;
+    /// A texture descriptor of the copied state (unflushed); throws EngineStateMissing for a
+    /// handle outside the copied table.
+    [[nodiscard]] Tegra::Texture::TICEntry ReadCopiedTextureInfo(u32 handle);
+
     Tegra::Engines::KeplerCompute* kepler_compute{};
+    /// The engine state of an environment built from a copy (kepler_compute is null then).
+    std::optional<ComputeEngineState> state_copy;
 };
 
 class FileEnvironment final : public Shader::Environment {

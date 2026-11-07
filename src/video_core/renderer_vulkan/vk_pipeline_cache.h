@@ -16,6 +16,7 @@
 #include <unordered_set>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <type_traits>
@@ -138,7 +139,45 @@ public:
     /// they read texture descriptors from, goes away at shutdown.
     void StopTranslation();
 
+    /// The GPU split's front, for a native compute launch it saw ahead of the back: the launch's
+    /// program is translated and its pipeline built on the workers (A/B bit PipelinePrebuild). The
+    /// back adopts the pipeline at the dispatch only when its own environment answers every
+    /// query of that translation the same (TakeComputePrebuild); otherwise it builds as before.
+    void QueueComputePrebuild(Tegra::MemoryManager& memory, GPUVAddr program_base,
+                              const VideoCommon::ComputeEngineState& state);
+
 private:
+    /// A compute pipeline the front asked for, translated and built on a pipeline worker.
+    struct ComputePrebuild {
+        enum class State : u8 {
+            Queued,
+            Running,
+            Done,
+        };
+        Tegra::MemoryManager* memory{};
+        GPUVAddr program_base{};
+        VideoCommon::ComputeEngineState engine;
+        /// Set by the worker; read once the state is Done.
+        ComputePipelineCacheKey key{};
+        std::optional<VideoCommon::ComputeEnvironment> env;
+        std::unique_ptr<ComputePipeline> pipeline;
+        std::atomic<State> state{State::Queued};
+    };
+
+    /// Runs on a worker.
+    void BuildComputePrebuild(const std::shared_ptr<ComputePrebuild>& job);
+
+    /// The prebuilt pipeline for this key, when its translation's answers are the dispatch's
+    /// (waits for one still building); null otherwise. GPU thread.
+    std::unique_ptr<ComputePipeline> TakeComputePrebuild(const ComputePipelineCacheKey& key,
+                                                         const ShaderInfo* shader);
+
+    /// A compute pipeline with this key exists now (built at boot or for a dispatch).
+    void NoteComputeKey(const ComputePipelineCacheKey& key);
+
+    /// Logs the prebuild counters (at most every 30 s, on the GPU thread).
+    void LogPrebuildCounters();
+
     /// A graphics pipeline translated and built on a pipeline worker (asynchronous shaders).
     struct PendingGraphicsPipeline {
         enum class State : u8 {
@@ -284,6 +323,29 @@ private:
     } build_counters;
     size_t worker_count{};
     size_t async_worker_count{};
+
+    /// Compute prebuilds (QueueComputePrebuild), before the workers that run them.
+    struct Prebuilds {
+        std::mutex mutex;
+        /// Prebuilds whose key the worker has worked out (Running or Done), until the dispatch
+        /// takes them or a pipeline with that key is built otherwise.
+        std::unordered_map<ComputePipelineCacheKey, std::shared_ptr<ComputePrebuild>> by_key;
+        /// Keys of the compute pipelines built (compute_cache's keys).
+        std::unordered_set<ComputePipelineCacheKey> known;
+        size_t in_flight{}; ///< Queued or running
+        // Counters, logged by LogPrebuildCounters:
+        std::atomic<u64> offered{};
+        std::atomic<u64> dropped{};       ///< Too many in flight
+        std::atomic<u64> already_built{}; ///< The worker found the key built or being built
+        std::atomic<u64> failed{};
+        std::atomic<u64> built{};
+        std::atomic<u64> adopted{};
+        std::atomic<u64> waited{}; ///< Adopted while still building: the dispatch waited
+        std::atomic<u64> wait_us{};
+        std::atomic<u64> mismatched{}; ///< The dispatch's environment answered otherwise
+        std::atomic<u64> unused{};     ///< Dropped: the pipeline was built otherwise
+        std::chrono::steady_clock::time_point window_start{};
+    } prebuilds;
 
     Common::ThreadWorker workers;
     /// In game, graphics pipelines nothing waits for (asynchronous shaders: their draws are

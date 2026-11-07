@@ -478,6 +478,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                                                      Common::ThreadPlacement::Background));
     }
     build_counters.window_start = std::chrono::steady_clock::now();
+    prebuilds.window_start = build_counters.window_start;
     if (DefersSoftwareMatrixPipelines(device) &&
         Common::Nx2Ab::On(Common::Nx2Ab::DeferredMatrixPipelines)) {
         matrix_workers.reset(new Common::ThreadWorker(1, "VkMatrixPipelines", {},
@@ -884,9 +885,176 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     if (!is_new) {
         return pipeline.get();
     }
-    ++build_counters.gpu_thread_compute;
-    pipeline = CreateComputePipeline(key, shader);
+    if (Common::Nx2Ab::On(Common::Nx2Ab::PipelinePrebuild)) {
+        pipeline = TakeComputePrebuild(key, shader);
+    }
+    if (!pipeline) {
+        ++build_counters.gpu_thread_compute;
+        pipeline = CreateComputePipeline(key, shader);
+    }
+    NoteComputeKey(key);
     return pipeline.get();
+}
+
+void PipelineCache::QueueComputePrebuild(Tegra::MemoryManager& memory, GPUVAddr program_base,
+                                         const VideoCommon::ComputeEngineState& state) {
+    prebuilds.offered.fetch_add(1, std::memory_order_relaxed);
+    {
+        // A wrong guess costs a worker; a burst of them must not hold up the builds a draw or
+        // dispatch waits for.
+        std::scoped_lock lock{prebuilds.mutex};
+        if (prebuilds.in_flight >= (std::max<size_t>)(worker_count, 2) * 2) {
+            prebuilds.dropped.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        ++prebuilds.in_flight;
+    }
+    auto job{std::make_shared<ComputePrebuild>()};
+    job->memory = &memory;
+    job->program_base = program_base;
+    job->engine = state;
+    workers.QueueWork([this, job] { BuildComputePrebuild(job); });
+}
+
+void PipelineCache::BuildComputePrebuild(const std::shared_ptr<ComputePrebuild>& job) {
+    using State = ComputePrebuild::State;
+    job->state.store(State::Running, std::memory_order_release);
+    SCOPE_EXIT {
+        job->state.store(State::Done, std::memory_order_release);
+        job->state.notify_all();
+        std::scoped_lock lock{prebuilds.mutex};
+        --prebuilds.in_flight;
+    };
+    std::shared_lock translation_lock{translation_mutex};
+    if (translation_stopped) {
+        return;
+    }
+    try {
+        ComputeEnvironment env{job->engine, *job->memory, job->program_base};
+        // The key the dispatch will look for (ShaderCache::MakeShaderInfo's hash, the QMD's sizes).
+        const std::optional<u64> hash{env.Analyze()};
+        if (!hash) {
+            prebuilds.failed.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        const ComputePipelineCacheKey key{
+            .unique_hash = *hash,
+            .shared_memory_size = env.SharedMemorySize(),
+            .workgroup_size = env.WorkgroupSize(),
+        };
+        {
+            std::scoped_lock lock{prebuilds.mutex};
+            if (prebuilds.known.contains(key) || prebuilds.by_key.contains(key)) {
+                prebuilds.already_built.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            job->key = key;
+            prebuilds.by_key.emplace(key, job);
+        }
+        ShaderPools pools;
+        job->pipeline = CreateComputePipeline(pools, key, env, nullptr, false);
+        if (!job->pipeline) {
+            prebuilds.failed.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        job->env.emplace(std::move(env));
+        prebuilds.built.fetch_add(1, std::memory_order_relaxed);
+    } catch (const std::exception&) {
+        // Rejected, or the copied state didn't hold what translation read (EngineStateMissing):
+        // the dispatch translates it as before.
+        job->pipeline.reset();
+        prebuilds.failed.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+std::unique_ptr<ComputePipeline> PipelineCache::TakeComputePrebuild(
+    const ComputePipelineCacheKey& key, const ShaderInfo* shader) {
+    std::shared_ptr<ComputePrebuild> job;
+    {
+        std::scoped_lock lock{prebuilds.mutex};
+        const auto it{prebuilds.by_key.find(key)};
+        if (it == prebuilds.by_key.end()) {
+            return nullptr;
+        }
+        job = std::move(it->second);
+        prebuilds.by_key.erase(it);
+    }
+    using State = ComputePrebuild::State;
+    if (job->state.load(std::memory_order_acquire) != State::Done) {
+        // Keyed jobs are running: the dispatch waits for what is left of its build.
+        const auto begin{std::chrono::steady_clock::now()};
+        job->state.wait(State::Running, std::memory_order_acquire);
+        const auto waited{std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - begin)};
+        prebuilds.waited.fetch_add(1, std::memory_order_relaxed);
+        prebuilds.wait_us.fetch_add(static_cast<u64>(waited.count()), std::memory_order_relaxed);
+    }
+    if (!job->pipeline || !job->env) {
+        return nullptr;
+    }
+    // Adopted only when translating with the dispatch's own environment gives the same program.
+    const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
+    const auto& qmd{kepler_compute->launch_description};
+    ComputeEnvironment current{*kepler_compute, *gpu_memory, program_base, qmd.program_start,
+                               shader->lowered_native};
+    if (!job->env->SameAnswers(current)) {
+        prebuilds.mismatched.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    prebuilds.adopted.fetch_add(1, std::memory_order_relaxed);
+    if (!pipeline_cache_filename.empty()) {
+        serialization_thread.QueueWork([this, key, env_ = std::move(*job->env)] {
+            SerializePipeline(key, std::array<const GenericEnvironment*, 1>{&env_},
+                              pipeline_cache_filename, CACHE_VERSION);
+        });
+        QueueVulkanPipelineCacheFlush();
+    }
+    return std::move(job->pipeline);
+}
+
+void PipelineCache::NoteComputeKey(const ComputePipelineCacheKey& key) {
+    std::scoped_lock lock{prebuilds.mutex};
+    prebuilds.known.insert(key);
+    if (const auto it{prebuilds.by_key.find(key)}; it != prebuilds.by_key.end()) {
+        // Built otherwise (its own dispatch came first, or its answers differed): the prebuild
+        // is not needed. A running one finishes on its worker and is dropped there.
+        prebuilds.by_key.erase(it);
+        prebuilds.unused.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void PipelineCache::LogPrebuildCounters() {
+    const auto now{std::chrono::steady_clock::now()};
+    if (now - prebuilds.window_start < std::chrono::seconds{30}) {
+        return;
+    }
+    const double seconds{std::chrono::duration<double>(now - prebuilds.window_start).count()};
+    prebuilds.window_start = now;
+    const auto take{[](std::atomic<u64>& counter) {
+        return counter.exchange(0, std::memory_order_relaxed);
+    }};
+    const u64 offered{take(prebuilds.offered)};
+    const u64 dropped{take(prebuilds.dropped)};
+    const u64 already_built{take(prebuilds.already_built)};
+    const u64 failed{take(prebuilds.failed)};
+    const u64 built{take(prebuilds.built)};
+    const u64 adopted{take(prebuilds.adopted)};
+    const u64 waited{take(prebuilds.waited)};
+    const u64 wait_us{take(prebuilds.wait_us)};
+    const u64 mismatched{take(prebuilds.mismatched)};
+    const u64 unused{take(prebuilds.unused)};
+    if (offered == 0 && built == 0 && adopted == 0 && mismatched == 0 && unused == 0) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan,
+             "Compute prebuilds ({:.0f} s): {} offered by the front ({} dropped, queue full), {} "
+             "already built, {} failed, {} built; {} adopted ({} waited for, mean {:.0f} ms), {} "
+             "answered otherwise, {} unused [PipelinePrebuild {}]",
+             seconds, offered, dropped, already_built, failed, built, adopted, waited,
+             waited != 0 ? static_cast<double>(wait_us) / 1000.0 / static_cast<double>(waited)
+                         : 0.0,
+             mismatched, unused,
+             Common::Nx2Ab::On(Common::Nx2Ab::PipelinePrebuild) ? "on" : "off");
 }
 
 void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
@@ -944,6 +1112,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             std::scoped_lock lock{state.mutex};
             if (pipeline) {
                 compute_cache.emplace(key, std::move(pipeline));
+                NoteComputeKey(key);
             }
             ++state.built;
             if (state.has_loaded) {
@@ -1283,6 +1452,7 @@ void PipelineCache::TickFrame() {
     ++frame_count;
     CollectPendingPipelines();
     LogBuildCounters();
+    LogPrebuildCounters();
     while (!evicted_pipelines.empty() && scheduler.IsFree(evicted_pipelines.front().first)) {
         evicted_pipelines.pop_front();
     }
