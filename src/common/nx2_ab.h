@@ -25,6 +25,10 @@ enum Feature : u64 {
     // texlookup (11-06): the Texture Cache Memory Limit setting caps the collector's thresholds
     // (TextureCache::ApplyThresholdOverrides) in place of MaxCriticalMemory.
     TcMemoryLimit = 1ull << 1,
+    // frontprep (11-06): with channels parked and nothing queued, the GPU thread waits for a
+    // wake (semaphore writes, back batch ends, commands) instead of a 2 ms yield loop; at most
+    // 200 us (VideoCommon::PendingWake). Idea: SerkiGohan (#681), MFS-code latch wake.
+    PendingWake = 1ull << 2,
     // backperf (11-06, play-dkb6 idea 30a): guest reads of cached pages remember 8 flush areas
     // per core (VideoCore::GuestReadAreaTable) in place of one, stamped also with the epoch of
     // images becoming GPU-modified, so repeat reads skip GetFlushArea's two cache mutexes.

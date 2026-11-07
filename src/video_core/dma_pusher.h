@@ -35,6 +35,7 @@ struct ChannelState;
 
 class GPU;
 class MemoryManager;
+struct MethodTallyState;
 
 enum class SubmissionMode : u32 {
     IncreasingOld = 0,
@@ -242,7 +243,14 @@ public:
     /// flushes and reads guest memory.
     bool ReadGpuWrittenCommands(GPUVAddr address, u32 count);
     /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
-    void FlushGpuWrittenCommands(GPUVAddr address, size_t size);
+    /// Returns whether it drained (the list is on GPU-written pages).
+    bool FlushGpuWrittenCommands(GPUVAddr address, size_t size);
+    /// Words per method of an entry the front read after a drain (`drained`) or from a copy,
+    /// `commands` processed from `state` (nx2_method_tally.h).
+    void TallyGpuWrittenEntry(std::span<const CommandHeader> commands,
+                              const MethodTallyState& state, bool drained);
+    /// The method state ProcessCommands starts from (TallyGpuWrittenEntry).
+    [[nodiscard]] MethodTallyState CurrentTallyState() const;
 
     /// Device pages entries were read from unwritten after waiting for the writers, and how often
     /// (WaitForEntryWriters).

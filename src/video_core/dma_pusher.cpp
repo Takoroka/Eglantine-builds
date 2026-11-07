@@ -27,6 +27,7 @@
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_method_tally.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Tegra {
@@ -35,6 +36,15 @@ constexpr u32 MacroRegistersStart = 0xE00;
 constexpr u32 ComputeInline = 0x6D;
 
 namespace {
+
+// Words per method of the GPU-written entries the front read after a drain
+// (FlushGpuWrittenCommands) and of those it read from copies or synced memory after waiting for
+// their writers (ReadGpuWrittenCommands), per 30 s. Entries the back draws on the GPU (bit 55) are
+// in neither. GPU thread only.
+MethodHistogram g_drained_methods;
+MethodHistogram g_copied_methods;
+constexpr auto MethodWindow = std::chrono::seconds{30};
+constexpr size_t MethodTop = 8;
 
 u64 NanosecondsSince(std::chrono::steady_clock::time_point start) {
     return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -130,10 +140,37 @@ void ReportListStats() {
     const double fragment_barriers = rate(stats.fragment_barriers);
     const double fragment_barriers_deferred = rate(stats.fragment_barriers_deferred);
     const double fragment_barriers_read = rate(stats.fragment_barriers_read);
+    const double pending_waits = rate(stats.pending_waits);
+    const double pending_wait_ms = ms(stats.pending_wait_ns);
+    const double pending_woken = rate(stats.pending_woken);
+    const double pending_by_semaphore = rate(stats.pending_by_semaphore);
+    const double pending_by_back = rate(stats.pending_by_back);
+    const double pending_by_command = rate(stats.pending_by_command);
+    const double pending_woken_resumes = rate(stats.pending_woken_resumes);
+    const double pending_cap_resumes = rate(stats.pending_cap_resumes);
+    const double pending_polls = rate(stats.pending_polls);
+    const double pending_poll_ms = ms(stats.pending_poll_ns);
+    const double pending_poll_resumes = rate(stats.pending_poll_resumes);
+    // The 30 s method window closes on the first report after it ends.
+    static Clock::time_point method_window_start = window_start;
+    std::string drained_methods = "next window";
+    std::string copied_methods = "next window";
+    if (now - method_window_start >= MethodWindow) {
+        method_window_start = now;
+        const u64 drained_entries = g_drained_methods.Entries();
+        const u64 drained_words = g_drained_methods.Words();
+        drained_methods = MethodHistogram::Format(g_drained_methods.TakeTop(MethodTop),
+                                                  drained_entries, drained_words);
+        const u64 copied_entries = g_copied_methods.Entries();
+        const u64 copied_words = g_copied_methods.Words();
+        copied_methods = MethodHistogram::Format(g_copied_methods.TakeTop(MethodTop),
+                                                 copied_entries, copied_words);
+    }
     if (entries == 0 && draw_writes == 0 && entry_waits == 0 && entry_skips == 0 &&
         split_drains == 0 && split_waits == 0 && indirect_draws == 0 && extended_draws == 0 &&
         extended_rechecks == 0 && acquire_ahead_met == 0 && resume_ahead_met == 0 &&
-        resume_ahead_waits == 0 && wait_for_idles == 0 && fragment_barriers == 0) {
+        resume_ahead_waits == 0 && wait_for_idles == 0 && fragment_barriers == 0 &&
+        pending_waits == 0 && pending_polls == 0) {
         return;
     }
     using Common::Nx2Ab::On;
@@ -160,7 +197,11 @@ void ReportListStats() {
              "{:.0f} kept waiting; {:.0f} not readable ahead; check {:.0f} compared, {:.0f} met "
              "too early, {:.0f} met late | waits for idle {:.0f} (bit 60 {}), {:.0f} "
              "compute-to-draw barriers | fragment barriers {:.0f} (bit 53 {}): {:.0f} deferred, "
-             "{:.0f} passes ended for a draw sampling a render target",
+             "{:.0f} passes ended for a draw sampling a render target | pending waits (bit 2 "
+             "{}): {:.0f} ({:.1f} ms), {:.0f} woken ({:.0f} by semaphore writes, {:.0f} by back "
+             "batches, {:.0f} by commands); resumed {:.0f} after a wake, {:.0f} after the cap | "
+             "pending polls {:.0f} ({:.1f} ms), resumed {:.0f} after a poll | GPU-written "
+             "entries' words by method, 30 s: drained {}; read from copies or synced {}",
              On(Common::Nx2Ab::ListDrawRanges) ? "on" : "off",
              On(Common::Nx2Ab::ListWriterWaitSkip) ? "on" : "off",
              On(Common::Nx2Ab::SemAcquireOnBack) ? "on" : "off",
@@ -183,7 +224,11 @@ void ReportListStats() {
              acquire_verified, acquire_early, acquire_late, wait_for_idles,
              On(Common::Nx2Ab::WaitForIdleBarrier) ? "on" : "off", compute_draw_barriers,
              fragment_barriers, On(Common::Nx2Ab::FragmentBarrierDefer) ? "on" : "off",
-             fragment_barriers_deferred, fragment_barriers_read);
+             fragment_barriers_deferred, fragment_barriers_read,
+             On(Common::Nx2Ab::PendingWake) ? "on" : "off", pending_waits, pending_wait_ms,
+             pending_woken, pending_by_semaphore, pending_by_back, pending_by_command,
+             pending_woken_resumes, pending_cap_resumes, pending_polls, pending_poll_ms,
+             pending_poll_resumes, drained_methods, copied_methods);
 }
 
 } // Anonymous namespace
@@ -462,15 +507,24 @@ bool DmaPusher::Step() {
         } else if (ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size))) {
             const std::span<const CommandHeader> commands{command_headers.data(), header.size};
             RecordParsedEntry(header, commands);
-            command_resume_offset +=
-                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+            const MethodTallyState tally_state = CurrentTallyState();
+            const auto rest = commands.subspan(command_resume_offset);
+            const size_t processed = ProcessCommands(rest, command_resume_offset);
+            TallyGpuWrittenEntry(rest.first(processed), tally_state, false);
+            command_resume_offset += processed;
         } else {
-            FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+            const bool drained =
+                FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);
-            command_resume_offset +=
-                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+            const MethodTallyState tally_state = CurrentTallyState();
+            const auto rest = commands.subspan(command_resume_offset);
+            const size_t processed = ProcessCommands(rest, command_resume_offset);
+            if (drained) {
+                TallyGpuWrittenEntry(rest.first(processed), tally_state, true);
+            }
+            command_resume_offset += processed;
         }
         if (puller.HasPendingAcquire()) {
             return false;
@@ -1035,14 +1089,14 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
     return true;
 }
 
-void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
+bool DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
     // Title 1 runs small command lists its culling dispatches fill in each frame. Accurate GPU
     // mode reads every command list through the caches (safe reads); here only the ones on pages
     // the GPU has written are, or their draws run with an older frame's words (trees vanish).
     // These are the lists ReadGpuWrittenCommands can't take from a copy or guest memory (a page's
     // first list, or pages draws write too).
     if (!IsGpuWrittenCommands(address, size)) {
-        return;
+        return false;
     }
     // The caches belong to the split's back: it first runs what the front queued (the dispatch
     // that writes these words among it). The whole pages are flushed: their next lists read
@@ -1084,7 +1138,7 @@ void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
     }
     Nx2CountList(g_nx2_list_stats.flush_ns, NanosecondsSince(flush_start));
     if (rasterizer == nullptr) {
-        return;
+        return true;
     }
     std::array<u8, 0x1000> words;
     const GPUVAddr end = address + size;
@@ -1106,6 +1160,52 @@ void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
             rasterizer->NoteGpuWrittenCommandListSynced(*device);
         }
     }
+    return true;
+}
+
+MethodTallyState DmaPusher::CurrentTallyState() const {
+    return MethodTallyState{
+        .method = dma_state.method,
+        .subchannel = dma_state.subchannel,
+        .method_count = dma_state.method_count,
+        .non_incrementing = dma_state.non_incrementing,
+        .increment_once = dma_increment_once,
+    };
+}
+
+void DmaPusher::TallyGpuWrittenEntry(std::span<const CommandHeader> commands,
+                                     const MethodTallyState& state, bool drained) {
+    // The engines as bound after the entry ran (one that binds a subchannel itself is rare).
+    MethodHistogram& histogram = drained ? g_drained_methods : g_copied_methods;
+    histogram.AddEntry();
+    ForEachMethodWords(commands, state, [&](u32 subchannel, u32 method, u32 words) {
+        MethodHistogram::Kind kind = MethodHistogram::Unbound;
+        if (method < non_puller_methods) {
+            kind = MethodHistogram::Puller;
+        } else if (subchannel < max_subchannels && subchannels[subchannel] != nullptr) {
+            switch (subchannel_type[subchannel]) {
+            case Engines::EngineTypes::Maxwell3D:
+                kind = MethodHistogram::Maxwell3D;
+                break;
+            case Engines::EngineTypes::KeplerCompute:
+                kind = MethodHistogram::Compute;
+                break;
+            case Engines::EngineTypes::MaxwellDMA:
+                kind = MethodHistogram::Dma;
+                break;
+            case Engines::EngineTypes::Fermi2D:
+                kind = MethodHistogram::Fermi2D;
+                break;
+            case Engines::EngineTypes::KeplerMemory:
+                kind = MethodHistogram::InlineToMemory;
+                break;
+            case Engines::EngineTypes::Nv01Timer:
+                kind = MethodHistogram::Timer;
+                break;
+            }
+        }
+        histogram.Add(kind, method, words);
+    });
 }
 
 void DmaPusher::ReportUnboundSubchannel() {

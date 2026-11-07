@@ -59,6 +59,8 @@ add_executable(tests
     video_core/fragment_barrier_defer.cpp
     video_core/guest_read_areas.cpp
     video_core/present_queue.cpp
+    video_core/pending_wake.cpp
+    video_core/method_tally.cpp
     video_core/texture_cache_memory_limit.cpp
     input_common/calibration_configuration_job.cpp
 )

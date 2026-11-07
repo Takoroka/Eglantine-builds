@@ -113,6 +113,9 @@ add_library(video_core STATIC
     native_query_trace.h
     nx2.h
     nx2_diag.h
+    nx2_method_tally.h
+    nx2_pending_wake.cpp
+    nx2_pending_wake.h
     nx2_profile.h
     present.h
     pte_kind.h

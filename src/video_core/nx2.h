@@ -16,6 +16,7 @@
 
 #include "common/common_types.h"
 #include "common/nx2_ab.h"
+#include "video_core/nx2_pending_wake.h"
 
 namespace Tegra {
 
@@ -209,6 +210,18 @@ struct Nx2ListStats {
     std::atomic<u64> fragment_barriers_deferred; ///< ... that left the render pass going
     std::atomic<u64> fragment_barriers_read;     ///< Passes a deferred one ended for a draw sampling
                                                  ///< a render target
+    // The GPU thread with channels parked and nothing queued (A/B bit PendingWake, gpu_thread.cpp).
+    std::atomic<u64> pending_waits;         ///< Waits for a wake (VideoCommon::PendingWake)
+    std::atomic<u64> pending_wait_ns;       ///< ... their time
+    std::atomic<u64> pending_woken;         ///< ... ended by a notification, not the cap
+    std::atomic<u64> pending_by_semaphore;  ///< ... that a GPU semaphore write sent
+    std::atomic<u64> pending_by_back;       ///< ... the end of a batch on the back
+    std::atomic<u64> pending_by_command;    ///< ... a command pushed to the GPU thread
+    std::atomic<u64> pending_woken_resumes; ///< A channel resumed right after a notified wait
+    std::atomic<u64> pending_cap_resumes;   ///< ... right after a wait that reached the cap
+    std::atomic<u64> pending_polls;         ///< Bit off: yields and timer-tick sleeps
+    std::atomic<u64> pending_poll_ns;       ///< ... their time
+    std::atomic<u64> pending_poll_resumes;  ///< ... a channel resumed right after
 };
 inline Nx2ListStats g_nx2_list_stats{};
 
@@ -558,12 +571,17 @@ public:
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
-        std::scoped_lock lk{mutex};
-        for (auto& w : waiters) {
-            if (w.address == device_address && !w.latched && Matches(w, value)) {
-                w.latched = true;
+        {
+            std::scoped_lock lk{mutex};
+            for (auto& w : waiters) {
+                if (w.address == device_address && !w.latched && Matches(w, value)) {
+                    w.latched = true;
+                }
             }
         }
+        // A channel waits on a semaphore: the GPU thread may be waiting for a wake (A/B bit
+        // PendingWake).
+        VideoCommon::PendingWake::Get().Notify(VideoCommon::PendingWake::SemaphoreWrite);
     }
 
 private:

@@ -30,6 +30,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_pending_wake.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_sem_model.h"
 
@@ -746,6 +747,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         }
         g_back_busy.store(false, std::memory_order_release);
         StoreConsumed(read_position);
+        // What the batch ran (releases, fences, the work a parked channel's drain waits for)
+        // may let a parked channel go on (A/B bit PendingWake).
+        PendingWake::Get().Notify(PendingWake::BackBatch);
     }
     back_running.store(false, std::memory_order_release);
 }
