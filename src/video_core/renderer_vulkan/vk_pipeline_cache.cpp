@@ -574,6 +574,8 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .has_broken_spirv_subgroup_shuffle = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
         .has_broken_graphics_subgroup_shuffle = driver_id == VK_DRIVER_ID_AMD_PROPRIETARY ||
                                                 driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE,
+        .needs_task_payload_init = driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS ||
+                                   driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA,
         .max_subgroup_size = device.GetMaxSubgroupSize(),
         .has_broken_robust =
             device.IsNvidia() && device.GetNvidiaArch() <= NvidiaArchitecture::Arch_Pascal,
