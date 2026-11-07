@@ -283,6 +283,7 @@ add_library(video_core STATIC
     texture_cache/image_view_base.h
     texture_cache/image_view_info.cpp
     texture_cache/image_view_info.h
+    texture_cache/astc_path_stats.h
     texture_cache/memory_limit.h
     texture_cache/memory_priority.h
     texture_cache/render_targets.h

@@ -65,6 +65,8 @@ add_executable(tests
     video_core/texture_cache_memory_limit.cpp
     video_core/vram_priority_timestamps.cpp
     video_core/sparse_bind_batch.cpp
+    video_core/astc_path_stats.cpp
+    video_core/bc_encoder_psnr.cpp
     input_common/calibration_configuration_job.cpp
 )
 
@@ -72,6 +74,11 @@ create_target_directory_groups(tests)
 
 target_link_libraries(tests PRIVATE common core input_common video_core)
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
+
+# bc_encoder_psnr.cpp runs the host shader's SPIR-V (video_core/host_shaders/bc_encoder.comp).
+get_target_property(HOST_SHADERS_BINARY_DIR host_shaders BINARY_DIR)
+target_include_directories(tests PRIVATE ${HOST_SHADERS_BINARY_DIR}/include)
+add_dependencies(tests host_shaders)
 
 add_test(NAME tests COMMAND tests)
 
