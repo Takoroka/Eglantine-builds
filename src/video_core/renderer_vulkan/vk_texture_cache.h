@@ -100,6 +100,10 @@ public:
     /// Device memory is the system's RAM (the collector keeps its fixed cap there).
     bool IsIntegratedGpu() const;
 
+    /// A draw sampling its own colour target reads garbage (AMD's compressed tiles): sample a
+    /// copy taken before the draw instead (TextureCache::ReplaceColorFeedbackViews).
+    bool CopiesColorFeedbackTargets() const;
+
     bool CanReportMemoryUsage() const;
 
     /// Images that did not fit the device memory budget so far (see MemoryAllocator).

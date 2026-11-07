@@ -139,6 +139,10 @@ public:
         return has_broken_texture_view_formats;
     }
 
+    bool CopiesColorFeedbackTargets() const noexcept {
+        return false;
+    }
+
     bool HasNativeASTC() const noexcept;
 
     void TickFrame() {}

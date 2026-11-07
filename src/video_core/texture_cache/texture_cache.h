@@ -610,7 +610,10 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
             }
         }
     } while (has_deleted_images || (blacklist && has_blacklisted));
-    if (!compute) {
+    // AMD drivers only, where the loop reads garbage: elsewhere the copies cost GPU time and the
+    // per-view check runs on every full draw setup.
+    if (!compute && runtime.CopiesColorFeedbackTargets() &&
+        Common::Nx2Ab::On(Common::Nx2Ab::ColorFeedbackCopy)) {
         ReplaceColorFeedbackViews(views);
     }
 }

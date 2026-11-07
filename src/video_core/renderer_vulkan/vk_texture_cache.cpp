@@ -2531,6 +2531,14 @@ bool TextureCacheRuntime::IsIntegratedGpu() const {
     return device.IsIntegrated();
 }
 
+bool TextureCacheRuntime::CopiesColorFeedbackTargets() const {
+    // The garbage was seen on RADV; AMD's own drivers compress colour targets the same way. Other
+    // drivers keep the loop (and skip the copies).
+    const VkDriverId driver = device.GetDriverID();
+    return driver == VK_DRIVER_ID_MESA_RADV || driver == VK_DRIVER_ID_AMD_PROPRIETARY ||
+           driver == VK_DRIVER_ID_AMD_OPEN_SOURCE;
+}
+
 bool TextureCacheRuntime::CanDownloadMsaa(const VideoCommon::ImageInfo& info) const {
     const VkImageAspectFlags aspect_mask = ImageAspectMask(info.format);
     if ((aspect_mask & VK_IMAGE_ASPECT_COLOR_BIT) != 0) {
