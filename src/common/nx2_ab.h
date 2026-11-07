@@ -42,6 +42,11 @@ enum Feature : u64 {
     // only when its environment answers every translation query the same (PipelineCache
     // compute prebuilds).
     PipelinePrebuild = 1ull << 13,
+    // vkoff (11-06): on every vendor, software HMMA compute pipelines build where nothing waits for
+    // them (as DeferredMatrixPipelines does on AMD's drivers), and their dispatches meanwhile get
+    // the stand-in a rejected matrix program gets (KeplerCompute: upscale from the constant
+    // buffers, or the DLSS chain's replacement).
+    TensorStandIn = 1ull << 21,
     // texlookup (11-06): VK_EXT_memory_priority / VK_EXT_pageable_device_local_memory: render
     // targets, buffers and the stream buffer high, texture cache images by recency
     // (VideoCommon::MemoryPriority). Read once, at device creation.

@@ -50,6 +50,14 @@ enum class LoadCallbackStage {
 };
 using DiskResourceLoadCallback = std::function<void(LoadCallbackStage, std::size_t, std::size_t)>;
 
+/// What DispatchCompute returns for a software matrix (tensor) program whose pipeline is still
+/// building where nothing waits for it (A/B bit TensorStandIn): the compute engine stands in for
+/// the dispatch as for a rejected matrix program (its handler looks for "matrix multiply").
+inline const std::string& MatrixPipelineBuildingText() {
+    static const std::string text{"matrix multiply program still building in the background"};
+    return text;
+}
+
 class RasterizerInterface {
 public:
     virtual ~RasterizerInterface() = default;

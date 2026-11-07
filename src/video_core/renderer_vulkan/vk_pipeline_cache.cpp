@@ -493,9 +493,15 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     }
     build_counters.window_start = std::chrono::steady_clock::now();
     prebuilds.window_start = build_counters.window_start;
-    if (DefersSoftwareMatrixPipelines(device) &&
-        Common::Nx2Ab::On(Common::Nx2Ab::DeferredMatrixPipelines)) {
-        matrix_workers.reset(new Common::ThreadWorker(1, "VkMatrixPipelines", {},
+    const bool amd_matrix_deferral{DefersSoftwareMatrixPipelines(device) &&
+                                   Common::Nx2Ab::On(Common::Nx2Ab::DeferredMatrixPipelines)};
+    if (amd_matrix_deferral || Common::Nx2Ab::On(Common::Nx2Ab::TensorStandIn)) {
+        // AMD's compilers run out of memory over these programs: one at a time there. Elsewhere a
+        // few build at once (Donkey Kong Bananza's four take 7-12 s each on an RTX 4070 Laptop).
+        const size_t threads{DefersSoftwareMatrixPipelines(device)
+                                 ? size_t{1}
+                                 : (std::min)(size_t{4}, (std::max)(worker_count, size_t{1}))};
+        matrix_workers.reset(new Common::ThreadWorker(threads, "VkMatrixPipelines", {},
                                                       Common::ThreadPlacement::Background));
     }
     if (Settings::values.use_vulkan_driver_pipeline_cache.GetValue() && !use_vulkan_pipeline_cache) {
@@ -2288,14 +2294,17 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
         const auto name{fmt::format("Shader {:016x}", key.unique_hash)};
         spv_module.SetObjectNameEXT(name.c_str());
     }
-    // Software matrix programs on AMD's own compilers: built on a worker nothing waits for (not
-    // even boot), their dispatches skipped until then (RasterizerVulkan::DispatchCompute).
+    // Software matrix programs (on AMD's own compilers, or on every vendor with A/B bit
+    // TensorStandIn): built on a worker nothing waits for (not even boot), their dispatches skipped
+    // or given the stand-in until then (RasterizerVulkan::DispatchCompute).
     const bool defer_build{matrix_workers && program.info.uses_software_matrix};
     if (defer_build) {
         LOG_INFO(Render_Vulkan,
                  "Compute shader {:016X} runs HMMA in software: built in the background, its "
-                 "dispatches are skipped until it is",
-                 key.unique_hash);
+                 "dispatches are {} until it is",
+                 key.unique_hash,
+                 Common::Nx2Ab::On(Common::Nx2Ab::TensorStandIn) ? "given the stand-in"
+                                                                 : "skipped");
     }
     Common::ThreadWorker* const thread_worker{
         defer_build ? matrix_workers.get() : (build_in_parallel ? &workers : nullptr)};

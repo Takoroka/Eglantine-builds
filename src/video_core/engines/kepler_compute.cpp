@@ -548,27 +548,47 @@ void KeplerCompute::CallMultiMethod(Core::System& system, u32 method, const u32*
 }
 
 namespace {
-/// Counts dispatches of rejected programs that were skipped without a throw; logs the count at
-/// most every 30 s while they go on.
+/// Counts dispatches and logs the count at most every 30 s while they go on.
+class DispatchCounter {
+public:
+    explicit DispatchCounter(const char* what_) : what{what_} {}
+
+    void Count() {
+        using Clock = std::chrono::steady_clock;
+        counted.fetch_add(1, std::memory_order_relaxed);
+        const Clock::rep now = Clock::now().time_since_epoch().count();
+        Clock::rep start = window_start.load(std::memory_order_relaxed);
+        if (start == 0) {
+            window_start.compare_exchange_strong(start, now, std::memory_order_relaxed);
+            return;
+        }
+        const auto elapsed = Clock::duration{now - start};
+        if (elapsed >= std::chrono::seconds{30} &&
+            window_start.compare_exchange_strong(start, now, std::memory_order_relaxed)) {
+            const u64 count = counted.exchange(0, std::memory_order_relaxed);
+            const double seconds = std::chrono::duration<double>(elapsed).count();
+            LOG_INFO(HW_GPU, "{}: {} in {:.0f} s ({:.0f}/s)", what, count, seconds,
+                     static_cast<double>(count) / seconds);
+        }
+    }
+
+private:
+    const char* what;
+    std::atomic<u64> counted{};
+    std::atomic<std::chrono::steady_clock::rep> window_start{};
+};
+
+/// Dispatches of rejected programs that were skipped without a throw.
 void CountSkippedRejectedDispatch() {
-    using Clock = std::chrono::steady_clock;
-    static std::atomic<u64> skipped{};
-    static std::atomic<Clock::rep> window_start{};
-    skipped.fetch_add(1, std::memory_order_relaxed);
-    const Clock::rep now = Clock::now().time_since_epoch().count();
-    Clock::rep start = window_start.load(std::memory_order_relaxed);
-    if (start == 0) {
-        window_start.compare_exchange_strong(start, now, std::memory_order_relaxed);
-        return;
-    }
-    const auto elapsed = Clock::duration{now - start};
-    if (elapsed >= std::chrono::seconds{30} &&
-        window_start.compare_exchange_strong(start, now, std::memory_order_relaxed)) {
-        const u64 count = skipped.exchange(0, std::memory_order_relaxed);
-        const double seconds = std::chrono::duration<double>(elapsed).count();
-        LOG_INFO(HW_GPU, "Rejected compute dispatches skipped: {} in {:.0f} s ({:.0f}/s)", count,
-                 seconds, static_cast<double>(count) / seconds);
-    }
+    static DispatchCounter counter{"Rejected compute dispatches skipped"};
+    counter.Count();
+}
+
+/// Dispatches of software matrix programs given the stand-in while their pipelines build
+/// (A/B bit TensorStandIn).
+void CountTensorStandIn() {
+    static DispatchCounter counter{"Tensor stand-ins while matrix pipelines build"};
+    counter.Count();
 }
 
 /// A native QMD's launch parameters; false at a constant buffer address wider than supported
@@ -871,8 +891,13 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     }
     if (skipped_rejection) {
         // The program was rejected at an earlier dispatch (and logged then): the rasterizer
-        // skipped it without throwing the error again.
-        CountSkippedRejectedDispatch();
+        // skipped it without throwing the error again. Or it is a software matrix program whose
+        // pipeline still builds, stood in for in the same way (A/B bit TensorStandIn).
+        if (skipped_rejection == &VideoCore::MatrixPipelineBuildingText()) {
+            CountTensorStandIn();
+        } else {
+            CountSkippedRejectedDispatch();
+        }
         diag_note("failed", *skipped_rejection);
         if (const std::optional<bool> result = rejected(*skipped_rejection)) {
             return *result;
