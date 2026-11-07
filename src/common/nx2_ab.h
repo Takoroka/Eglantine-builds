@@ -179,6 +179,10 @@ enum Feature : u64 {
     // PageTable::WRITE_MARKED_MASK, so writes still trap) until the GPU writes it again. With
     // bit 3 only (its read path). Bit forced off: the JITs don't check the store mask at all.
     FastmemRestore = 1ull << 18,
+    // switchbrew (11-07): the Switch 2 video decoder's input-ready event goes quiet at Stop and
+    // Finalize until the next Start (INx2VideoSession). Kirby Air Riders aborted when it fired
+    // after finalize.
+    VdecStopQuiet = 1ull << 29,
 };
 
 inline const u64 g_mask = [] {
