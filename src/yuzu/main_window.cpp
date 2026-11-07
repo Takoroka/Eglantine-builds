@@ -9,6 +9,9 @@
 #endif
 
 #include <boost/algorithm/string/split.hpp>
+#ifdef YUZU_USE_MIMALLOC
+#include <mimalloc.h>
+#endif
 #include "common/fs/path_util.h"
 #include "common/game_presets.h"
 #include "common/settings.h"
@@ -1940,6 +1943,26 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         return;
     }
     LOG_INFO(Frontend, "Eglantine starting...");
+#ifdef YUZU_USE_MIMALLOC
+    {
+        // The eglantine-mimalloc variant (YUZU_USE_MIMALLOC). On Windows mimalloc only becomes the
+        // process allocator when mimalloc-redirect.dll took over the CRT heap.
+        const int version = mi_version();
+#ifdef _WIN32
+        if (mi_is_redirected()) {
+            LOG_INFO(Frontend, "Allocator: mimalloc {}.{}.{} (CRT heap redirected for every module)",
+                     version / 10000, version / 100 % 100, version % 100);
+        } else {
+            LOG_WARNING(Frontend, "Allocator: mimalloc {}.{}.{} loaded, but the CRT heap is NOT "
+                        "redirected (mimalloc-redirect.dll missing?): the system allocator is in use",
+                        version / 10000, version / 100 % 100, version % 100);
+        }
+#else
+        LOG_INFO(Frontend, "Allocator: mimalloc {}.{}.{} (malloc/free of the process)",
+                 version / 10000, version / 100 % 100, version % 100);
+#endif
+    }
+#endif
 
     if (params.program_id == 0 ||
         params.program_id > static_cast<u64>(Service::AM::AppletProgramId::MaxProgramId)) {

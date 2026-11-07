@@ -248,6 +248,25 @@ add_executable(yuzu
 
 set_target_properties(yuzu PROPERTIES OUTPUT_NAME "eglantine")
 
+# mimalloc as the process allocator (YUZU_USE_MIMALLOC): a second variant of the executable,
+# eglantine-mimalloc, to compare with eglantine. Linked before every other library: on Windows
+# mimalloc.dll has to come first in the import table (externals/CMakeLists.txt has the rest).
+if (YUZU_USE_MIMALLOC)
+    set_target_properties(yuzu PROPERTIES OUTPUT_NAME "eglantine-mimalloc")
+    target_compile_definitions(yuzu PRIVATE YUZU_USE_MIMALLOC)
+    if (WIN32)
+        target_link_libraries(yuzu PRIVATE mimalloc)
+        target_link_options(yuzu PRIVATE "/INCLUDE:mi_version")
+        add_custom_command(TARGET yuzu POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:mimalloc>" "$<TARGET_FILE_DIR:yuzu>"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE_DIR:mimalloc>/mimalloc-redirect.dll" "$<TARGET_FILE_DIR:yuzu>"
+            VERBATIM)
+    else()
+        target_link_libraries(yuzu PRIVATE mimalloc-obj)
+    endif()
+endif()
+
 # Shipped next to the executable: the NX2 switches a GUI launch cannot set another way. Read at
 # startup (LoadNx2Switches in main.cpp); a user copy in %APPDATA%\eden overrides it.
 add_custom_command(TARGET yuzu POST_BUILD
