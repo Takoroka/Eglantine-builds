@@ -440,4 +440,98 @@ TEST_CASE("Ampere Ocarina byte constant loads, ULEA carries to UP3 and two-sourc
     REQUIRE(static_cast<bool>(convert));
     CHECK(field(FindMaxwell(convert, 0x5cb, 52), 41, 2) == 3);
 }
+
+TEST_CASE("Ampere Kirby Air Riders race forms: reserved registers, SHF.L.U64.HI, uniform STL",
+          "[video_core][ampere]") {
+    const auto lower = [](Instruction instruction) {
+        return LowerToMaxwell(std::array<Instruction, 2>{instruction, EXIT});
+    };
+    const auto field = [](u64 word, u32 shift, u32 count) {
+        return static_cast<u32>((word >> shift) & ((u64{1} << count) - 1));
+    };
+    // Shadow copies between register banks (NativeRegisterCopy): 8 before and 8 after per quartet.
+    const auto copies = [](const auto& lowered) { return CountMaxwell(lowered, 0x5c98a, 44); };
+
+    // FRND R248, R249 (Kirby's: FRND R222, R203 with the uniform bank in use): both live in
+    // the reserved quartet R248-R251, which is borrowed as R240-R243.
+    const auto round = lower({{0x00f87307, 0x000000f9, 0x00205000, 0x000e7000}});
+    INFO(round.error);
+    REQUIRE(static_cast<bool>(round));
+    CHECK(copies(round) == 16);
+    const u64 frnd = FindMaxwell(round, 0x5ca8, 48);
+    CHECK(field(frnd, 0, 8) == 240);
+    CHECK(field(frnd, 20, 8) == 241);
+
+    // F2I.S32 R248, R246: two reserved quartets, borrowed as R236 (R248) and R240 (R246).
+    const auto convert = lower({{0x00f87305, 0x000000f6, 0x0021f100, 0x0002e600}});
+    INFO(convert.error);
+    REQUIRE(static_cast<bool>(convert));
+    CHECK(copies(convert) == 32);
+    const u64 f2i = FindMaxwell(convert, 0x5cb0, 48);
+    CHECK(field(f2i, 0, 8) == 236);
+    CHECK(field(f2i, 20, 8) == 242);
+
+    // FSETP with R248 as its first source: predicates out, so only the source is copied.
+    const auto compare = lower({{0xf800920b, 0x000000ff, 0x03f1c000, 0x000fe400}});
+    INFO(compare.error);
+    REQUIRE(static_cast<bool>(compare));
+    CHECK(copies(compare) == 16);
+
+    // LDG.E R166, [R235 + UR6]: R235 is a 32-bit offset (no .64, bit 90), so it needn't fit in
+    // one quartet with R236.
+    const auto load = lower({{0xeba6a981, 0x00000006, 0x081ea900, 0x00032c00}});
+    INFO(load.error);
+    REQUIRE(static_cast<bool>(load));
+    CHECK(copies(load) == 16);
+    CHECK(FindMaxwell(load, 0xeed, 52) != 0);
+
+    // SHF.L.U64.HI R8, R14, 0x10, R9 -> Maxwell SHF.L R8, R14, 0x10, R9.
+    const auto shift = lower({{0x0e087819, 0x00000010, 0x00010209, 0x000fe200}});
+    INFO(shift.error);
+    REQUIRE(static_cast<bool>(shift));
+    const u64 shf = FindMaxwell(shift, 0x36f8, 48);
+    REQUIRE(shf != 0);
+    CHECK(field(shf, 0, 8) == 8);
+    CHECK(field(shf, 8, 8) == 14);
+    CHECK(field(shf, 20, 6) == 16);
+    CHECK(field(shf, 39, 8) == 9);
+
+    // SEL R249, R49, 0xffffffff, P?, IADD3 R248, R248, c[..], RZ and STG.E [R144.64], R248 on
+    // reserved registers; Hyrule Warriors' TLD.SCR.LZ R232, R232 (here R248).
+    for (const Instruction& reserved : {Instruction{{0x31f97807, 0xffffffff, 0x04000000, 0x000fc800}},
+                                        Instruction{{0xf8f87a10, 0x00001000, 0x07f9e0ff, 0x000fe200}},
+                                        Instruction{{0x90007386, 0x000000f8, 0x0010a900, 0x0001e400}},
+                                        Instruction{{0xf8f87b66, 0x10000cff, 0x009e01ff, 0x000f4200}}}) {
+        const auto lowered = lower(reserved);
+        INFO(lowered.error);
+        REQUIRE(static_cast<bool>(lowered));
+        CHECK(copies(lowered) == 16);
+    }
+
+    // LDL R47, [UR8+0x6c]: the load's uniform base is in bits 32-39.
+    const auto local = lower({{0xff2f7983, 0x00006c08, 0x08100800, 0x000f2200}});
+    INFO(local.error);
+    REQUIRE(static_cast<bool>(local));
+    const u64 ldl = FindMaxwell(local, 0xef44, 48);
+    REQUIRE(ldl != 0);
+    CHECK(field(ldl, 0, 8) == 47);
+    CHECK(field(ldl, 8, 8) == 224);
+    CHECK(field(ldl, 20, 24) == 0x6c);
+
+    // STL.128 [UR8+0x40], R4: four 32-bit stores from UR8's mirror (R224).
+    const auto store = lower({{0xff007987, 0x00004004, 0x08100c08, 0x0001e200}});
+    INFO(store.error);
+    REQUIRE(static_cast<bool>(store));
+    CHECK(CountMaxwell(store, 0xef54, 48) == 4);
+    for (u32 word = 0; word < 4; ++word) {
+        const auto it = std::find_if(store.instructions.begin(), store.instructions.end(),
+                                     [&](u64 maxwell) {
+                                         return (maxwell >> 48) == 0xef54 &&
+                                                field(maxwell, 20, 24) == 0x40 + 4 * word;
+                                     });
+        REQUIRE(it != store.instructions.end());
+        CHECK(field(*it, 0, 8) == 4 + word);
+        CHECK(field(*it, 8, 8) == 224);
+    }
+}
 } // namespace
