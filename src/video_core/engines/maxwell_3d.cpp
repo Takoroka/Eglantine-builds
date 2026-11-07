@@ -12,7 +12,10 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <span>
+#include <string>
 #include <unordered_map>
+#include <utility>
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/scope_exit.h"
@@ -38,6 +41,25 @@ namespace Tegra::Engines {
 
 /// First register id that is actually a Macro call.
 constexpr u32 MacroRegistersStart = 0xE00;
+
+namespace {
+/// Draw-loop macro counts (play-dkb6 idea 26 step 1, the "Draw-loop macros" line every 30 s):
+/// calls of NVN2's indexed indirect draw macro (Nx2IndexedIndirectDrawMacro) and its extended
+/// variant, by where their arguments came from, with their instance counts (the macro draws its
+/// instances one by one).
+enum DrawLoopKind : u32 { NotDrawLoop, PlainDrawLoop, ExtendedDrawLoop, DrawLoopKinds };
+enum DrawLoopSource : u32 {
+    CpuWrittenArguments, ///< The macro ran with the arguments from a CPU-written entry
+    GpuWrittenRead,      ///< ... from a GPU-written entry, read (drained) and run
+    GpuWrittenDrawn,     ///< ... drawn from the GPU, not read (FrontIndirectDrawMacro)
+    DrawLoopSources
+};
+/// Which draw-loop macro the native code at `start` is, if any.
+DrawLoopKind ClassifyDrawLoop(MacroEngine& engine, u32 start);
+/// A call; `parameters` are the topology and the five arguments, if they were read.
+void CountDrawLoop(DrawLoopKind kind, DrawLoopSource source, u32 start,
+                   std::span<const u32> parameters);
+} // Anonymous namespace
 
 Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
     : draw_manager()
@@ -522,9 +544,15 @@ void Maxwell3D::CallMacroMethod(Core::System& system, u32 method, std::span<cons
     // Lookup the macro offset
     const u32 entry =
         ((method - MacroRegistersStart) >> 1) % static_cast<u32>(GetNativeMacroPositions().size());
+    const u32 start = GetNativeMacroPositions()[entry];
+    if (const DrawLoopKind kind = ClassifyDrawLoop(GetNativeMacroEngine(), start);
+        kind != NotDrawLoop) {
+        CountDrawLoop(kind, g_nx2_gpu_written_entry ? GpuWrittenRead : CpuWrittenArguments, start,
+                      parameters);
+    }
 
     // Execute the current macro.
-    GetNativeMacroEngine().Execute(system, *this, GetNativeMacroPositions()[entry], parameters);
+    GetNativeMacroEngine().Execute(system, *this, start, parameters);
     draw_manager.DrawDeferred(*this);
 }
 
@@ -1661,6 +1689,10 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     auto& engine = GetNativeMacroEngine();
     const auto positions = GetNativeMacroPositions();
     const u32 start = positions[((method - MacroRegistersStart) >> 1) % positions.size()];
+    if (const DrawLoopKind kind = ClassifyDrawLoop(engine, start); kind != NotDrawLoop) {
+        CountDrawLoop(kind, g_nx2_gpu_written_entry ? GpuWrittenRead : CpuWrittenArguments, start,
+                      fs.parameters);
+    }
     {
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
         engine.native_interpreter.active_dram = &native_data_ram;
@@ -1913,6 +1945,119 @@ bool IndirectTopologySafe(Maxwell3D::Regs::PrimitiveTopology topology) {
     }
 }
 
+DrawLoopKind ClassifyDrawLoop(MacroEngine& engine, u32 start) {
+    if (!engine.native_turing) {
+        return NotDrawLoop;
+    }
+    // Checked once per start and macro code generation, per thread (the front or the back runs
+    // macros) and engine.
+    struct Entry {
+        const MacroEngine* engine;
+        u64 generation;
+        u32 start;
+        DrawLoopKind kind;
+    };
+    thread_local std::array<Entry, 64> entries{};
+    Entry& entry = entries[start % entries.size()];
+    if (entry.engine == &engine && entry.generation == engine.native_code_generation &&
+        entry.start == start) {
+        return entry.kind;
+    }
+    const auto code_is = [&](std::span<const u32> code) {
+        const size_t first = size_t{start} * 3;
+        return first + code.size() <= engine.native_code.size() &&
+               std::equal(code.begin(), code.end(), engine.native_code.begin() + first);
+    };
+    const DrawLoopKind kind = code_is(Nx2IndexedIndirectDrawMacro)           ? PlainDrawLoop
+                              : code_is(Nx2ExtendedIndexedIndirectDrawMacro) ? ExtendedDrawLoop
+                                                                             : NotDrawLoop;
+    entry = {&engine, engine.native_code_generation, start, kind};
+    return kind;
+}
+
+struct DrawLoopStats {
+    using Counters = std::array<std::array<std::atomic<u64>, DrawLoopSources>, DrawLoopKinds>;
+    Counters calls{};
+    Counters measured{};  ///< Calls whose instance count was read
+    Counters instances{}; ///< Their instance counts
+    Counters single{};    ///< ... of them one instance
+    std::array<std::atomic<u32>, DrawLoopKinds> start{}; ///< The last start seen
+};
+DrawLoopStats g_draw_loops;
+
+void ReportDrawLoops(s64 now) {
+    // Only the thread that took the window is here.
+    using Snapshot = std::array<std::array<u64, DrawLoopSources>, DrawLoopKinds>;
+    static Snapshot last_calls{}, last_measured{}, last_instances{}, last_single{};
+    static s64 last_time = 0;
+    const auto take = [](const DrawLoopStats::Counters& counters, Snapshot& last) {
+        Snapshot delta{};
+        for (size_t k = 0; k < DrawLoopKinds; ++k) {
+            for (size_t s = 0; s < DrawLoopSources; ++s) {
+                const u64 value = counters[k][s].load(std::memory_order_relaxed);
+                delta[k][s] = value - last[k][s];
+                last[k][s] = value;
+            }
+        }
+        return delta;
+    };
+    const Snapshot calls = take(g_draw_loops.calls, last_calls);
+    const Snapshot measured = take(g_draw_loops.measured, last_measured);
+    const Snapshot instances = take(g_draw_loops.instances, last_instances);
+    const Snapshot single = take(g_draw_loops.single, last_single);
+    const s64 start_time = std::exchange(last_time, now);
+    if (start_time == 0) {
+        return; // The first window starts here.
+    }
+    const double seconds = static_cast<double>(now - start_time) / 1e9;
+    const auto kind_text = [&](size_t k) {
+        const auto read = [&](size_t s) {
+            if (measured[k][s] == 0) {
+                return fmt::format("{:.0f}/s", static_cast<double>(calls[k][s]) / seconds);
+            }
+            const double n = static_cast<double>(measured[k][s]);
+            return fmt::format("{:.0f}/s (mean {:.2f} instances, {:.0f}% one)",
+                               static_cast<double>(calls[k][s]) / seconds,
+                               static_cast<double>(instances[k][s]) / n,
+                               100.0 * static_cast<double>(single[k][s]) / n);
+        };
+        return fmt::format("CPU-written {}, GPU-written read {}, GPU-written drawn from the GPU "
+                           "{:.0f}/s, start {:#x}",
+                           read(CpuWrittenArguments), read(GpuWrittenRead),
+                           static_cast<double>(calls[k][GpuWrittenDrawn]) / seconds,
+                           g_draw_loops.start[k].load(std::memory_order_relaxed));
+    };
+    LOG_INFO(HW_GPU, "Draw-loop macros {:.0f} s: plain {} | extended {}", seconds,
+             kind_text(PlainDrawLoop), kind_text(ExtendedDrawLoop));
+}
+
+void CountDrawLoop(DrawLoopKind kind, DrawLoopSource source, u32 start,
+                   std::span<const u32> parameters) {
+    g_draw_loops.start[kind].store(start, std::memory_order_relaxed);
+    if (parameters.size() == 6) {
+        // Topology, index count, instance count, first index, base vertex, base instance.
+        const u32 instances = parameters[2];
+        Nx2CountList(g_draw_loops.measured[kind][source]);
+        Nx2CountList(g_draw_loops.instances[kind][source], instances);
+        if (instances == 1) {
+            Nx2CountList(g_draw_loops.single[kind][source]);
+        }
+    }
+    const u64 calls = g_draw_loops.calls[kind][source].fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((calls & 255) != 0) {
+        return;
+    }
+    using namespace std::chrono;
+    static std::atomic<s64> next_report{};
+    const s64 now = duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+    s64 next = next_report.load(std::memory_order_relaxed);
+    if (now >= next && next_report.compare_exchange_strong(
+                           next, now + duration_cast<nanoseconds>(30s).count(),
+                           std::memory_order_relaxed)) {
+        ReportDrawLoops(now);
+    }
+}
+
 } // Anonymous namespace
 
 bool Maxwell3D::FrontIndirectDrawMacro(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1995,6 +2140,7 @@ bool Maxwell3D::FrontIndirectDrawMacro(Core::System& system, VideoCommon::GpuSpl
     fs.parameters.clear();
     fs.executing_macro = 0;
     Nx2CountList(extended ? g_nx2_list_stats.extended_draws : g_nx2_list_stats.indirect_draws);
+    CountDrawLoop(extended ? ExtendedDrawLoop : PlainDrawLoop, GpuWrittenDrawn, start, {});
     FrontQueueIndirectDraw(system, split, fs, topology, arguments, extended, nullptr);
     return true;
 }

@@ -285,12 +285,15 @@ struct GPU::Impl {
         gpu_thread.FlushRegion(addr, size, is_async);
     }
 
-    VideoCore::RasterizerDownloadArea OnCPURead(DAddr addr, u64 size) {
+    VideoCore::RasterizerDownloadArea OnCPURead(DAddr addr, u64 size, bool* flushed) {
         auto raster_area = renderer->ReadRasterizer()->GetFlushArea(addr, size);
         if (raster_area.preemtive) {
             return raster_area;
         }
         raster_area.preemtive = true;
+        if (flushed != nullptr) {
+            *flushed = true;
+        }
         // A guest CPU read of GPU-written memory (reactive flushing): count them, they decide
         // whether buffer data must be copied back at every fence (EDEN_NX2_BUFFER_DOWNLOADS).
         if (static std::atomic<u64> reads{}; (reads.fetch_add(1, std::memory_order_relaxed) & 63) == 0) {
@@ -636,8 +639,8 @@ void GPU::PushGPUEntries(s32 channel, Tegra::CommandList&& entries) {
     impl->PushGPUEntries(channel, std::move(entries));
 }
 
-VideoCore::RasterizerDownloadArea GPU::OnCPURead(PAddr addr, u64 size) {
-    return impl->OnCPURead(addr, size);
+VideoCore::RasterizerDownloadArea GPU::OnCPURead(PAddr addr, u64 size, bool* flushed) {
+    return impl->OnCPURead(addr, size, flushed);
 }
 
 void GPU::FlushRegion(DAddr addr, u64 size) {

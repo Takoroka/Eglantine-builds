@@ -212,6 +212,10 @@ struct Nx2ListStats {
 };
 inline Nx2ListStats g_nx2_list_stats{};
 
+/// The GP entry the calling thread parses is on GPU-written pages (DmaPusher::Step): a macro call
+/// it ends got its arguments from the GPU (the "Draw-loop macros" counts, maxwell_3d.cpp).
+inline thread_local bool g_nx2_gpu_written_entry = false;
+
 inline void Nx2CountList(std::atomic<u64>& counter, u64 amount = 1) {
     counter.fetch_add(amount, std::memory_order_relaxed);
 }

@@ -376,6 +376,7 @@ bool DmaPusher::Step() {
                 Nx2CountList(g_nx2_list_stats.entries);
             }
         }
+        g_nx2_gpu_written_entry = gpu_written;
         ReportListStats();
         // The words as submitted, unless this is a resumed entry or the GPU has newer ones the
         // safe read below would flush (with the split, the front can't tell: it reads memory

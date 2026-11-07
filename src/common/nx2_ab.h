@@ -25,6 +25,10 @@ enum Feature : u64 {
     // texlookup (11-06): the Texture Cache Memory Limit setting caps the collector's thresholds
     // (TextureCache::ApplyThresholdOverrides) in place of MaxCriticalMemory.
     TcMemoryLimit = 1ull << 1,
+    // backperf (11-06, play-dkb6 idea 30a): guest reads of cached pages remember 8 flush areas
+    // per core (VideoCore::GuestReadAreaTable) in place of one, stamped also with the epoch of
+    // images becoming GPU-modified, so repeat reads skip GetFlushArea's two cache mutexes.
+    GuestReadAreas = 1ull << 3,
     // fences (11-05): direct draws with no vertices or no instances skip the draw setup.
     ZeroDrawSkip = 1ull << 40,
     // vkoff (11-05): draws with none of the dynamic states' dirty flags set skip their updates.
