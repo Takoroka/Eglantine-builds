@@ -169,6 +169,12 @@ struct UserConfig {
     /// This bit should be included as part of `page_table_pointer_mask_bits`.
     std::optional<std::uint8_t> page_table_marked_bit = std::nullopt;
 
+    /// Setting this value has Dynarmic treat the page as unmapped for stores (x64 backend) when
+    /// any of these bits of the page pointer is set, in place of `page_table_marked_bit` (loads
+    /// still check that bit alone): pages whose loads may read memory directly while their
+    /// stores need the callbacks. The bits should be part of the pointer mask and fit in 31 bits.
+    std::optional<std::uint64_t> page_table_write_marked_mask = std::nullopt;
+
     /// If this value is set, Dynarmic will sign extend the page table pointer by this bit.
     /// Useful for compacting bits into the page table and should be used as part of `page_table_pointer_mask`.
     std::optional<std::uint8_t> page_table_sign_extension = std::nullopt;

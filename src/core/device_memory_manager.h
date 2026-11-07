@@ -134,7 +134,16 @@ public:
     /// Traps the next guest CPU read of these pages, to learn which GPU writes the CPU reads.
     void ArmReadTraps(DAddr addr, size_t size);
 
+    /// The GPU writes these pages now (an image became GPU-modified): those of them restored to
+    /// direct guest reads (A/B bit 18 FastmemRestore) take the rasterizer path again.
+    void RemarkRestoredReads(DAddr addr, size_t size);
+
 private:
+    /// Calls `method` for each run of these device pages that is contiguous in one process's
+    /// address space.
+    void ForEachCpuBackingRun(DAddr addr, size_t size,
+                              void (*method)(Memory::Memory*, VAddr, size_t));
+
     struct TranslationEntry {
         DAddr guest_page{};
         u8* host_ptr{};

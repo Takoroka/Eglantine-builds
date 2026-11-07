@@ -220,7 +220,7 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
     } else {
         // Use page table
         ASSERT(conf.page_table);
-        const auto dest_ptr = EmitVAddrLookup(code, ctx, bitsize, *abort, vaddr);
+        const auto dest_ptr = EmitVAddrLookup(code, ctx, bitsize, *abort, vaddr, true);
         EmitWriteMemoryMov<bitsize>(code, dest_ptr, value_idx, ordered);
 
         ctx.deferred_emits.emplace_back([=, this, &ctx] {

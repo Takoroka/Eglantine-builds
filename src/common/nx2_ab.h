@@ -120,6 +120,11 @@ enum Feature : u64 {
     // their own (Vulkan::ReadbackQueue) after the GPU tick of the source's last use, and wait for
     // that copy alone instead of Finish() (the whole graphics queue).
     ReadbackQueue = 1ull << 11,
+    // backperf (11-06, play-dkb8 idea 30b): a guest read of a cached page that needed no flush
+    // gives the page back to direct reads (its marked bit cleared; JIT stores test
+    // PageTable::WRITE_MARKED_MASK, so writes still trap) until the GPU writes it again. With
+    // bit 3 only (its read path). Bit forced off: the JITs don't check the store mask at all.
+    FastmemRestore = 1ull << 18,
 };
 
 inline const u64 g_mask = [] {
