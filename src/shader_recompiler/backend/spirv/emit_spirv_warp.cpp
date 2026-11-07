@@ -90,18 +90,22 @@ Id GuestLane(EmitContext& ctx, Id index) {
     return ctx.OpBitwiseAnd(ctx.U32[1], index, ctx.Const(31U));
 }
 
-bool HasBrokenShuffle(EmitContext& ctx) {
+bool UseShuffleFallback(EmitContext& ctx) {
     if (ctx.profile.has_broken_spirv_subgroup_shuffle) {
         return true;
     }
-    // AMD's compiler: the vertex to fragment stages. Compute, task and mesh shuffle correctly.
+    // AMD's compilers: the fragment stage on the Windows driver, and with
+    // has_broken_graphics_subgroup_shuffle the vertex to fragment stages there and on AMDVLK.
+    // Compute, task and mesh shuffle correctly.
     switch (ctx.stage) {
+    case Stage::Fragment:
+        return ctx.profile.has_broken_spirv_fragment_shuffle ||
+               ctx.profile.has_broken_graphics_subgroup_shuffle;
     case Stage::VertexA:
     case Stage::VertexB:
     case Stage::TessellationControl:
     case Stage::TessellationEval:
     case Stage::Geometry:
-    case Stage::Fragment:
         return ctx.profile.has_broken_graphics_subgroup_shuffle;
     default:
         return false;
@@ -109,7 +113,7 @@ bool HasBrokenShuffle(EmitContext& ctx) {
 }
 
 Id ShuffleAbsolute(EmitContext& ctx, Id value, Id src_thread_id) {
-    if (!HasBrokenShuffle(ctx)) {
+    if (!UseShuffleFallback(ctx)) {
         return ctx.OpGroupNonUniformShuffle(ctx.U32[1], SubgroupScope(ctx), value, src_thread_id);
     }
     // Every host lane is broadcast and the one asked for is selected. The loop covers the
@@ -125,7 +129,7 @@ Id ShuffleAbsolute(EmitContext& ctx, Id value, Id src_thread_id) {
 }
 
 Id ShuffleRelative(EmitContext& ctx, Id value, Id delta, Id src_thread_id, spv::Op op) {
-    if (!ctx.profile.support_shuffle_relative) {
+    if (!ctx.profile.support_shuffle_relative || UseShuffleFallback(ctx)) {
         return ShuffleAbsolute(ctx, value, HostThreadId(ctx, src_thread_id));
     }
     const Id result{ctx.OpGroupNonUniformShuffleXor(ctx.U32[1], SubgroupScope(ctx), value, delta)};

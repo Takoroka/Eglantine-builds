@@ -93,15 +93,9 @@ public:
     /// of a renderpass.
     void RequestOutsideRenderPassOperationContext();
 
-    /// A dispatch was recorded (A/B bit WaitForIdleBarrier): the next render pass begins after a
-    /// barrier that makes what it wrote visible to the draws.
-    void RequestComputeBarrier() noexcept {
-        compute_barrier_pending = true;
-    }
-
-    /// A full barrier was recorded: no render pass needs the barrier after the dispatches before it.
-    void ClearComputeBarrier() noexcept {
-        compute_barrier_pending = false;
+    /// A dispatch was recorded: the next render pass must see what it wrote.
+    void NoteComputeWrites() {
+        compute_writes_pending = true;
     }
 
     /// Returns true when a render pass is currently active in the scheduler state.
@@ -389,6 +383,7 @@ private:
     StateTracker& state_tracker;
 
     std::unique_ptr<MasterSemaphore> master_semaphore;
+    bool compute_writes_pending{};
     bool graphics_pipeline_missing{};
     std::unique_ptr<CommandPool> command_pool;
 
@@ -404,7 +399,6 @@ private:
 
     State state;
     u64 record_serial = 0;
-    bool compute_barrier_pending = false; ///< RequestComputeBarrier
     FragmentBarrierState fragment_barrier; ///< DeferFragmentBarrier
 
     u32 num_renderpass_images = 0;

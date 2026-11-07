@@ -30,6 +30,7 @@
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/ir_opt/passes.h"
 #include "shader_recompiler/program_header.h"
+#include "common/env_gate.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
@@ -547,8 +548,14 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
             driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY &&
             device.GetDriverVersion() < VK_MAKE_VERSION(512, 672, 0),
         .has_broken_spirv_subgroup_shuffle = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
-        .has_broken_graphics_subgroup_shuffle = driver_id == VK_DRIVER_ID_AMD_PROPRIETARY ||
-                                                driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE,
+        .has_broken_spirv_fragment_shuffle =
+            driver_id == VK_DRIVER_ID_AMD_PROPRIETARY &&
+            Common::EnvGate("EGLANTINE_AMD_FRAGMENT_SHUFFLE"),
+        // The other graphics stages too, and AMDVLK; the same launch gate turns it off.
+        .has_broken_graphics_subgroup_shuffle =
+            (driver_id == VK_DRIVER_ID_AMD_PROPRIETARY ||
+             driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE) &&
+            Common::EnvGate("EGLANTINE_AMD_FRAGMENT_SHUFFLE"),
         .max_subgroup_size = device.GetMaxSubgroupSize(),
         .has_broken_robust =
             device.IsNvidia() && device.GetNvidiaArch() <= NvidiaArchitecture::Arch_Pascal,

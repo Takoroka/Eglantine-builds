@@ -7,6 +7,7 @@
 namespace Settings {
 
 inline constexpr u64 MarioKartWorldProgramId = 0x0400C3F00006E000ULL;
+inline constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000;
 
 // Mario Kart World's recommended settings, passed one by one to `apply(setting, value)`. Docked at
 // 1x without anti-aliasing: handheld or a lower resolution would only hide the emulator's cost.
@@ -50,6 +51,32 @@ inline bool ApplyMarioKartWorldPreset(Values& settings, u64 program_id) {
         applied = true;
     });
     return applied;
+}
+
+inline void SetOcarinaOfTimeRecommendedSettings(Values& settings, bool global) {
+    const auto session = [global](auto& setting, auto value) {
+        setting.SetGlobal(global);
+        setting.SetValue(value);
+    };
+    session(settings.renderer_backend, RendererBackend::Vulkan);
+    session(settings.resolution_setup, ResolutionSetup::Res1X);
+    session(settings.gpu_accuracy, GpuAccuracy::Low);
+    session(settings.use_asynchronous_shaders, true);
+    session(settings.astc_recompression, AstcRecompression::Bc3);
+    session(settings.vram_usage_mode, VramUsageMode::Conservative);
+    session(settings.use_reactive_flushing, true);
+    session(settings.vsync_mode, VSyncMode::FifoRelaxed);
+    session(settings.use_docked_mode, ConsoleMode::Docked);
+    session(settings.scaling_filter, ScalingFilter::ScaleForce);
+    session(settings.anti_aliasing, AntiAliasing::Fxaa);
+}
+
+inline bool ApplyOcarinaOfTimePreset(Values& settings, u64 program_id, bool accepted) {
+    if (!accepted || program_id != OcarinaOfTimeProgramId) {
+        return false;
+    }
+    SetOcarinaOfTimeRecommendedSettings(settings, false);
+    return true;
 }
 
 } // namespace Settings

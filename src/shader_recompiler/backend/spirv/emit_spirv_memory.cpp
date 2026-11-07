@@ -9,6 +9,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+#include "shader_recompiler/backend/spirv/ssbo_align_gate.h"
 
 namespace Shader::Backend::SPIRV {
 namespace {
@@ -67,19 +68,6 @@ void WriteStorage32(EmitContext& ctx, const IR::Value& binding, const IR::Value&
                     u32 index_offset = 0) {
     WriteStorage(ctx, binding, offset, value, ctx.storage_types.U32, sizeof(u32),
                  &StorageDefinitions::U32, index_offset);
-}
-
-/// Storage bindings start at the host's minimum storage buffer offset alignment, and offsets count
-/// from there. When that alignment is smaller than the access (4 bytes on AMD), an aligned 8 or 16
-/// byte guest access can start at any word of the binding, and indexing the vector view would
-/// read or write the vector before it. The vector view is used only when the offset is known to
-/// be a multiple of the access size.
-bool UseVectorView(EmitContext& ctx, const IR::Value& offset, size_t size) {
-    if (!ctx.profile.support_descriptor_aliasing) {
-        return false;
-    }
-    return ctx.profile.min_ssbo_alignment >= size ||
-           (offset.IsImmediate() && offset.U32() % size == 0);
 }
 
 void WriteStorageByCasLoop(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
@@ -223,8 +211,24 @@ Id EmitLoadStorage32(EmitContext& ctx, const IR::Value& binding, const IR::Value
     return LoadStorage32(ctx, binding, offset);
 }
 
+// Offsets are relative to a binding aligned only to the device's storage buffer alignment (4 bytes
+// on AMD), so the vector view (offset >> 3 or 4) is exact only for offsets known to be multiples of
+// the access size; otherwise it reads the vector before the access.
+static bool VectorViewIsExact(EmitContext& ctx, const IR::Value& offset, u32 size) {
+    if (!ctx.profile.support_descriptor_aliasing) {
+        return false;
+    }
+    if (!SsboAlignFixEnabled()) {
+        return true;
+    }
+    if (offset.IsImmediate()) {
+        return offset.U32() % size == 0;
+    }
+    return ctx.profile.min_ssbo_alignment >= size;
+}
+
 Id EmitLoadStorage64(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset) {
-    if (UseVectorView(ctx, offset, sizeof(u32[2]))) {
+    if (VectorViewIsExact(ctx, offset, sizeof(u32[2]))) {
         return LoadStorage(ctx, binding, offset, ctx.U32[2], ctx.storage_types.U32x2,
                            sizeof(u32[2]), &StorageDefinitions::U32x2);
     } else {
@@ -234,7 +238,7 @@ Id EmitLoadStorage64(EmitContext& ctx, const IR::Value& binding, const IR::Value
 }
 
 Id EmitLoadStorage128(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset) {
-    if (UseVectorView(ctx, offset, sizeof(u32[4]))) {
+    if (VectorViewIsExact(ctx, offset, sizeof(u32[4]))) {
         return LoadStorage(ctx, binding, offset, ctx.U32[4], ctx.storage_types.U32x4,
                            sizeof(u32[4]), &StorageDefinitions::U32x4);
     } else {
@@ -296,7 +300,7 @@ void EmitWriteStorage32(EmitContext& ctx, const IR::Value& binding, const IR::Va
 
 void EmitWriteStorage64(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                         Id value) {
-    if (UseVectorView(ctx, offset, sizeof(u32[2]))) {
+    if (VectorViewIsExact(ctx, offset, sizeof(u32[2]))) {
         WriteStorage(ctx, binding, offset, value, ctx.storage_types.U32x2, sizeof(u32[2]),
                      &StorageDefinitions::U32x2);
     } else {
@@ -309,7 +313,7 @@ void EmitWriteStorage64(EmitContext& ctx, const IR::Value& binding, const IR::Va
 
 void EmitWriteStorage128(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                          Id value) {
-    if (UseVectorView(ctx, offset, sizeof(u32[4]))) {
+    if (VectorViewIsExact(ctx, offset, sizeof(u32[4]))) {
         WriteStorage(ctx, binding, offset, value, ctx.storage_types.U32x4, sizeof(u32[4]),
                      &StorageDefinitions::U32x4);
     } else {

@@ -82,8 +82,6 @@ public:
                 }
             }
             {
-                // Under the mutex: WaitForRequests checks its predicate while holding it, so a
-                // bump between that check and its wait would otherwise be missed for good.
                 std::scoped_lock lock{queue_mutex};
                 ++workers_stopped;
             }

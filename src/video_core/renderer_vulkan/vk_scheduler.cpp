@@ -172,21 +172,6 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
                                     const VkClearValue* clear_values, u32 clear_value_count) {
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
-    if (std::exchange(compute_barrier_pending, false)) {
-        // Draws read what the dispatches before them wrote (vertex and index buffers, indirect
-        // arguments, storage buffers and images), and no wait for idle came between.
-        Tegra::Nx2CountList(Tegra::g_nx2_list_stats.compute_draw_barriers);
-        Record([](vk::CommandBuffer cmdbuf) {
-            static constexpr VkMemoryBarrier barrier{
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .pNext = nullptr,
-                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
-            };
-            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                   VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, barrier);
-        });
-    }
     state.renderpass = renderpass;
     state.framebuffer = framebuffer_handle;
     state.render_area = render_area;
@@ -202,8 +187,12 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     for (u32 i = 0; i < clear_value_count && i < values.size(); ++i) {
         values[i] = clear_values[i];
     }
-    Record([renderpass, framebuffer_handle, render_area, values, clear_value_count](
-               vk::CommandBuffer cmdbuf) {
+    const bool after_compute = std::exchange(compute_writes_pending, false);
+    if (after_compute) {
+        Tegra::Nx2CountList(Tegra::g_nx2_list_stats.compute_draw_barriers);
+    }
+    Record([renderpass, framebuffer_handle, render_area, values, clear_value_count,
+            after_compute](vk::CommandBuffer cmdbuf) {
         const VkRenderPassBeginInfo renderpass_bi{
             .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
             .pNext = nullptr,
@@ -217,6 +206,18 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
             .clearValueCount = clear_value_count,
             .pClearValues = clear_value_count != 0 ? values.data() : nullptr,
         };
+        if (after_compute) {
+            // Draws read compute output as indirect arguments, vertices and resources; nothing
+            // else orders those reads after the dispatch.
+            static constexpr VkMemoryBarrier COMPUTE_TO_GRAPHICS{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, COMPUTE_TO_GRAPHICS);
+        }
         cmdbuf.BeginRenderPass(renderpass_bi, VK_SUBPASS_CONTENTS_INLINE);
     });
     num_renderpass_images = framebuffer->NumImages();
