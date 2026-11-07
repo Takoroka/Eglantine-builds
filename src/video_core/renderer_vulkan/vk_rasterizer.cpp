@@ -1463,6 +1463,13 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     });
 }
 
+bool RasterizerVulkan::SendFrontPipelineKey(VideoCommon::GpuSplit& split,
+                                            Tegra::Engines::EngineInterface* engine,
+                                            const u32* regs) {
+    // The front's thread: the pipeline cache reads only what it set up at construction.
+    return pipeline_cache.SendFrontKey(split, engine, regs);
+}
+
 void RasterizerVulkan::DrawIndirect() {
     // Its setup also resolves the indirect buffers: never repeated, nor repeated after.
     NoteSetupChange();

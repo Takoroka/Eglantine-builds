@@ -113,12 +113,41 @@ void RefreshXfbState(VideoCommon::TransformFeedbackState& state, const Maxwell& 
                            });
     state.varyings = regs.stream_out_layout;
 }
+
+/// Refresh's dirty flags: the parts kept per flag are redone where it is set, and cleared as
+/// Refresh always cleared them.
+struct BackDirty {
+    Tegra::Engines::Maxwell3D::DirtyState::Flags& flags;
+    [[nodiscard]] bool Test(u8 flag) const {
+        return flags[flag];
+    }
+    void Clear(u8 flag) {
+        flags[flag] = false;
+    }
+};
+
+/// RefreshFront: every part is redone, and the back's flags are left alone.
+struct AllDirty {
+    [[nodiscard]] bool Test(u8) const {
+        return true;
+    }
+    void Clear(u8) {}
+};
+
+Maxwell::PrimitiveTopology PackedTopology(Maxwell::PrimitiveTopology topology,
+                                          const DynamicFeatures& features) {
+    const bool can_collapse_topology_class =
+        features.has_extended_dynamic_state && features.has_extended_dynamic_state_2;
+    return can_collapse_topology_class
+               ? TOPOLOGY_CLASS_REPRESENTATIVE_LUT[static_cast<size_t>(topology)]
+               : topology;
+}
 } // Anonymous namespace
 
-void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFeatures& features) {
-    const Maxwell& regs = maxwell3d.regs;
-    const auto topology_ = maxwell3d.draw_manager.draw_state.topology;
-
+template <typename DirtyAccess>
+void FixedPipelineState::RefreshImpl(const Maxwell& regs, Maxwell::PrimitiveTopology topology_,
+                                     Tegra::Engines::Maxwell3D::EngineHint stage,
+                                     const DynamicFeatures& features, DirtyAccess& dirty) {
     driver_id = features.driver_id;
     driver_version = features.driver_version;
 
@@ -139,11 +168,7 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
                                   Maxwell::Tessellation::OutputPrimitives::Triangles_CW);
     // The field holds 1..32 points; an unset (0) or oversized register would wrap or truncate.
     patch_control_points_minus_one.Assign(std::clamp<u32>(regs.patch_vertices, 1, 32) - 1);
-    const bool can_collapse_topology_class =
-        features.has_extended_dynamic_state && features.has_extended_dynamic_state_2;
-    topology.Assign(can_collapse_topology_class
-                        ? TOPOLOGY_CLASS_REPRESENTATIVE_LUT[static_cast<size_t>(topology_)]
-                        : topology_);
+    topology.Assign(PackedTopology(topology_, features));
     msaa_mode.Assign(regs.anti_alias_samples_mode);
     attachment0_dual_source_blend.Assign(ComputeAttachment0DualSourceBlend(regs) ? 1 : 0);
 
@@ -183,7 +208,7 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
     smooth_lines.Assign(regs.line_anti_alias_enable != 0 ? 1 : 0);
     alpha_to_coverage_enabled.Assign(regs.anti_alias_alpha_control.alpha_to_coverage != 0 ? 1 : 0);
     alpha_to_one_enabled.Assign(regs.anti_alias_alpha_control.alpha_to_one != 0 ? 1 : 0);
-    app_stage.Assign(maxwell3d.engine_state);
+    app_stage.Assign(stage);
 
     depth_bounds_min = static_cast<u32>(regs.depth_bounds[0]);
     depth_bounds_max = static_cast<u32>(regs.depth_bounds[1]);
@@ -207,7 +232,7 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
                          : 0;
     point_size = std::bit_cast<u32>(regs.point_size);
 
-    if (maxwell3d.dirty.flags[Dirty::VertexInput]) {
+    if (dirty.Test(Dirty::VertexInput)) {
         if (features.has_dynamic_vertex_input) {
             // Dirty flag will be reset by the command buffer update
             const auto& attrs = regs.vertex_attrib_format;
@@ -219,7 +244,7 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
                 attribute_types |= static_cast<u64>(type & mask) << (i * 2);
             }
         } else {
-            maxwell3d.dirty.flags[Dirty::VertexInput] = false;
+            dirty.Clear(Dirty::VertexInput);
             enabled_divisors = 0;
             for (size_t index = 0; index < Maxwell::NumVertexArrays; ++index) {
                 const bool is_enabled = regs.vertex_stream_instances.IsInstancingEnabled(index);
@@ -238,8 +263,8 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
             }
         }
     }
-    if (maxwell3d.dirty.flags[Dirty::ViewportSwizzles]) {
-        maxwell3d.dirty.flags[Dirty::ViewportSwizzles] = false;
+    if (dirty.Test(Dirty::ViewportSwizzles)) {
+        dirty.Clear(Dirty::ViewportSwizzles);
         const auto& transform = regs.viewport_transform;
         std::ranges::transform(transform, viewport_swizzles.begin(), [](const auto& viewport) {
             return static_cast<u16>(viewport.swizzle.raw);
@@ -257,8 +282,8 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
         dynamic_state.Refresh2(regs, topology_, extended_dynamic_state_2);
     }
     if (!extended_dynamic_state_3_blend) {
-        if (maxwell3d.dirty.flags[Dirty::Blending]) {
-            maxwell3d.dirty.flags[Dirty::Blending] = false;
+        if (dirty.Test(Dirty::Blending)) {
+            dirty.Clear(Dirty::Blending);
             for (size_t index = 0; index < attachments.size(); ++index) {
                 attachments[index].Refresh(regs, index);
                 auto& attachment = attachments[index];
@@ -288,6 +313,45 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
             vertex_strides[binding] = static_cast<u16>(RepackedVertexStride(
                 repack_mask, binding, regs.vertex_streams[binding].stride));
         }
+    }
+}
+
+void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFeatures& features) {
+    BackDirty dirty{maxwell3d.dirty.flags};
+    RefreshImpl(maxwell3d.regs, maxwell3d.draw_manager.draw_state.topology, maxwell3d.engine_state,
+                features, dirty);
+}
+
+void FixedPipelineState::RefreshWith(const Maxwell& regs, Maxwell::PrimitiveTopology topology_,
+                                     Tegra::Engines::Maxwell3D::EngineHint stage,
+                                     const DynamicFeatures& features,
+                                     Tegra::Engines::Maxwell3D::DirtyState::Flags& flags) {
+    BackDirty dirty{flags};
+    RefreshImpl(regs, topology_, stage, features, dirty);
+}
+
+void FixedPipelineState::RefreshFront(const Maxwell& regs, const DynamicFeatures& features) {
+    AllDirty dirty;
+    RefreshImpl(regs, Maxwell::PrimitiveTopology::Points,
+                Tegra::Engines::Maxwell3D::EngineHint::None, features, dirty);
+}
+
+void FixedPipelineState::PatchBackFields(Maxwell::PrimitiveTopology topology_,
+                                         Tegra::Engines::Maxwell3D::EngineHint stage,
+                                         const DynamicFeatures& features) noexcept {
+    topology.Assign(PackedTopology(topology_, features));
+    app_stage.Assign(stage);
+}
+
+void FixedPipelineState::ConsumeRefreshFlags(Tegra::Engines::Maxwell3D::DirtyState::Flags& flags,
+                                             const DynamicFeatures& features) noexcept {
+    // The flags Refresh clears once it redid their part (RefreshImpl).
+    if (!features.has_dynamic_vertex_input) {
+        flags[Dirty::VertexInput] = false;
+    }
+    flags[Dirty::ViewportSwizzles] = false;
+    if (!features.has_extended_dynamic_state_3_blend) {
+        flags[Dirty::Blending] = false;
     }
 }
 

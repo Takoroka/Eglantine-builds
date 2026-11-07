@@ -26,6 +26,7 @@ namespace Tegra {
 class MemoryManager;
 namespace Engines {
 class AccelerateDMAInterface;
+class EngineInterface;
 }
 namespace Control {
 struct ChannelState;
@@ -34,6 +35,10 @@ namespace Texture {
 struct TICEntry;
 }
 } // namespace Tegra
+
+namespace VideoCommon {
+class GpuSplit;
+}
 
 namespace VideoCore {
 
@@ -53,6 +58,15 @@ public:
 
     /// Dispatches an indirect draw invocation
     virtual void DrawIndirect() {}
+
+    /// Split GPU thread, on its front (A/B bit FrontPipelineKey): sends the back the graphics
+    /// pipeline state of the draw that `engine`'s next method makes, built from `regs` (the
+    /// front's copy of the 3D engine's registers), right before that method. False: not sent.
+    virtual bool SendFrontPipelineKey([[maybe_unused]] VideoCommon::GpuSplit& split,
+                                      [[maybe_unused]] Tegra::Engines::EngineInterface* engine,
+                                      [[maybe_unused]] const u32* regs) {
+        return false;
+    }
 
     /// Dispatches an draw texture invocation
     virtual void DrawTexture() = 0;

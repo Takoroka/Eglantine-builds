@@ -1221,6 +1221,8 @@ struct Maxwell3D::FrontState {
     /// then can it have a deferred instanced draw to issue at the end of a macro.
     bool draw_pending{true};
     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
+    /// A/B bit FrontPipelineKey: false once the renderer said it takes no front keys.
+    bool front_keys{true};
     FrontUpload upload;
     std::vector<u32> read_ahead; ///< DMA read words from the split's record (FrontDmaRead)
     std::vector<u32> read_back;  ///< ... and from memory once the back caught up
@@ -1270,6 +1272,28 @@ namespace {
 bool FrontVerifyEnabled() {
     static const bool verify = std::getenv("EDEN_NX2_SPLIT_VERIFY") != nullptr;
     return verify;
+}
+
+// A/B bit FrontPipelineKey: the methods the draw manager draws in, within their own call
+// (DrawManager::ProcessMethodCall): the end of a draw, unless DrawBegin made it part of an
+// instanced loop the back draws later (DrawDeferred), and the small-index and instanced-array
+// draws. `regs`: the front's copy, the method's own write in.
+bool FrontKeyDraw(u32 method, const Maxwell3D::Regs& regs) {
+    switch (method) {
+    case MAXWELL3D_REG_INDEX(draw.end):
+        return regs.draw.instance_id != Maxwell3D::Regs::Draw::InstanceId::Subsequent;
+    case MAXWELL3D_REG_INDEX(index_buffer32_first):
+    case MAXWELL3D_REG_INDEX(index_buffer16_first):
+    case MAXWELL3D_REG_INDEX(index_buffer8_first):
+    case MAXWELL3D_REG_INDEX(index_buffer32_subsequent):
+    case MAXWELL3D_REG_INDEX(index_buffer16_subsequent):
+    case MAXWELL3D_REG_INDEX(index_buffer8_subsequent):
+    case MAXWELL3D_REG_INDEX(vertex_array_instance_first):
+    case MAXWELL3D_REG_INDEX(vertex_array_instance_subsequent):
+        return true;
+    default:
+        return false;
+    }
 }
 
 // Executable methods ProcessMethodCall handles itself; the rest go to the draw manager.
@@ -1510,6 +1534,13 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             }
             break;
         }
+    }
+    if (fs.front_keys && rasterizer != nullptr && execution_mask[method] &&
+        FrontKeyDraw(method, *reinterpret_cast<const Regs*>(fs.regs.data())) &&
+        Common::Nx2Ab::On(Common::Nx2Ab::FrontPipelineKey)) {
+        // The pipeline state of the draw this method makes, right before it (the renderer's
+        // pipeline lookup takes it on the back: vk_front_pipeline_key.h).
+        fs.front_keys = rasterizer->SendFrontPipelineKey(split, this, fs.regs.data());
     }
     if (from_macro) {
         split.MacroWrite(this, method, argument);
