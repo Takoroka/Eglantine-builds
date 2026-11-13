@@ -930,6 +930,17 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             key.state.ConvertToDynamicVertexInput();
         }
 
+        // Keys carry the driver they were saved with (FixedPipelineState::Refresh). Neither field
+        // feeds translation or pipeline creation, but both are hashed: after a driver update every
+        // saved key differed from the ones Refresh makes, so boot built pipelines no draw looks up,
+        // the game translated and built them all again (its draws skipped meanwhile), and each was
+        // saved once more. Another driver's keys (another GPU) are dropped; an older version of
+        // this driver's is taken as this version. The used list keeps the saved hash (saved_hash).
+        if (key.state.driver_id != dynamic_features.driver_id) {
+            return;
+        }
+        key.state.driver_version = dynamic_features.driver_version;
+
         if ((key.state.extended_dynamic_state != 0) !=
                 dynamic_features.has_extended_dynamic_state ||
             (key.state.extended_dynamic_state_2 != 0) !=
