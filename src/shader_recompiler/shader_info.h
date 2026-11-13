@@ -335,6 +335,8 @@ struct Info {
     bool removed_conditional_barrier{};
     bool uses_subgroup_mask{};
     bool uses_fswzadd{};
+    /// Matrix multiply-adds (HMMA) run in software (TensorMulAdd)
+    bool uses_software_matrix{};
     bool uses_derivatives{};
     bool uses_typeless_image_reads{};
     bool uses_typeless_image_writes{};

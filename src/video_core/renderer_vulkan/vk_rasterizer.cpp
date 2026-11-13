@@ -1265,6 +1265,11 @@ void RasterizerVulkan::DispatchCompute() {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute pipeline unavailable");
         return;
     }
+    if (pipeline->SkipsDispatches()) {
+        // A software matrix pipeline AMD's compiler is still building where nothing waits for it
+        // (PipelineCache matrix_workers): its dispatches are skipped until it exists.
+        return;
+    }
     std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};
     // Command list pages the dispatch writes are copied for the split's front right after it.
     buffer_cache.Nx2CollectListCopies(true);

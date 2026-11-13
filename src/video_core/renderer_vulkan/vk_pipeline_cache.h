@@ -220,6 +220,9 @@ private:
 
     Common::ThreadWorker workers;
     Common::ThreadWorker serialization_thread;
+    /// Builds software matrix compute pipelines on AMD's own compilers, which nothing waits for;
+    /// null on other drivers. Joined before the pipelines it builds go.
+    std::unique_ptr<Common::ThreadWorker> matrix_workers;
     DynamicFeatures dynamic_features;
 
     /// Cached graphics pipelines boot skipped (not in used_pipelines) are built on background

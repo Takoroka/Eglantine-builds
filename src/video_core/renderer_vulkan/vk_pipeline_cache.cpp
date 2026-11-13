@@ -385,6 +385,14 @@ bool DriverCachesPipelines(const Device& device) {
         return false;
     }
 }
+
+// AMD's own compilers (the Windows driver, AMDVLK) take minutes over the software HMMA compute
+// programs or fail them with VK_ERROR_OUT_OF_HOST_MEMORY, and the GPU thread waited for them
+// (Ocarina's boot and first movie on an RX 6650 XT). RADV builds them in time.
+bool DefersSoftwareMatrixPipelines(const Device& device) {
+    const VkDriverId driver = device.GetDriverID();
+    return driver == VK_DRIVER_ID_AMD_PROPRIETARY || driver == VK_DRIVER_ID_AMD_OPEN_SOURCE;
+}
 } // Anonymous namespace
 
 PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
@@ -406,6 +414,10 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
               "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
       serialization_thread(1, "VkPipelineSerialization", {},
                            Common::ThreadPlacement::Background) {
+    if (DefersSoftwareMatrixPipelines(device)) {
+        matrix_workers.reset(new Common::ThreadWorker(1, "VkMatrixPipelines", {},
+                                                      Common::ThreadPlacement::Background));
+    }
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
@@ -1673,12 +1685,23 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
         const auto name{fmt::format("Shader {:016x}", key.unique_hash)};
         spv_module.SetObjectNameEXT(name.c_str());
     }
-    Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
+    // Software matrix programs on AMD's own compilers: built on a worker nothing waits for (not
+    // even boot), their dispatches skipped until then (RasterizerVulkan::DispatchCompute).
+    const bool defer_build{matrix_workers && program.info.uses_software_matrix};
+    if (defer_build) {
+        LOG_INFO(Render_Vulkan,
+                 "Compute shader {:016X} runs HMMA in software: built in the background, its "
+                 "dispatches are skipped until it is",
+                 key.unique_hash);
+    }
+    Common::ThreadWorker* const thread_worker{
+        defer_build ? matrix_workers.get() : (build_in_parallel ? &workers : nullptr)};
+    // A deferred build can outlive the caller's statistics (the disk cache loader's are local).
     return std::make_unique<ComputePipeline>(device, scheduler, vulkan_pipeline_cache, descriptor_pool,
                                              guest_descriptor_queue, descriptor_buffer_ring,
-                                             thread_worker, statistics,
+                                             thread_worker, defer_build ? nullptr : statistics,
                                              &shader_notify, program.info, std::move(spv_module),
-                                             key.unique_hash);
+                                             key.unique_hash, defer_build);
 
 } catch (const Shader::Exception& exception) {
     LOG_ERROR(Render_Vulkan, "{}", exception.what());
