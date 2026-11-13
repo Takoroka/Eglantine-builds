@@ -250,24 +250,31 @@ public:
     std::optional<BcEncoderPass> bc_encoder_pass;
 
     /// ASTC decoded on the GPU and re-compressed to BC1/BC3 there (accelerate_astc=Gpu with
-    /// astc_recompression=Bc1/Bc3): decode into a temporary RGBA8 image, encode, copy.
+    /// astc_recompression=Bc1/Bc3): decode into an RGBA8 scratch image, encode, copy.
     void TranscodeAstcToBcn(Image& image, const StagingBufferRef& map,
                             std::span<const VideoCommon::SwizzleParameters> swizzles);
 
-    /// Temporary decode images, reusable once the GPU is past `tick`.
-    struct PendingTranscode {
-        u64 tick;
+    /// An RGBA8 decode image kept for every texture that fits in it: power-of-two sizes with
+    /// every level. A decode waits for the previous encode reading it instead of taking an image
+    /// of its own.
+    struct TranscodeScratch {
         vk::Image image;
-        std::vector<vk::ImageView> views;
+        std::vector<vk::ImageView> views; ///< Storage view of each level
         u32 width;
         u32 height;
         u32 levels;
         u32 layers;
+        u64 bytes;
+        u64 tick; ///< Last use on the GPU
         u32 unused_frames;
+        bool initialized; ///< Decoded into before (in the general layout)
+        bool single_use;  ///< Too large to keep: freed once the GPU is done with it
     };
-    std::deque<PendingTranscode> pending_transcodes;
-    /// Decode images the GPU is done with, for the next texture of the same shape.
-    std::vector<PendingTranscode> free_transcodes;
+    /// A scratch that `width`x`height` textures with `levels` and `layers` fit in.
+    TranscodeScratch& TranscodeScratchFor(u32 width, u32 height, u32 levels, u32 layers);
+    std::vector<TranscodeScratch> transcode_scratches;
+    /// Scratches taken out of use, freed once the GPU is past their tick.
+    std::vector<TranscodeScratch> retired_transcode_scratches;
 
     std::optional<BlockLinearUnswizzle3DPass> bl3d_unswizzle_pass;
     const Settings::ResolutionScalingInfo& resolution;
@@ -461,7 +468,7 @@ public:
 
     /// Where the image's memory lies, for the collector (TextureCache::RunGarbageCollector).
     [[nodiscard]] vk::Image::MemoryBlock MemoryBlock() const noexcept {
-        return original_image.GetMemoryBlock();
+        return memory_block;
     }
 
     /// Returns true when the image is already initialized and mark it as initialized
@@ -615,6 +622,9 @@ private:
 
     vk::Image original_image;
     vk::Image scaled_image;
+    /// original_image's memory, which stays where it was put: asked of VMA once rather than for
+    /// every image at each collector pass.
+    vk::Image::MemoryBlock memory_block{};
 
     vk::Buffer compute_unswizzle_buffer;
     VkDeviceSize compute_unswizzle_buffer_size = 0;

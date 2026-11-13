@@ -2630,9 +2630,22 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         if (IsPixelFormatASTC(new_info.format) && runtime.UseOpaqueAstcFormat()) {
             const size_t scan_bytes = CalculateGuestSizeInBytes(new_info);
             if (scan_bytes <= MaxScanBytes) {
-                astc_scan_buffer.resize(scan_bytes);
-                gpu_memory->ReadBlockUnsafe(gpu_addr, astc_scan_buffer.data(), scan_bytes);
-                new_info.astc_opaque = AstcDataLooksOpaque(astc_scan_buffer);
+                if (const u8* const data = gpu_memory->GetSpan(gpu_addr, scan_bytes)) {
+                    // Contiguous in host memory: scanned where it is, not copied first.
+                    new_info.astc_opaque = AstcDataLooksOpaque({data, scan_bytes});
+                } else {
+                    // In pieces, so a block with alpha early on ends the copying too.
+                    constexpr size_t ScanChunkBytes = 256_KiB;
+                    new_info.astc_opaque = true;
+                    for (size_t offset = 0; offset < scan_bytes && new_info.astc_opaque;
+                         offset += ScanChunkBytes) {
+                        const size_t chunk = (std::min)(ScanChunkBytes, scan_bytes - offset);
+                        astc_scan_buffer.resize(chunk);
+                        gpu_memory->ReadBlockUnsafe(gpu_addr + offset, astc_scan_buffer.data(),
+                                                    chunk);
+                        new_info.astc_opaque = AstcDataLooksOpaque(astc_scan_buffer);
+                    }
+                }
                 ++(new_info.astc_opaque ? astc_opaque_images : astc_alpha_images);
             }
         }
