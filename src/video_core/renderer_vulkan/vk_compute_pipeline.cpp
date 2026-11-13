@@ -259,6 +259,11 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         // A lone handle table's last element is this dispatch's own handle (the plain search's
         // handle program), which an index past the table selects.
         const u32 overflow_index{desc.overflow_program != ~0U ? desc.count - 1 : desc.count};
+        // An element takes the sampler of the element before it in its descriptor when their TSC
+        // index is the same (GetSamplerId would read the same entry again).
+        bool memo_valid{};
+        u32 memo_tsc{};
+        VideoCommon::SamplerId memo_sampler{};
         for (u32 index = 0; index < desc.count; ++index) {
             const auto handle{[&] {
                 if (index == overflow_index) {
@@ -277,8 +282,15 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             }()};
             views.push_back({handle.first});
 
+            if (memo_valid && handle.second == memo_tsc) {
+                samplers.push_back(memo_sampler);
+                continue;
+            }
             VideoCommon::SamplerId sampler = texture_cache.GetSamplerId(handle.second, true);
             samplers.push_back(sampler);
+            memo_valid = true;
+            memo_tsc = handle.second;
+            memo_sampler = sampler;
         }
     }
     for (const auto& desc : info.image_descriptors) {

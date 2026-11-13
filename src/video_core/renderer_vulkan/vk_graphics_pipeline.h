@@ -16,6 +16,8 @@
 #include <type_traits>
 #include <vector>
 
+#include <boost/container/small_vector.hpp>
+
 #include "common/thread_worker.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -212,6 +214,10 @@ private:
     std::vector<SampledImage> sampled_images;
     u32 num_textures{};
     bool fragment_has_color0_output{};
+    /// A setup's views and samplers when they outgrow ConfigureImpl's stack vectors (large handle
+    /// tables), kept between setups instead of heap vectors per draw. Cleared on entry.
+    boost::container::small_vector<VideoCommon::ImageViewInOut, 1> scratch_views;
+    boost::container::small_vector<VideoCommon::SamplerId, 1> scratch_samplers;
 
     vk::DescriptorSetLayout descriptor_set_layout;
     DescriptorAllocator descriptor_allocator;

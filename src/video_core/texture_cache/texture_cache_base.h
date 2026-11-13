@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <deque>
 #include <limits>
@@ -69,6 +70,11 @@ struct ImageViewInOut {
     bool blacklist{};
     ImageViewId id{};
 };
+
+/// Setups with at least this many texture views resolve each distinct view index once a
+/// FillImageViews pass (large handle tables name the same handles many times). Smaller setups
+/// take the plain path.
+constexpr size_t TABLE_DEDUPE_MIN_VIEWS = 64;
 
 struct AsyncDecodeContext {
     ImageId image_id;
@@ -394,6 +400,13 @@ private:
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);
 
+    /// VisitImageView for the first element with this index in a FillImageViews pass, the view it
+    /// resolved to for the others.
+    ImageViewId VisitImageViewOnce(u32 index, bool compute);
+
+    /// Starts an empty view memo (a new stamp; on wrap, all slots cleared).
+    void StartViewMemo() noexcept;
+
     /// Find or create a framebuffer with the given render target parameters
     FramebufferId GetFramebufferId(const RenderTargets& key);
 
@@ -636,6 +649,27 @@ private:
 
     u64 modification_tick = 0;
     u64 frame_tick = 0;
+
+    /// Goes up whenever an alias copy lands in an image or an image with aliases is modified: an
+    /// image prepared earlier in a FillImageViews pass may have to synchronize again, so the view
+    /// memo starts over. Never reset.
+    u64 alias_copy_epoch = 0;
+
+    /// The view each distinct index resolved to in the current FillImageViews pass (setups of
+    /// TABLE_DEDUPE_MIN_VIEWS or more views). Open addressing; a slot is live while its stamp is
+    /// the memo's.
+    struct ViewMemoSlot {
+        u32 stamp;
+        u32 index;
+        ImageViewId id;
+    };
+    static constexpr size_t VIEW_MEMO_SLOTS = 2048;                 ///< power of two
+    static constexpr u32 VIEW_MEMO_MAX_USED = VIEW_MEMO_SLOTS / 2; ///< then plain visits
+    std::array<ViewMemoSlot, VIEW_MEMO_SLOTS> view_memo{};
+    u32 view_memo_stamp = 0;
+    u32 view_memo_used = 0;
+    u64 view_memo_epoch = 0;     ///< alias_copy_epoch when the memo started
+    bool view_memo_busy = false; ///< a FillImageViews with the memo is running (no nesting)
 
     Common::ThreadWorker texture_decode_worker{1, "TextureDecoder", {},
                                                Common::ThreadPlacement::Efficiency};

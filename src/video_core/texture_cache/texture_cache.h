@@ -532,14 +532,29 @@ bool TextureCache<P>::PublishComputeCollisionImage(u32 index) {
 }
 template <class P>
 void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist) {
+    // Large handle tables name the same handles many times (a Kirby Air Riders table draw has
+    // about 513 elements naming about 210 views): each distinct index is visited once a pass, in
+    // first-occurrence order, and its later elements take the view it resolved to. A repeated
+    // visit would only prepare the image again: a no-op within the pass, unless images were
+    // deleted (the pass runs again, and the memo with it) or an alias copy or a modification of
+    // an aliased image happened meanwhile (alias_copy_epoch: the memo starts over). Blacklisted
+    // views (written images) always visit.
+    const bool dedupe = views.size() >= TABLE_DEDUPE_MIN_VIEWS && !view_memo_busy;
+    if (dedupe) {
+        view_memo_busy = true;
+    }
     bool has_blacklisted = false;
     do {
         has_deleted_images = false;
         if (blacklist) {
             has_blacklisted = false;
         }
+        if (dedupe) {
+            StartViewMemo();
+        }
         for (ImageViewInOut& view : views) {
-            view.id = VisitImageView(view.index, compute);
+            view.id = dedupe && !view.blacklist ? VisitImageViewOnce(view.index, compute)
+                                                : VisitImageView(view.index, compute);
             if (blacklist) {
                 if (view.blacklist && view.id != NULL_IMAGE_VIEW_ID) {
                     const ImageViewBase& image_view = slot_image_views[view.id];
@@ -550,6 +565,9 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
             }
         }
     } while (has_deleted_images || (blacklist && has_blacklisted));
+    if (dedupe) {
+        view_memo_busy = false;
+    }
 }
 
 template <class P>
@@ -887,6 +905,45 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
     const auto id = table.bound_ids[index];
     if (id != NULL_IMAGE_VIEW_ID)
         PrepareImageView(id, false, false);
+    return id;
+}
+
+template <class P>
+void TextureCache<P>::StartViewMemo() noexcept {
+    if (++view_memo_stamp == 0) {
+        for (ViewMemoSlot& slot : view_memo) {
+            slot.stamp = 0;
+        }
+        view_memo_stamp = 1;
+    }
+    view_memo_used = 0;
+    view_memo_epoch = alias_copy_epoch;
+}
+
+template <class P>
+ImageViewId TextureCache<P>::VisitImageViewOnce(u32 index, bool compute) {
+    if (has_deleted_images) {
+        // This pass runs again: views it resolved before the deletion may be erased.
+        return VisitImageView(index, compute);
+    }
+    if (view_memo_epoch != alias_copy_epoch) {
+        // An alias copy or an aliased modification: images prepared before may synchronize again.
+        StartViewMemo();
+    }
+    size_t slot = static_cast<size_t>((index * 0x9E3779B1u) >> 21) & (VIEW_MEMO_SLOTS - 1);
+    while (view_memo[slot].stamp == view_memo_stamp) {
+        if (view_memo[slot].index == index) {
+            return view_memo[slot].id;
+        }
+        slot = (slot + 1) & (VIEW_MEMO_SLOTS - 1);
+    }
+    const ImageViewId id = VisitImageView(index, compute);
+    // Kept unless the visit deleted images or moved the epoch (then the memo restarts anyway).
+    if (!has_deleted_images && view_memo_epoch == alias_copy_epoch &&
+        view_memo_used < VIEW_MEMO_MAX_USED) {
+        view_memo[slot] = ViewMemoSlot{view_memo_stamp, index, id};
+        ++view_memo_used;
+    }
     return id;
 }
 
@@ -3566,6 +3623,9 @@ template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     image.flags |= ImageFlagBits::GpuModified;
     image.modification_tick = ++modification_tick;
+    if (!image.aliased_images.empty()) {
+        ++alias_copy_epoch; // FillImageViews' view memo starts over
+    }
 }
 
 template <class P>
@@ -3587,6 +3647,7 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     if (aliased_images.empty()) {
         return;
     }
+    ++alias_copy_epoch; // FillImageViews' view memo starts over
     const bool can_rescale = ImageCanRescale(image);
     if (any_rescaled) {
         if (can_rescale) {
