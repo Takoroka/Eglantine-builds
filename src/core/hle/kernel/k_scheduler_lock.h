@@ -72,6 +72,8 @@ private:
     friend class GlobalSchedulerContext;
 
     KernelCore& m_kernel;
+    // On a cache line of its own (KAlignedSpinLock), so the count and owner the holder writes
+    // start the next line.
     KAlignedSpinLock m_spin_lock{};
     s32 m_lock_count{};
     std::atomic<KThread*> m_owner_thread{};
