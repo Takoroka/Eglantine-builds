@@ -153,7 +153,11 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
         remaining_size -= page_size;
     }
     flush_modified();
-    kind_map.Map(gpu_addr, gpu_addr + size, kind);
+    {
+        std::unique_lock<std::mutex> lock(guard);
+        kind_map.Map(gpu_addr, gpu_addr + size, kind);
+        kind_map_generation.fetch_add(1, std::memory_order_release);
+    }
     map_serial.fetch_add(1, std::memory_order_release);
     return gpu_addr;
 }
@@ -209,6 +213,7 @@ GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr
     {
         std::unique_lock<std::mutex> lock(guard);
         kind_map.Map(gpu_addr, gpu_addr + size, kind);
+        kind_map_generation.fetch_add(1, std::memory_order_release);
     }
     map_serial.fetch_add(1, std::memory_order_release);
     return gpu_addr;
@@ -649,8 +654,36 @@ size_t MemoryManager::MaxContinuousRangeUncached(GPUVAddr gpu_addr, size_t size)
 }
 
 size_t MemoryManager::GetMemoryLayoutSize(GPUVAddr gpu_addr, size_t max_size) const {
+    // Storage buffer binds ask for every buffer of every draw: keep the last runs found (per
+    // thread, for the kind map as of a generation) instead of locking and searching each time.
+    // A run found from gpu_addr ends at the next kind change, so every address in it has the
+    // same end.
+    struct CachedRun {
+        size_t owner;
+        u64 generation; // 0: empty
+        GPUVAddr begin;
+        GPUVAddr end;
+    };
+    thread_local std::array<CachedRun, 4> runs{};
+    thread_local u32 next_run = 0;
+    const u64 generation = kind_map_generation.load(std::memory_order_acquire);
+    for (const CachedRun& run : runs) {
+        if (run.generation == generation && run.owner == unique_identifier &&
+            gpu_addr >= run.begin && gpu_addr < run.end) {
+            return run.end - gpu_addr;
+        }
+    }
     std::unique_lock<std::mutex> lock(guard);
-    return kind_map.GetContinuousSizeFrom(gpu_addr);
+    const size_t size = kind_map.GetContinuousSizeFrom(gpu_addr);
+    if (size != 0) {
+        runs[next_run++ % runs.size()] = {
+            .owner = unique_identifier,
+            .generation = kind_map_generation.load(std::memory_order_relaxed),
+            .begin = gpu_addr,
+            .end = gpu_addr + size,
+        };
+    }
+    return size;
 }
 
 void MemoryManager::InvalidateRegion(GPUVAddr gpu_addr, size_t size,
