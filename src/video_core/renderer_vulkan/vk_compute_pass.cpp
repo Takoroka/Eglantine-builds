@@ -234,9 +234,11 @@ struct BcEncoderPushConstants {
     u32 blocks_y;
     u32 width;
     u32 height;
-    u32 bc3;
+    u32 flags; // bc_encoder.comp's FLAG_*
     u32 out_offset; // in 8-byte units
 };
+constexpr u32 BC_ENCODER_FLAG_BC3 = 1;
+constexpr u32 BC_ENCODER_FLAG_ENDPOINT_CANDIDATES = 2;
 
 struct QueriesPrefixScanPushConstants {
     u32 min_accumulation_base;
@@ -857,7 +859,8 @@ void BcEncoderPass::Encode(VkImageView source, u32 width, u32 height, u32 layers
         .blocks_y = Common::DivCeil(height, 4U),
         .width = width,
         .height = height,
-        .bc3 = bc3 ? 1U : 0U,
+        // The un-inset endpoints are tried too.
+        .flags = (bc3 ? BC_ENCODER_FLAG_BC3 : 0U) | BC_ENCODER_FLAG_ENDPOINT_CANDIDATES,
         .out_offset = static_cast<u32>(out_offset / 8),
     };
     const VkPipeline vk_pipeline = *pipeline;

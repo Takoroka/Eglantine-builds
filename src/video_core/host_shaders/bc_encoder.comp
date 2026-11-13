@@ -4,8 +4,10 @@
 // Compresses one level of an RGBA8 image (the ASTC decoder's output) to BC1 or BC3, one 4x4 block
 // per invocation, so re-compressed ASTC never round-trips through the CPU. Colour endpoints are
 // the block's bounding box, oriented along the colours' covariance and inset by 1/16; each texel
-// takes the nearest palette entry. Values are encoded as stored (sRGB data stays sRGB, like the
-// CPU path).
+// takes the nearest palette entry. With FLAG_ENDPOINT_CANDIDATES the un-inset box corners are
+// tried too and the pair with less error is kept: the inset suits gradients, but moves the two
+// exact colours of a two-colour block (text, UI, decals) inward.
+// Values are encoded as stored (sRGB data stays sRGB, like the CPU path).
 
 #version 460 core
 
@@ -22,9 +24,12 @@ layout (push_constant) uniform PushConstants {
     uint blocks_y;
     uint width;
     uint height;
-    uint bc3;
+    uint flags; // FLAG_*
     uint out_offset; // in 8-byte units
 };
+
+const uint FLAG_BC3 = 1u;
+const uint FLAG_ENDPOINT_CANDIDATES = 2u;
 
 uint Pack565(vec3 color) {
     const uvec3 q = uvec3(round(clamp(color, 0.0, 1.0) * vec3(31.0, 63.0, 31.0)));
@@ -42,9 +47,54 @@ float Distance2(vec3 a, vec3 b) {
     return dot(d, d);
 }
 
+// One BC1 colour block from two endpoints; error is the summed squared error of its texels.
+uvec2 EncodePair(in vec4 texels[16], vec3 e0, vec3 e1, bool punch_through, out float error) {
+    uint q0 = Pack565(e0);
+    uint q1 = Pack565(e1);
+    // Four-colour mode needs colour0 > colour1, three-colour mode colour0 <= colour1.
+    if (punch_through ? q0 > q1 : q0 < q1) {
+        const uint t = q0;
+        q0 = q1;
+        q1 = t;
+    }
+    vec3 palette[4];
+    palette[0] = Unpack565(q0);
+    palette[1] = Unpack565(q1);
+    if (punch_through) {
+        palette[2] = (palette[0] + palette[1]) * 0.5;
+        palette[3] = vec3(0.0);
+    } else {
+        palette[2] = (2.0 * palette[0] + palette[1]) / 3.0;
+        palette[3] = (palette[0] + 2.0 * palette[1]) / 3.0;
+    }
+    // Equal endpoints in four-colour mode: every texel takes colour0.
+    const int entries = punch_through ? 3 : (q0 == q1 ? 1 : 4);
+    uint indices = 0u;
+    error = 0.0;
+    for (int i = 0; i < 16; ++i) {
+        uint best = 0u;
+        float best_distance = 0.0;
+        if (punch_through && texels[i].a < 0.5) {
+            best = 3u;
+        } else {
+            best_distance = Distance2(texels[i].rgb, palette[0]);
+            for (int p = 1; p < entries; ++p) {
+                const float distance = Distance2(texels[i].rgb, palette[p]);
+                if (distance < best_distance) {
+                    best_distance = distance;
+                    best = uint(p);
+                }
+            }
+        }
+        error += best_distance;
+        indices |= best << (2 * i);
+    }
+    return uvec2(q0 | (q1 << 16), indices);
+}
+
 // BC1 colour block. With punch_through (BC1 only), texels with alpha < 0.5 use the transparent
 // index of the three-colour mode; otherwise the four-colour mode is used (BC3 always decodes so).
-uvec2 EncodeColor(in vec4 texels[16], bool punch_through) {
+uvec2 EncodeColor(in vec4 texels[16], bool punch_through, bool candidates) {
     vec3 lo = vec3(1.0);
     vec3 hi = vec3(0.0);
     for (int i = 0; i < 16; ++i) {
@@ -78,49 +128,14 @@ uvec2 EncodeColor(in vec4 texels[16], bool punch_through) {
         }
     }
     const vec3 inset = (e0 - e1) / 16.0;
-    e0 -= inset;
-    e1 += inset;
-
-    uint q0 = Pack565(e0);
-    uint q1 = Pack565(e1);
-    // Four-colour mode needs colour0 > colour1, three-colour mode colour0 <= colour1.
-    if (punch_through ? q0 > q1 : q0 < q1) {
-        const uint t = q0;
-        q0 = q1;
-        q1 = t;
+    float inset_error;
+    const uvec2 inset_block = EncodePair(texels, e0 - inset, e1 + inset, punch_through, inset_error);
+    if (!candidates) {
+        return inset_block;
     }
-    if (!punch_through && q0 == q1) {
-        return uvec2(q0 | (q1 << 16), 0u);
-    }
-    vec3 palette[4];
-    palette[0] = Unpack565(q0);
-    palette[1] = Unpack565(q1);
-    if (punch_through) {
-        palette[2] = (palette[0] + palette[1]) * 0.5;
-        palette[3] = vec3(0.0);
-    } else {
-        palette[2] = (2.0 * palette[0] + palette[1]) / 3.0;
-        palette[3] = (palette[0] + 2.0 * palette[1]) / 3.0;
-    }
-    const int entries = punch_through ? 3 : 4;
-    uint indices = 0u;
-    for (int i = 0; i < 16; ++i) {
-        uint best = 0u;
-        if (punch_through && texels[i].a < 0.5) {
-            best = 3u;
-        } else {
-            float best_distance = Distance2(texels[i].rgb, palette[0]);
-            for (int p = 1; p < entries; ++p) {
-                const float distance = Distance2(texels[i].rgb, palette[p]);
-                if (distance < best_distance) {
-                    best_distance = distance;
-                    best = uint(p);
-                }
-            }
-        }
-        indices |= best << (2 * i);
-    }
-    return uvec2(q0 | (q1 << 16), indices);
+    float raw_error;
+    const uvec2 raw_block = EncodePair(texels, e0, e1, punch_through, raw_error);
+    return raw_error < inset_error ? raw_block : inset_block;
 }
 
 // BC3 alpha block: eight-value mode (alpha0 > alpha1), indices 0 = alpha0, 1 = alpha1, 2..7 the
@@ -174,10 +189,11 @@ void main() {
         }
     }
     const uint block = (id.z * blocks_y + id.y) * blocks_x + id.x;
-    if (bc3 != 0u) {
+    const bool candidates = (flags & FLAG_ENDPOINT_CANDIDATES) != 0u;
+    if ((flags & FLAG_BC3) != 0u) {
         blocks[out_offset + block * 2u] = EncodeAlpha(texels);
-        blocks[out_offset + block * 2u + 1u] = EncodeColor(texels, false);
+        blocks[out_offset + block * 2u + 1u] = EncodeColor(texels, false, candidates);
     } else {
-        blocks[out_offset + block] = EncodeColor(texels, any_transparent);
+        blocks[out_offset + block] = EncodeColor(texels, any_transparent, candidates);
     }
 }
