@@ -180,6 +180,10 @@ public:
     /// Tick pending requests within the GPU.
     void TickWork();
 
+    /// Only guest CPU read flushes are pending: the split's back runs them between entries
+    /// instead of after the work queued behind them.
+    [[nodiscard]] bool HasEarlySyncRequests() const;
+
     /// Gets a mutable reference to the Host1x interface
     [[nodiscard]] Host1x::Host1x& Host1x();
 
