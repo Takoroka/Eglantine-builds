@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -590,6 +591,70 @@ void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* bas
     }
 }
 
+void Maxwell3D::ApplyStateRun(Core::System& system, const u64* flags, const u64* writes,
+                              u32 count) {
+    // After the state writes the method sink holds, as when each came as a method.
+    ConsumeSink(system);
+    if (draw_manager.HasDeferredDraw() || record_write_history || g_trace_first_method_writes)
+        [[unlikely]] {
+        // CallMethod for each: the first write outside the instance loop draws the waiting
+        // instances with the state they were begun with.
+        EngineInterface::ApplyStateRun(system, flags, writes, count);
+        return;
+    }
+    // The values are the registers' after the shadow RAM: in Track mode it keeps them too.
+    const auto control = shadow_state.shadow_ram_control;
+    if (control == Regs::ShadowRamControl::Track ||
+        control == Regs::ShadowRamControl::TrackWithFilter) {
+        for (u32 i = 0; i < count; ++i) {
+            const u32 method = static_cast<u32>(writes[i] & 0xffff);
+            const u32 value = static_cast<u32>(writes[i] >> 32);
+            shadow_state.reg_array[method] = value;
+            regs.reg_array[method] = value;
+        }
+    } else {
+        for (u32 i = 0; i < count; ++i) {
+            regs.reg_array[writes[i] & 0xffff] = static_cast<u32>(writes[i] >> 32);
+        }
+    }
+    for (size_t word = 0; word < 4; ++word) {
+        for (u64 bits = flags[word]; bits != 0; bits &= bits - 1) {
+            dirty.flags[word * 64 + std::countr_zero(bits)] = true;
+        }
+    }
+}
+
+void Maxwell3D::ApplyDataRun(Core::System& system, const u64* writes, u32 count) {
+    ConsumeSink(system);
+    if (record_write_history || g_trace_first_method_writes) [[unlikely]] {
+        EngineInterface::ApplyDataRun(system, writes, count);
+        return;
+    }
+    // What CallMethod does for each word: the first ends an instance loop (ProcessDirtyRegisters),
+    // each sets its register (and shadow copy in Track mode) and goes to the current buffer.
+    if (draw_manager.HasDeferredDraw()) [[unlikely]] {
+        draw_manager.DrawDeferred(*this, true);
+    }
+    const auto control = shadow_state.shadow_ram_control;
+    const bool track = control == Regs::ShadowRamControl::Track ||
+                       control == Regs::ShadowRamControl::TrackWithFilter;
+    std::array<u32, 64> words;
+    u32 pending = 0;
+    for (u32 i = 0; i < count; ++i) {
+        const u32 method = static_cast<u32>(writes[i] & 0xffff);
+        const u32 value = static_cast<u32>(writes[i] >> 32);
+        regs.reg_array[method] = value;
+        if (track) {
+            shadow_state.reg_array[method] = value;
+        }
+        words[pending++] = value;
+        if (pending == words.size() || i + 1 == count) {
+            ProcessCBMultiData(words.data(), pending);
+            pending = 0;
+        }
+    }
+}
+
 void Maxwell3D::ProcessMacroUpload(u32 data) {
     GetNativeMacroEngine().AddCode(regs.load_mme.instruction_ptr++, data);
 }
@@ -851,6 +916,10 @@ struct Maxwell3D::FrontState {
     /// then can it have a deferred instanced draw to issue at the end of a macro.
     bool draw_pending{true};
     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
+    /// State writes go to the back in runs with their dirty flags (GpuSplit::StateWrite), looked
+    /// up here in a copy of the dirty tables (set once, when the channel is made).
+    bool state_runs{};
+    DirtyState::Tables dirty_tables{};
 };
 
 namespace {
@@ -919,6 +988,9 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
         std::memcpy(front->shadow.data(), shadow_state.reg_array.data(), sizeof(front->shadow));
         front->control = shadow_state.shadow_ram_control;
         front->skip_same = SkipSameValueWrites() && FrontSkipSame();
+        front->dirty_tables = dirty.tables;
+        front->state_runs =
+            std::ranges::any_of(dirty.tables[0], [](u8 flag) { return flag != 0; });
         front->executing_macro = executing_macro;
         front->parameters = std::move(macro_params);
         macro_params.clear();
@@ -970,6 +1042,15 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             }
             return;
         }
+        if (fs.state_runs) {
+            // What CallMethod would do on the back: the register's new value, and its dirty
+            // flags unless it keeps the value (the shadow RAM may still change).
+            const bool changed = !SkipSameValueWrites() || fs.regs[method] != value;
+            fs.regs[method] = value;
+            split.StateWrite(this, method, value, fs.dirty_tables[0][method],
+                             fs.dirty_tables[1][method], changed);
+            return;
+        }
         fs.regs[method] = value;
     } else {
         fs.regs[method] = value;
@@ -1002,6 +1083,11 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         default:
             if (method >= cb_data && method < cb_data + 16) {
                 fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)] += sizeof(u32);
+                if (fs.state_runs) {
+                    // Consecutive words land next to each other: one guest memory write.
+                    split.DataWrite(this, method, value);
+                    return;
+                }
             } else if (!FrontHandledOutsideDrawManager(method)) {
                 fs.draw_pending = true;
             }

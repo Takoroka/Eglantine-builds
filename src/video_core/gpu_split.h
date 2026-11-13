@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <functional>
@@ -105,6 +106,34 @@ public:
                    (u64{argument} << 32);
         Commit(1);
     }
+    /// A state write (not in the engine's execution_mask) whose effect the front worked out:
+    /// `value` is what the register holds after it (shadow RAM applied) and `flag_a`/`flag_b`
+    /// the dirty flags it sets, none when `changed` is false (it keeps the register's value).
+    /// Consecutive ones go to the back as one entry (EngineInterface::ApplyStateRun), which
+    /// stores the registers and sets the flags the whole run sets in one pass.
+    void StateWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 value, u8 flag_a,
+                    u8 flag_b, bool changed) {
+        if (engine != front_engine || run_data || run_count == MaxRunWrites) [[unlikely]] {
+            FlushRun();
+            SelectEngine(engine);
+        }
+        run_writes[run_count++] = u64{method} | (u64{value} << 32);
+        if (changed) {
+            run_flags[flag_a >> 6] |= u64{1} << (flag_a & 63);
+            run_flags[flag_b >> 6] |= u64{1} << (flag_b & 63);
+        }
+    }
+    /// A word of a data method the engine takes many of in a row (Maxwell3D's constant buffer
+    /// data, one write to guest memory each): consecutive ones go to the back as one entry
+    /// (EngineInterface::ApplyDataRun), `value` as in StateWrite.
+    void DataWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 value) {
+        if (engine != front_engine || !run_data || run_count == MaxRunWrites) [[unlikely]] {
+            FlushRun();
+            SelectEngine(engine);
+            run_data = true;
+        }
+        run_writes[run_count++] = u64{method} | (u64{value} << 32);
+    }
 
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
     template <typename Func>
@@ -157,6 +186,8 @@ private:
         Method, ///< Bits 8-23 method, 32-63 argument; flags IsLast, HasSegment (word 1)
         Multi,  ///< Bits 8-23 method, 32-63 amount; word 1 methods pending, [segment], words
         Call,   ///< Bits 8-31 payload size in words; word 1 thunk, then the payload
+        State,  ///< Bits 32-63 count; words 1-4 dirty flags, then a method | value << 32 each
+        Data,   ///< Bits 32-63 count; then a method | value << 32 each
     };
     static constexpr u64 IsLast = 1 << 4;
     static constexpr u64 HasSegment = 1 << 5;
@@ -166,6 +197,8 @@ private:
     static constexpr size_t RingMask = RingWords - 1;
     static constexpr u32 MaxMultiWords = 8192;
     static constexpr size_t PublishEvery = 256;
+    static constexpr u32 MaxRunWrites = 512;
+    static constexpr size_t RunFlagWords = 4; ///< 256 dirty flags (Maxwell3D::DirtyState)
 
     template <typename Func>
     static void CallThunk(const u64* payload) {
@@ -174,6 +207,10 @@ private:
 
     /// Room for an entry of `words` at the write position (never across the ring's end).
     u64* Reserve(size_t words) {
+        // Every other entry comes after the state writes collected so far.
+        if (run_count != 0) {
+            FlushRun();
+        }
         const size_t index = write_position & RingMask;
         if (index + words <= RingWords && write_position + words - consumed_cache <= RingWords)
             [[likely]] {
@@ -182,6 +219,8 @@ private:
         return ReserveSlow(words);
     }
     u64* ReserveSlow(size_t words);
+    /// Sends the writes collected so far (StateWrite, DataWrite) as one entry.
+    void FlushRun();
     void Commit(size_t words) {
         write_position += words;
         if (write_position - published_local >= publish_every) {
@@ -212,6 +251,12 @@ private:
     /// Words between publishes: small right after a drain, while the back has nothing to do.
     size_t publish_every{PublishEvery};
     Tegra::Engines::EngineInterface* front_engine{};
+    /// Writes for front_engine not sent yet (StateWrite, or DataWrite when run_data), and the
+    /// dirty flags the state writes set.
+    u32 run_count{};
+    bool run_data{};
+    std::array<u64, RunFlagWords> run_flags{};
+    std::array<u64, MaxRunWrites> run_writes{};
 
     // Back side.
     Tegra::Engines::EngineInterface* back_engine{};
