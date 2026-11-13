@@ -4,6 +4,8 @@
 #pragma once
 
 #include <memory>
+#include <utility>
+#include <vector>
 
 #include "common/common_types.h"
 #include "core/device_memory_manager.h"
@@ -25,7 +27,10 @@ public:
         return start >= m_vaddress && end <= (m_vaddress + m_size);
     }
 
-    DAddr Map(VAddr start, size_t size);
+    /// mapped_before, if given, gets the parts of [start, +size) that were mapped already (their
+    /// device pages are kept as they are).
+    DAddr Map(VAddr start, size_t size,
+              std::vector<std::pair<VAddr, size_t>>* mapped_before = nullptr);
 
     void Unmap(VAddr start, size_t size);
 

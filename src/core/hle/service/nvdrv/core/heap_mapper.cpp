@@ -35,7 +35,8 @@ HeapMapper::~HeapMapper() {
     });
 }
 
-DAddr HeapMapper::Map(VAddr start, size_t size) {
+DAddr HeapMapper::Map(VAddr start, size_t size,
+                      std::vector<std::pair<VAddr, size_t>>* mapped_before) {
     std::scoped_lock lk(m_internal->m_guard);
     // Add the mapping range to a temporary range set.
     m_internal->m_temporary_set.Clear();
@@ -43,8 +44,11 @@ DAddr HeapMapper::Map(VAddr start, size_t size) {
 
     // Remove anything that's already mapped from the temporary range set.
     m_internal->m_mapped_ranges.ForEachInRange(
-        start, size, [this](VAddr start_addr, VAddr end_addr, s32) {
+        start, size, [this, mapped_before](VAddr start_addr, VAddr end_addr, s32) {
             m_internal->m_temporary_set.Subtract(start_addr, end_addr - start_addr);
+            if (mapped_before != nullptr) {
+                mapped_before->emplace_back(start_addr, end_addr - start_addr);
+            }
         });
 
     // Map anything that has not been mapped yet.

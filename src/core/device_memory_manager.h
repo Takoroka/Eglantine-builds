@@ -66,6 +66,13 @@ public:
 
     void Unmap(DAddr address, size_t size);
 
+    /// Device pages of [address, address + size), mapped for [virtual_address, ...) of asid, whose
+    /// physical page is no longer the one behind their virtual address (the guest freed and
+    /// re-backed it while the device pages stayed mapped) take the current one. Pages whose
+    /// virtual address isn't backed now are left as they are. True if any page changed: the
+    /// caller then drops what the caches hold of the range (in GPU order).
+    bool Retranslate(DAddr address, VAddr virtual_address, size_t size, Asid asid);
+
     void TrackContinuityImpl(DAddr address, VAddr virtual_address, size_t size, Asid asid);
     void TrackContinuity(DAddr address, VAddr virtual_address, size_t size, Asid asid) {
         std::scoped_lock lk(mapping_guard);

@@ -575,7 +575,12 @@ private:
 
     // Sub 102: word 2 is the memory handle 101 returned, word 3 the job slot. The game frees the
     // memory (svc 0x80 clears GPU access) and reuses it as ordinary heap right after, so nothing
-    // on the GPU side may keep it: drop the mapping 101 made at its own address.
+    // on the GPU side may keep it: drop the mapping 101 made at its own address, then the SMMU
+    // mappings of the memory (in GPU-thread order, after the GPU unmap). Kept, an SMMU mapping
+    // went on translating to the physical pages the memory had when it was mapped: the kernel
+    // hands those to other memory once the game frees it, and memory created again at the same
+    // address and size reused the mapping, so GPU writes to it landed in other live objects
+    // (Kirby Air Riders, the Susie unlock: objects zeroed under live references).
     void SubDestroyMemory(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         const u32 handle = w[2];
@@ -584,7 +589,9 @@ private:
             LOG_DEBUG(Service, "nx2:gpu 102 destroy handle={} [{:#x}, +{:#x}] slot={}", handle,
                       address, size, w[3]);
             if (size != 0) {
-                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(address, size);
+                auto& registry = Nvidia::Devices::Nx2GpuMemoryRegistry::Get();
+                registry.Unmap(address, size);
+                registry.ReleaseBacking(address, size);
             }
             if (size == 0x2000) {
                 Tegra::Nx2RemoveSemaphoreRegion(address);

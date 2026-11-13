@@ -322,6 +322,67 @@ void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
 }
 
 template <typename Traits>
+bool DeviceMemoryManager<Traits>::Retranslate(DAddr address, VAddr virtual_address, size_t size,
+                                              Asid asid) {
+    Core::Memory::Memory* process_memory = registered_processes[asid.id];
+    const size_t start_page_d = address >> Memory::YUZU_PAGEBITS;
+    const size_t num_pages =
+        Common::AlignUp(size, Memory::YUZU_PAGESIZE) >> Memory::YUZU_PAGEBITS;
+    bool changed = false;
+    std::scoped_lock lk(mapping_guard);
+    tracked_entries.CommitRegion(start_page_d, start_page_d + num_pages);
+    for (size_t i = 0; i < num_pages; i++) {
+        const size_t page_d = start_page_d + i;
+        const VAddr new_vaddress = virtual_address + i * Memory::YUZU_PAGESIZE;
+        auto* ptr = process_memory->GetPointerSilent(Common::ProcessAddress(new_vaddress));
+        const u32 phys_addr =
+            ptr != nullptr ? static_cast<u32>(GetRawPhysicalAddr(ptr) >> Memory::YUZU_PAGEBITS) + 1U
+                           : 0U;
+        auto& entry = tracked_entries.GetUnchecked(page_d);
+        const u32 old_phys = entry.compressed_physical_ptr;
+        // Unchanged, or not backed now: a page losing its backing is left to the release or the
+        // unmap that untracks it first (UpdatePagesCachedCount needs its CPU backing for that).
+        if (old_phys == phys_addr || phys_addr == 0) [[likely]] {
+            continue;
+        }
+        changed = true;
+        // The old physical page no longer maps back here (as in Unmap).
+        if (old_phys != 0) {
+            u32& base_dev = compressed_device_addr.GetAndFault(old_phys - 1U);
+            if ((base_dev >> MULTI_FLAG_BITS) == 0) {
+                base_dev = 0;
+            } else {
+                const auto [more_entries, new_start] = impl->multi_dev_address.Unregister(
+                    static_cast<u32>(page_d), base_dev & MULTI_MASK);
+                base_dev = more_entries ? (new_start | MULTI_FLAG)
+                                        : impl->multi_dev_address.ReleaseEntry(new_start);
+            }
+        }
+        CutContinuityAt(page_d);
+        entry.continuity_tracker = 0;
+        entry.compressed_physical_ptr = phys_addr;
+        InsertCPUBacking(page_d, new_vaddress, asid);
+        // The new physical page maps back here (as in Map).
+        const u32 base_dev = compressed_device_addr[phys_addr - 1U];
+        const u32 new_dev = static_cast<u32>(page_d);
+        if (base_dev == 0) {
+            compressed_device_addr.GetAndFault(phys_addr - 1U) = new_dev;
+            continue;
+        }
+        u32 start_id = base_dev & MULTI_MASK;
+        if ((base_dev >> MULTI_FLAG_BITS) == 0) {
+            start_id = impl->multi_dev_address.Register(base_dev);
+            compressed_device_addr.GetAndFault(phys_addr - 1U) = MULTI_FLAG | start_id;
+        }
+        impl->multi_dev_address.Register(new_dev, start_id);
+    }
+    if (changed) {
+        translation_generation.fetch_add(1, std::memory_order_release);
+    }
+    return changed;
+}
+
+template <typename Traits>
 void DeviceMemoryManager<Traits>::CutContinuityAt(size_t page) {
     // Runs counted from the pages before `page` end there: the pages from `page` on are being
     // mapped again or unmapped. A run is counted down page by page (TrackContinuityImpl), so the
