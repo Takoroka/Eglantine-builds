@@ -2580,6 +2580,12 @@ private:
     static constexpr s64 PauseGap = 1'000'000;   // us
     static constexpr s64 MaxCatchUp = 3'000'000; // us
     static constexpr u32 MaxDroppedInARow = 30;
+    // Frames the client acquired and hasn't released, in acquire order (ClockFromRelease).
+    struct HeldFrame {
+        u32 image;
+        u64 pts;
+    };
+    static constexpr size_t MaxHeldFrames = 16;
 
     void Log(HLERequestContext& ctx, std::string_view what) {
         const auto* w = ctx.CommandBuffer();
@@ -2655,6 +2661,7 @@ private:
             m_clock_offset.reset();
             const auto* process = ctx.GetThread().GetOwnerProcess();
             m_movie_program_id = process ? process->GetProgramId() : 0;
+            m_held.clear();
         }
         if (!m_worker.joinable()) {
             m_worker = std::thread{[this] { DecodeLoop(); }};
@@ -2740,6 +2747,10 @@ private:
     void ReleaseBuffer(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         Log(ctx, "release output");
+        {
+            std::scoped_lock lk{m_mutex};
+            ClockFromRelease(w[2]);
+        }
         const auto handle = HandOut(w[2], Fence{~w[4], w[6]});
         TipcReplyWords(ctx, {handle[0], handle[1], handle[2], handle[3]});
     }
@@ -2789,6 +2800,7 @@ private:
             m_flush = true;
             m_stream_ended = false;
             m_clock_offset.reset();
+            m_held.clear();
             m_ready->room.store(true, std::memory_order_relaxed);
             // Only Stop: Bananza flushes (8) after its movies end and treats every completed
             // fence as a frame to acquire.
@@ -2806,6 +2818,7 @@ private:
             std::scoped_lock lk{m_mutex};
             CompleteHandedFences();
             m_clock_offset.reset();
+            m_held.clear();
         }
         TipcReplyWords(ctx, {});
     }
@@ -2827,15 +2840,43 @@ private:
 
     // Starts or corrects the movie clock from a frame the client just acquired (m_mutex held).
     // The clock never runs behind a frame the client already shows.
-    void AnchorClock(u64 pts) {
+    void AnchorClock(u64 pts, u32 image) {
         const s64 now = HostTimeUs();
         const s64 offset = now - static_cast<s64>(pts);
-        if (!m_clock_offset || now - m_last_acquire > PauseGap || pts < m_last_acquired_pts ||
-            offset < *m_clock_offset || offset - *m_clock_offset > MaxCatchUp) {
+        // The clock follows the client's releases (ClockFromRelease): an acquire only starts the
+        // clock or restarts it after a pause or a seek. A client that acquires a frame before it
+        // shows it (one that shows frames at their pts, Kirby Air Riders) pulled the clock ahead of
+        // what it shows when acquires set it: the frames it still wanted were dropped as late, the
+        // one it got was that much in its future, it held both images until then, and the movie
+        // settled at 2 fps (MaxDroppedInARow frames, 0.5 s, a step).
+        if (!m_clock_offset || now - m_last_acquire > PauseGap || pts < m_last_acquired_pts) {
             m_clock_offset = offset;
         }
         m_last_acquire = now;
         m_last_acquired_pts = pts;
+        if (m_held.size() == MaxHeldFrames) {
+            m_held.pop_front();
+        }
+        m_held.push_back({image, pts});
+    }
+
+    // The client gave `image` back (m_mutex held): it is done with that frame and shows the next
+    // one it acquired, or will show the frame one interval on. That is the movie's time now, for
+    // clients that show a frame as they acquire it (Ocarina of Time releases the previous one then)
+    // and for those that acquire ahead and show frames at their pts alike.
+    void ClockFromRelease(u32 image) {
+        const auto it =
+            std::ranges::find_if(m_held, [image](const HeldFrame& held) { return held.image == image; });
+        if (it == m_held.end()) {
+            return;
+        }
+        const auto next = std::next(it);
+        const u64 shows = next != m_held.end() ? next->pts : it->pts + m_frame_interval;
+        m_held.erase(it);
+        if (!m_clock_offset) {
+            return;
+        }
+        m_clock_offset = HostTimeUs() - static_cast<s64>(shows);
     }
 
     // The pts the movie's audio has reached, if the client shows frames yet (m_mutex held).
@@ -2903,7 +2944,7 @@ private:
             if (!m_outputs.empty()) {
                 output = m_outputs.front();
                 m_outputs.pop_front();
-                AnchorClock(output->pts);
+                AnchorClock(output->pts, output->image);
             }
         }
         if (!output) {
@@ -3161,6 +3202,7 @@ private:
     std::optional<s64> m_clock_offset; ///< Host time minus pts (us) of the frames the client shows
     s64 m_last_acquire{};              ///< Host time (us) of the client's last acquire
     u64 m_last_acquired_pts{};
+    std::deque<HeldFrame> m_held; ///< Acquired, not released yet (ClockFromRelease)
     u64 m_frame_interval{16667}; ///< us, from consecutive decoded frames
     u64 m_last_decoded_pts{};
     u32 m_dropped_in_a_row{};
