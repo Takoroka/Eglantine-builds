@@ -246,6 +246,9 @@ private:
     Common::MultiLevelPageTable<u32> page_table;
     mutable Common::RangeMap<GPUVAddr, PTEKind> kind_map;
     Common::SparseLargeVector<u32> big_page_table_dev;
+    /// Bumped whenever page table entries may have changed: GpuToCpuAddress's per-thread cached
+    /// translations hold while it is the same.
+    std::atomic<u64> translation_generation{1};
 
     std::vector<u64> big_page_continuous;
     boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> page_stash{};
