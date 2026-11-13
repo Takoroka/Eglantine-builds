@@ -2621,6 +2621,7 @@ private:
         {
             std::scoped_lock lk{m_mutex};
             m_stopped = false;
+            m_input_ended = false;
             m_ready->room.store(!m_stream_ended && m_inputs.size() < MaxQueuedInputs,
                                 std::memory_order_relaxed);
         }
@@ -2785,6 +2786,7 @@ private:
             m_inputs.push_back(std::move(input));
             m_stream_ended = false;
             m_stopped = false;
+            m_input_ended = end;
             m_ready->room.store(!end && m_inputs.size() < MaxQueuedInputs, std::memory_order_relaxed);
         }
         m_cv.notify_one();
@@ -2801,6 +2803,7 @@ private:
             m_inputs.clear();
             m_flush = true;
             m_stream_ended = false;
+            m_input_ended = false;
             m_clock_offset.reset();
             // A stopped decoder asks for no input until Start (or a submission): Kirby Air Riders
             // destroys its copy of the event after Finalize, and a later signal woke a worker job
@@ -2959,6 +2962,7 @@ private:
                 m_decoded.clear();
                 m_last_decoded_pts = 0;
                 m_dropped_in_a_row = 0;
+                m_end_queued = false;
                 if (MkwMovieActivity::IsLargeMovie(m_movie_program_id, m_width)) {
                     m_objects->mkw_movie_activity.Reset();
                 }
@@ -3008,7 +3012,10 @@ private:
             }
             Input input = std::move(m_inputs.front());
             m_inputs.pop_front();
-            if (!m_stream_ended && !m_stopped) {
+            // After end of stream was submitted the decoder asks for no more input: Kirby Air
+            // Riders' lesson player serves the ready event first, and while it kept firing it only
+            // submitted end of stream again, never reaching its Stop.
+            if (!m_stream_ended && !m_stopped && !m_input_ended) {
                 m_ready->room.store(m_inputs.size() < MaxQueuedInputs, std::memory_order_relaxed);
             }
             std::string codec = m_codec;
@@ -3044,14 +3051,19 @@ private:
                 m_last_decoded_pts = pts;
                 m_decoded.push_back({std::move(picture), pts, false});
             }
-            if (input.end) {
-                // The client stops at the frame marked end of stream; give it one even when the
-                // last input held no picture.
-                if (m_decoded.empty()) {
-                    m_decoded.push_back({std::nullopt, input.pts, true});
-                } else {
-                    m_decoded.back().end = true;
-                }
+            if (!input.end && !pictures.empty()) {
+                m_end_queued = false;
+            }
+            if (input.end && !m_end_queued) {
+                // The client stops at the frame marked end of stream: one per stream, always a
+                // frame of its own, empty, at the last decoded pts. Kirby Air Riders' lesson player
+                // copies the end flag of the frame at the head of its queue before it checks that
+                // the frame is due, and after that looks at no frame again: the flag on the last
+                // picture, fetched ahead of its time, left the lesson waiting for the end of the
+                // movie. Later end-of-stream submissions with nothing decoded added more end
+                // frames at pts -1, a time the player waited for forever.
+                m_decoded.push_back({std::nullopt, m_last_decoded_pts, true});
+                m_end_queued = true;
             }
         }
     }
@@ -3182,6 +3194,8 @@ private:
     u64 m_last_acquired_pts{};
     u64 m_frame_interval{16667}; ///< us, from consecutive decoded frames
     u64 m_last_decoded_pts{};
+    bool m_end_queued{};  ///< Decode thread: this stream's end-of-stream frame is queued
+    bool m_input_ended{}; ///< The last submission was end of stream: no more input asked
     u32 m_dropped_in_a_row{};
     std::deque<Input> m_inputs;
     std::deque<Decoded> m_decoded;     ///< Waiting for a free output image
