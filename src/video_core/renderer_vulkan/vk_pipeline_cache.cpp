@@ -692,6 +692,9 @@ bool PreloadAllPipelines() {
 
 PipelineCache::~PipelineCache() {
     StopBackgroundPipelines();
+    // The workers stop at once with their queue: write the pipelines still queued for the disk
+    // cache first (a burst of new ones before closing was lost).
+    serialization_thread.WaitForRequests();
     SaveUsedPipelines();
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
         if (!device.CanReadPipelineCacheDuringBuilds()) {
@@ -727,14 +730,25 @@ void PipelineCache::SaveUsedPipelines() {
             next.try_emplace(hash, static_cast<u8>(age + 1));
         }
     }
-    std::ofstream file{used_pipelines_filename, std::ios::binary | std::ios::trunc};
-    const u32 count = static_cast<u32>(next.size());
-    file.write(reinterpret_cast<const char*>(&UsedPipelinesMagic), sizeof(UsedPipelinesMagic));
-    file.write(reinterpret_cast<const char*>(&count), sizeof(count));
-    for (const auto& [hash, age] : next) {
-        file.write(reinterpret_cast<const char*>(&hash), sizeof(hash));
-        file.write(reinterpret_cast<const char*>(&age), sizeof(age));
+    // Written beside the list and renamed over it: one cut off mid-write (the emulator stopped)
+    // was read as no list, and the next boot built up to 3,000 pipelines instead of the used ones.
+    auto temporary{used_pipelines_filename};
+    temporary += ".tmp";
+    {
+        std::ofstream file{temporary, std::ios::binary | std::ios::trunc};
+        const u32 count = static_cast<u32>(next.size());
+        file.write(reinterpret_cast<const char*>(&UsedPipelinesMagic), sizeof(UsedPipelinesMagic));
+        file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        for (const auto& [hash, age] : next) {
+            file.write(reinterpret_cast<const char*>(&hash), sizeof(hash));
+            file.write(reinterpret_cast<const char*>(&age), sizeof(age));
+        }
+        if (!file) {
+            return;
+        }
     }
+    std::error_code error;
+    std::filesystem::rename(temporary, used_pipelines_filename, error);
 }
 
 bool PipelineCache::IsIndirectResetShader() const {
