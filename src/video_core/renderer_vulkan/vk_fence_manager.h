@@ -47,6 +47,7 @@ struct FenceManagerParams {
     using QueryCacheType = QueryCache;
 
     static constexpr bool HAS_ASYNC_CHECK = true;
+    static constexpr bool QUEUE_SUBMITS = true; ///< InnerFence::Queue submits the work
 };
 
 using GenericFenceManager = VideoCommon::FenceManager<FenceManagerParams>;
