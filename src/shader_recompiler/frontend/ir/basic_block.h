@@ -99,6 +99,15 @@ public:
         return ssa_variable_values[index];
     }
 
+    /// The SSA rewrite's read that is collecting the operands of a phi for this block, as an
+    /// index into its walk (0: none).
+    void SetSsaPendingPhi(u32 read_index) noexcept {
+        ssa_pending_phi = read_index;
+    }
+    [[nodiscard]] u32 SsaPendingPhi() const noexcept {
+        return ssa_pending_phi;
+    }
+
     void SsaSeal() noexcept {
         is_ssa_sealed = true;
     }
@@ -195,6 +204,7 @@ private:
     std::array<Value, NUM_SSA_VARIABLES> ssa_variable_values;
     /// Intrusively store if the block is sealed in the SSA pass.
     bool is_ssa_sealed{false};
+    u32 ssa_pending_phi{};
 
     /// Intrusively stored host definition of this block.
     u32 definition{};
