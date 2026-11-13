@@ -238,6 +238,10 @@ public:
 
     virtual void ReleaseChannel(s32 channel_id) {}
 
+    /// The GPU thread stopped for shutdown: work on other threads must stop reading guest GPU
+    /// memory, which goes away with the services.
+    virtual void OnGpuShutdown() {}
+
     /// Register the address as a Transform Feedback Object
     virtual void RegisterTransformFeedback(GPUVAddr tfb_object_addr) {}
 

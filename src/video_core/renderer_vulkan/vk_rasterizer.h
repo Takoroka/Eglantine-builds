@@ -158,6 +158,9 @@ public:
     void BindChannel(Tegra::Control::ChannelState& channel) override;
 
     void ReleaseChannel(s32 channel_id) override;
+
+    void OnGpuShutdown() override;
+
     std::optional<FramebufferTextureInfo> AccelerateDisplay(const Tegra::FramebufferConfig& config,
                                                             VAddr framebuffer_addr,
                                                             u32 pixel_stride);

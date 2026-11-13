@@ -3010,4 +3010,8 @@ void RasterizerVulkan::ReleaseChannel(s32 channel_id) {
     query_cache.EraseChannel(channel_id);
 }
 
+void RasterizerVulkan::OnGpuShutdown() {
+    pipeline_cache.StopTranslation();
+}
+
 } // namespace Vulkan
