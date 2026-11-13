@@ -40,6 +40,15 @@ struct HostTranslateInfo {
     bool support_conditional_barrier{}; ///< True when the device supports barriers in conditional
                                         ///< control flow
     bool single_lane_geometry_subgroups{};
+    /// Handle tables only: the most textures a stage may sample (GL: GL_MAX_TEXTURE_IMAGE_UNITS).
+    /// 0: none beyond the descriptor limits above.
+    /// Not a descriptor limit: other texture arrays don't see it (their constant buffer windows
+    /// follow the limits above).
+    u32 handle_table_sampler_limit{};
+    /// Handle tables only: maxPerStageDescriptorSamplers (a handle table is an
+    /// array of combined image samplers, so each element takes a sampler too). Read only by the
+    /// handle table cap.
+    u32 max_per_stage_descriptor_samplers{};
 
     void ApplyDescriptorLimitPolicy() noexcept {
         if (min_ssbo_alignment == 0) {
@@ -55,6 +64,7 @@ struct HostTranslateInfo {
         ApplyDescriptorLimitFallback(max_descriptor_set_sampled_images);
         ApplyDescriptorLimitFallback(max_descriptor_set_storage_images);
         ApplyDescriptorLimitFallback(max_descriptor_set_input_attachements);
+        ApplyDescriptorLimitFallback(max_per_stage_descriptor_samplers);
     }
 
 private:

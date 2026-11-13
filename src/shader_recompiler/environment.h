@@ -67,6 +67,16 @@ struct ConstBufferAddr {
     u32 count;
     bool has_secondary;
     u32 handle_program{~0U}; ///< index in Info::handle_programs for a handle computed per draw
+    /// With has_secondary and count > 1: every element ORs the same secondary word (a handle table
+    /// plus a fixed sampler word), the secondary offset is not indexed.
+    bool secondary_fixed{};
+    /// A handle table indexed per pixel: no descriptor is read at translation time, the
+    /// instruction's own type decides (as for handle programs).
+    bool handle_table{};
+    /// A lone handle table (no secondary word): index in Info::handle_programs of the program the
+    /// plain search gives for the handle. count includes one more element past the table, which is
+    /// that program's answer for the draw: an index past the table selects it. ~0: none.
+    u32 overflow_program{~0U};
 };
 
 class Environment {

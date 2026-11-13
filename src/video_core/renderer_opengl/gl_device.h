@@ -51,6 +51,11 @@ public:
         return max_user_clip_distances;
     }
 
+    /// Texture units a shader stage can sample (GL_MAX_TEXTURE_IMAGE_UNITS, often 32).
+    u32 GetMaxTextureImageUnits() const {
+        return max_texture_image_units;
+    }
+
     u32 GetMaxGLASMStorageBufferBlocks() const {
         return max_glasm_storage_buffer_blocks;
     }
@@ -207,6 +212,7 @@ private:
     u32 max_compute_shared_memory_size{};
     u32 max_glasm_storage_buffer_blocks{};
     u32 max_user_clip_distances{};
+    u32 max_texture_image_units{};
 
     bool has_warp_intrinsics{};
     bool has_shader_ballot{};

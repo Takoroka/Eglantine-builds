@@ -234,6 +234,14 @@ struct TextureDescriptor {
     /// Index in Info::handle_programs when the handle is computed at draw time (read from a
     /// storage buffer), ~0 when it is the constant buffer word above.
     u32 handle_program{~0U};
+    /// With has_secondary: element i reads its handle from cbuf_offset + (i << size_shift) ORed
+    /// with the word at secondary_cbuf_offset itself, not indexed (a handle table plus one sampler
+    /// word).
+    bool secondary_fixed{};
+    /// A lone handle table: index in Info::handle_programs of the handle's program from the plain
+    /// search. The last element (count - 1) is not read from the table: it is
+    /// that program's answer for the draw, which an index past the table selects. ~0: none.
+    u32 overflow_program{~0U};
 
     auto operator<=>(const TextureDescriptor&) const = default;
 };

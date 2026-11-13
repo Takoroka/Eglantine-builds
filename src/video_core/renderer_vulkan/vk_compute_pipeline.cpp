@@ -221,7 +221,12 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                       std::is_same_v<decltype(desc), const Shader::TextureBufferDescriptor&>) {
             if (desc.has_secondary) {
                 ASSERT(((qmd.const_buffer_enable_mask >> desc.secondary_cbuf_index) & 1) != 0);
-                const u32 secondary_offset{desc.secondary_cbuf_offset + index_offset};
+                u32 secondary_index_offset{index_offset};
+                if constexpr (requires { desc.secondary_fixed; }) {
+                    // A handle table's elements share one secondary word.
+                    secondary_index_offset = desc.secondary_fixed ? 0 : index_offset;
+                }
+                const u32 secondary_offset{desc.secondary_cbuf_offset + secondary_index_offset};
                 const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].Address() +
                                              secondary_offset};
                 const u32 lhs_raw{gpu_memory.Read<u32>(addr) << desc.shift_left};
@@ -248,8 +253,25 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         add_image(desc, false);
     }
     for (const auto& desc : info.texture_descriptors) {
+        // A lone handle table's last element is this dispatch's own handle (the plain search's
+        // handle program), which an index past the table selects.
+        const u32 overflow_index{desc.overflow_program != ~0U ? desc.count - 1 : desc.count};
         for (u32 index = 0; index < desc.count; ++index) {
-            const auto handle{read_handle(desc, index)};
+            const auto handle{[&] {
+                if (index == overflow_index) {
+                    return TexturePair(
+                        VideoCommon::EvaluateTextureHandle(
+                            info, desc.overflow_program, gpu_memory,
+                            [&](u32 cbuf) -> GPUVAddr {
+                                return cbuf < cbufs.size() &&
+                                               ((qmd.const_buffer_enable_mask >> cbuf) & 1) != 0
+                                           ? cbufs[cbuf].Address()
+                                           : GPUVAddr{};
+                            }),
+                        via_header_index);
+                }
+                return read_handle(desc, index);
+            }()};
             views.push_back({handle.first});
 
             VideoCommon::SamplerId sampler = texture_cache.GetSamplerId(handle.second, true);

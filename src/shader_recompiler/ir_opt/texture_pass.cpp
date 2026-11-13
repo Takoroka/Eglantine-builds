@@ -5,17 +5,20 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <queue>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include <bit>
+#include <bitset>
 #include <optional>
 #include "common/container/unordered_map.h"
 #include <tuple>
 #include <limits>
 #include <boost/container/small_vector.hpp>
 
+#include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/env_gate.h"
@@ -259,6 +262,194 @@ u32 DynamicSampledTextureArrayCount(const TextureInstVector& to_replace) {
     return count;
 }
 
+std::optional<u32> HandleTableShift(const IR::U32& dynamic_offset);
+
+// The constant buffers a stage reads (its uniform buffer descriptors): CollectShaderInfoPass
+// fills Info's list only after this pass, so they are counted from the program. A read with a
+// non-constant buffer index counts all of them.
+u32 ConstantBufferCount(const IR::Program& program) {
+    constexpr u32 MAX_CONSTANT_BUFFERS = 18;
+    std::bitset<MAX_CONSTANT_BUFFERS> used;
+    for (const IR::Block* const block : program.blocks) {
+        for (const IR::Inst& inst : block->Instructions()) {
+            switch (inst.GetOpcode()) {
+            case IR::Opcode::GetCbufU8:
+            case IR::Opcode::GetCbufS8:
+            case IR::Opcode::GetCbufU16:
+            case IR::Opcode::GetCbufS16:
+            case IR::Opcode::GetCbufU32:
+            case IR::Opcode::GetCbufF32:
+            case IR::Opcode::GetCbufU32x2:
+                if (!inst.Arg(0).IsImmediate()) {
+                    return MAX_CONSTANT_BUFFERS;
+                }
+                if (inst.Arg(0).U32() < MAX_CONSTANT_BUFFERS) {
+                    used.set(inst.Arg(0).U32());
+                }
+                break;
+            default:
+                break;
+            }
+        }
+    }
+    return static_cast<u32>(used.count());
+}
+
+static inline TextureType ReadTextureTypeCached(Environment& env, const ConstBufferAddr& cbuf);
+
+// The most elements one handle table of this stage gets from
+// the host's limits. The stage's other descriptors are counted as Descriptors::Add will make
+// them, at the size they are bound with: single textures and texel buffers, texture arrays at
+// their own cap, texel buffer and storage arrays uncapped, constant buffers. Tables are combined
+// image samplers, so the sampler, sampled image and resource budgets all bound them (texel
+// buffers take no sampler; GL's texture units bound textures and texel buffers, for tables only).
+// The cap is the largest value with which the tables fit, counted as Add will key them: a table
+// cut by it drops its overflow element, and cut tables that differ only in that merge into one
+// descriptor. A stage without a table returns before reading anything.
+u32 HandleTableCap(Environment& env, const IR::Program& program, const Info& info,
+                   const HostTranslateInfo& host_info, const TextureInstVector& to_replace,
+                   u32 other_array_cap) {
+    if (std::ranges::none_of(to_replace,
+                             [](const TextureInst& inst) { return inst.cbuf.handle_table; })) {
+        return DESCRIPTOR_MAX_COUNT;
+    }
+    const u32 sampler_limit{(std::min)(host_info.max_per_stage_descriptor_samplers,
+                                       host_info.max_descriptor_set_samplers)};
+    u32 sampled_limit{(std::min)(host_info.max_per_stage_descriptor_sampled_images,
+                                 host_info.max_descriptor_set_sampled_images)};
+    if (host_info.handle_table_sampler_limit != 0) {
+        sampled_limit = (std::min)(sampled_limit, host_info.handle_table_sampler_limit);
+    }
+    const u32 resource_limit{host_info.max_per_stage_resources};
+    // The type TexturePass gives an instruction before Add: a size query takes the type of
+    // another instruction of its handle program, else the bound type (Color2D for a table); a 1D
+    // fetch from a bound texture buffer becomes a texel buffer.
+    std::unordered_map<u32, TextureType> handle_program_types;
+    for (const TextureInst& inst : to_replace) {
+        const IR::Opcode opcode{IndexedInstruction(*inst.inst)};
+        if (inst.cbuf.handle_program != ~0U && opcode != IR::Opcode::ImageQueryDimensions &&
+            !IsStorageImageOpcode(opcode)) {
+            handle_program_types.try_emplace(inst.cbuf.handle_program,
+                                             inst.inst->Flags<IR::TextureInstInfo>().type.Value());
+        }
+    }
+    const auto add_type{[&](const TextureInst& inst) {
+        const auto flags{inst.inst->Flags<IR::TextureInstInfo>()};
+        const IR::Opcode opcode{IndexedInstruction(*inst.inst)};
+        if (opcode == IR::Opcode::ImageQueryDimensions) {
+            if (const auto it{handle_program_types.find(inst.cbuf.handle_program)};
+                it != handle_program_types.end()) {
+                return it->second;
+            }
+            return ReadTextureTypeCached(env, inst.cbuf);
+        }
+        if (opcode == IR::Opcode::ImageFetch && flags.type == TextureType::Color1D &&
+            ReadTextureTypeCached(env, inst.cbuf) == TextureType::Buffer) {
+            return TextureType::Buffer;
+        }
+        return flags.type.Value();
+    }};
+    const auto size_shift_of{[](const ConstBufferAddr& cbuf) {
+        if (cbuf.handle_table) {
+            return HandleTableShift(cbuf.dynamic_offset).value_or(DESCRIPTOR_SIZE_SHIFT);
+        }
+        return cbuf.count > 1 ? DynamicDescriptorSizeShift(cbuf.dynamic_offset)
+                              : DESCRIPTOR_SIZE_SHIFT;
+    }};
+    // Add's fields for a texture or texel buffer descriptor (count at index 9, overflow program
+    // at 13).
+    using Key = std::tuple<u32, bool, bool, u32, u32, u32, u32, u32, u32, u32, u32, u32, bool, u32>;
+    // Add's fields for a storage image or image buffer descriptor.
+    using StorageKey = std::tuple<u32, u32, u32, u32, u32, u32, u32>;
+    std::vector<Key> tables;
+    std::vector<Key> textures;
+    std::vector<Key> texel_buffers;
+    std::vector<StorageKey> storage;
+    u32 texture_elements{};
+    u32 texel_buffer_elements{};
+    u32 storage_elements{};
+    for (const TextureInst& inst : to_replace) {
+        const auto flags{inst.inst->Flags<IR::TextureInstInfo>()};
+        const ConstBufferAddr& cbuf{inst.cbuf};
+        const TextureType type{IsStorageImageOpcode(IndexedInstruction(*inst.inst))
+                                   ? flags.type.Value()
+                                   : add_type(inst)};
+        const u32 size_shift{size_shift_of(cbuf)};
+        if (IsStorageImageOpcode(IndexedInstruction(*inst.inst))) {
+            const StorageKey key{static_cast<u32>(type),
+                                 static_cast<u32>(flags.image_format.Value()), cbuf.index,
+                                 cbuf.offset, cbuf.count, size_shift, cbuf.handle_program};
+            if (std::ranges::find(storage, key) == storage.end()) {
+                storage.push_back(key);
+                storage_elements += (std::max)(cbuf.count, 1U);
+            }
+            continue;
+        }
+        const bool is_table{cbuf.handle_table && cbuf.count > 1 && type != TextureType::Buffer};
+        const Key key{static_cast<u32>(type), flags.is_depth != 0, cbuf.has_secondary,
+                      cbuf.index, cbuf.offset, cbuf.shift_left, cbuf.secondary_index,
+                      cbuf.secondary_offset, cbuf.secondary_shift_left, cbuf.count, size_shift,
+                      cbuf.handle_program, cbuf.secondary_fixed,
+                      is_table ? cbuf.overflow_program : ~0U};
+        auto& list{type == TextureType::Buffer ? texel_buffers : is_table ? tables : textures};
+        if (std::ranges::find(list, key) != list.end()) {
+            continue;
+        }
+        list.push_back(key);
+        if (&list == &texel_buffers) {
+            texel_buffer_elements += (std::max)(cbuf.count, 1U);
+        } else if (&list == &textures) {
+            texture_elements += cbuf.count > 1 ? (std::min)(cbuf.count, other_array_cap) : 1U;
+        }
+    }
+    if (tables.empty()) {
+        return DESCRIPTOR_MAX_COUNT;
+    }
+    const u32 textures_static{texture_elements + StaticDescriptorCount(info.texture_descriptors)};
+    const u32 texel_buffers_static{texel_buffer_elements +
+                                   StaticDescriptorCount(info.texture_buffer_descriptors)};
+    const u32 constant_buffers{
+        (std::max)(NumDescriptors(info.constant_buffer_descriptors), ConstantBufferCount(program))};
+    const u32 others_static{constant_buffers + NumDescriptors(info.storage_buffers_descriptors) +
+                            storage_elements + NumDescriptors(info.image_buffer_descriptors) +
+                            NumDescriptors(info.image_descriptors)};
+    const u32 budget{(std::min)({SaturatingSub(sampler_limit, textures_static),
+                                 SaturatingSub(sampled_limit, textures_static + texel_buffers_static),
+                                 SaturatingSub(resource_limit, textures_static +
+                                                                   texel_buffers_static +
+                                                                   others_static)})};
+    // The elements the tables take with a cap, keyed as Add will key them.
+    std::vector<Key> capped;
+    const auto table_elements{[&](u32 cap) {
+        capped.clear();
+        u32 elements{};
+        for (Key key : tables) {
+            if (std::get<9>(key) > cap) {
+                std::get<9>(key) = cap;
+                std::get<13>(key) = ~0U;
+            }
+            if (std::ranges::find(capped, key) == capped.end()) {
+                capped.push_back(key);
+                elements += std::get<9>(key);
+            }
+        }
+        return elements;
+    }};
+    u32 largest{};
+    for (const Key& key : tables) {
+        largest = (std::max)(largest, std::get<9>(key));
+    }
+    if (table_elements(largest) <= budget) {
+        return DESCRIPTOR_MAX_COUNT;
+    }
+    for (u32 cap = largest - 1; cap > 1; --cap) {
+        if (table_elements(cap) <= budget) {
+            return cap;
+        }
+    }
+    return 1;
+}
+
 bool IsBindless(const IR::Inst& inst) {
     switch (inst.GetOpcode()) {
     case IR::Opcode::BindlessImageSampleImplicitLod:
@@ -349,24 +540,49 @@ static inline u32 GetTextureHandleCached(Environment& env, const ConstBufferAddr
 // A handle computed per draw has no descriptor to read at translation time: assume an ordinary
 // floating-point 2D texture, the instruction's own type deciding the rest (see the TexturePass
 // ImageQueryDimensions case, which has none).
+// A handle table is treated the same way: its elements are picked per pixel, and reading none
+// keeps the environment's reads as they were before tables (older caches still load).
 static inline TextureType ReadTextureTypeCached(Environment& env, const ConstBufferAddr& cbuf) {
-    if (cbuf.handle_program != ~0U) return TextureType::Color2D;
+    if (cbuf.handle_program != ~0U || cbuf.handle_table) return TextureType::Color2D;
     return env.ReadTextureType(GetTextureHandleCached(env, cbuf));
 }
 static inline TexturePixelFormat ReadTexturePixelFormatCached(Environment& env,
                                                                 const ConstBufferAddr& cbuf) {
-    if (cbuf.handle_program != ~0U) return TexturePixelFormat::A8B8G8R8_UNORM;
+    if (cbuf.handle_program != ~0U || cbuf.handle_table) return TexturePixelFormat::A8B8G8R8_UNORM;
     return env.ReadTexturePixelFormat(GetTextureHandleCached(env, cbuf));
 }
 static inline bool IsTexturePixelFormatIntegerCached(Environment& env,
                                                         const ConstBufferAddr& cbuf) {
-    if (cbuf.handle_program != ~0U) return false;
+    if (cbuf.handle_program != ~0U || cbuf.handle_table) return false;
     return env.IsTexturePixelFormatInteger(GetTextureHandleCached(env, cbuf));
 }
 
 
+// Handle tables off for one search (image operations, texture buffers: tables are only made for
+// sampled textures), which then runs as the plain search and bypasses the search cache.
+thread_local bool g_handle_tables_off{};
+/// The search's answers while g_handle_tables_off (its own: they must not mix with the main cache),
+/// cleared before each such search. Holds misses too, so deep expressions are searched once.
+thread_local std::unordered_map<const IR::Inst*, std::optional<ConstBufferAddr>> g_tables_off_cache;
+
+bool HandleTablesOn() {
+    return !g_handle_tables_off;
+}
+
 std::optional<ConstBufferAddr> Track(const IR::Value& value, Environment& env, const HostTranslateInfo& host_info, const IR::Block* block);
 static inline std::optional<ConstBufferAddr> TrackCached(const IR::Value& v, Environment& env, const HostTranslateInfo& host_info, const IR::Block* block) {
+    if (g_handle_tables_off) {
+        const IR::Inst* const key{v.TryInstRecursive()};
+        if (!key) {
+            return Track(v, env, host_info, block);
+        }
+        if (const auto it{g_tables_off_cache.find(key)}; it != g_tables_off_cache.end()) {
+            return it->second;
+        }
+        std::optional found{Track(v, env, host_info, block)};
+        g_tables_off_cache.emplace(key, found);
+        return found;
+    }
     if (const IR::Inst* key = v.TryInstRecursive()) {
         if (auto it = env.track_cache.find(key); it != env.track_cache.end()) return it->second;
         auto found = Track(v, env, host_info, block);
@@ -394,6 +610,158 @@ bool IsMemoryLoad(IR::Opcode opcode) {
     }
 }
 
+// Most elements a handle table descriptor gets: its index comes from memory per pixel, so the
+// translation can't bound it. 33: Kirby Air Riders' race keeps its current shadow cascade at
+// element 32 (c5@0x200); with 32 elements that index fell on the last element or the per-draw
+// overflow element (black Kirby, dark shaded ground).
+constexpr u32 HANDLE_TABLE_MAX_COUNT = 33;
+
+// The log2 of one table offset's element stride: a power-of-two number of 8-byte handle words,
+// `index << k` (k >= 3) or `index * m` (m = 8 << j). Anything else (a 4-byte stride, a 24-byte
+// one) is no table. With require_load, only `index << k` with the index loaded from memory (a
+// lone table's offset).
+std::optional<u32> TableOffsetShift(const IR::Inst* inst, bool require_load) {
+    if (inst->GetOpcode() == IR::Opcode::ShiftLeftLogical32) {
+        if (!inst->Arg(1).IsImmediate()) {
+            return std::nullopt;
+        }
+        const u32 shift{inst->Arg(1).U32()};
+        if (shift < DESCRIPTOR_SIZE_SHIFT || shift >= 31) {
+            return std::nullopt;
+        }
+        if (require_load && (inst->Arg(0).IsImmediate() ||
+                             !IsMemoryLoad(inst->Arg(0).InstRecursive()->GetOpcode()))) {
+            return std::nullopt;
+        }
+        return shift;
+    }
+    if (inst->GetOpcode() == IR::Opcode::IMul32 && !require_load) {
+        const IR::Value lhs{inst->Arg(0)};
+        const IR::Value rhs{inst->Arg(1)};
+        if (lhs.IsImmediate() == rhs.IsImmediate()) {
+            return std::nullopt;
+        }
+        const u32 factor{lhs.IsImmediate() ? lhs.U32() : rhs.U32()};
+        if (factor < DESCRIPTOR_SIZE || !std::has_single_bit(factor)) {
+            return std::nullopt;
+        }
+        return static_cast<u32>(std::countr_zero(factor));
+    }
+    return std::nullopt;
+}
+
+// A table offset merged through Phis: one read per branch, all with the same stride (Kirby Air
+// Riders' computes 6a61383eab76058c and dfd4c8e0055065fd read constant buffer 4 at a storage
+// buffer word << 4, the word picked through a chain of Phis). Undefined incoming values and loops
+// back to a Phi already followed don't count; anything else must be TableOffsetShift's form.
+bool CollectPhiTableShift(const IR::Value& value, bool require_load, std::optional<u32>& shift,
+                          std::unordered_set<const IR::Inst*>& phis) {
+    if (value.IsEmpty() || value.IsImmediate()) {
+        return false;
+    }
+    const IR::Inst* const inst{value.InstRecursive()};
+    if (inst->GetOpcode() == IR::Opcode::UndefU32) {
+        return true;
+    }
+    if (inst->GetOpcode() == IR::Opcode::Phi) {
+        if (!phis.insert(inst).second) {
+            return true;
+        }
+        if (phis.size() > 64) {
+            return false;
+        }
+        for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+            if (!CollectPhiTableShift(inst->Arg(arg), require_load, shift, phis)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    const std::optional<u32> form{TableOffsetShift(inst, require_load)};
+    if (!form || (shift && *shift != *form)) {
+        return false;
+    }
+    shift = form;
+    return true;
+}
+
+// The stride of a table offset that is a Phi (see CollectPhiTableShift), or nothing. Then the
+// Phi itself is the offset, and `phi >> stride` the element.
+std::optional<u32> PhiTableShift(const IR::Value& value, bool require_load) {
+    std::optional<u32> shift;
+    std::unordered_set<const IR::Inst*> phis;
+    if (!CollectPhiTableShift(value, require_load, shift, phis)) {
+        return std::nullopt;
+    }
+    return shift;
+}
+
+bool IsPhiValue(const IR::Value& value) {
+    return !value.IsEmpty() && !value.IsImmediate() &&
+           value.InstRecursive()->GetOpcode() == IR::Opcode::Phi;
+}
+
+// The log2 of a handle table's element stride (TableOffsetShift), also through Phis.
+std::optional<u32> HandleTableShift(const IR::U32& dynamic_offset) {
+    const IR::Inst* const inst{dynamic_offset.TryInstRecursive()};
+    if (!inst) {
+        return std::nullopt;
+    }
+    if (inst->GetOpcode() == IR::Opcode::Phi) {
+        return PhiTableShift(dynamic_offset, false);
+    }
+    return TableOffsetShift(inst, false);
+}
+
+// Elements of a handle table at `base_offset` with 1 << shift bytes between them: as many as fit
+// in a constant buffer (64 KiB) from its base, at most HANDLE_TABLE_MAX_COUNT.
+u32 HandleTableCount(u32 base_offset, u32 shift) {
+    constexpr u32 CBUF_BYTES = 0x10000;
+    if (shift >= 31 || base_offset > CBUF_BYTES - DESCRIPTOR_SIZE) {
+        return 1;
+    }
+    const u32 fit{1U + ((CBUF_BYTES - DESCRIPTOR_SIZE - base_offset) >> shift)};
+    return (std::min)(fit, HANDLE_TABLE_MAX_COUNT);
+}
+
+// A lone handle table: the whole handle is one constant buffer word read at `index << k`
+// (k >= 3), the index loaded from memory. Kirby Air Riders' cascade texel-size query reads it with
+// the index from a light record the GPU writes: the handle program evaluated on the CPU (the plain
+// search's answer) reads guest memory before the GPU's data is there (a 1x1 dummy instead of the
+// 512x512 shadow map). The shader indexes the table itself, per pixel. Only as the whole
+// handle: inside a larger expression the read is left to the search (and the handle program).
+std::optional<ConstBufferAddr> LoneHandleTable(const IR::Inst* read) {
+    if (read->GetOpcode() != IR::Opcode::GetCbufU32 || !read->Arg(0).IsImmediate() ||
+        read->Arg(1).IsImmediate()) {
+        return std::nullopt;
+    }
+    // `load << k`, or Phis merging such reads (one per branch).
+    const IR::Value offset{read->Arg(1)};
+    const bool through_phis{IsPhiValue(offset)};
+    const std::optional<u32> shift{through_phis ? PhiTableShift(offset, true)
+                                                : TableOffsetShift(offset.InstRecursive(), true)};
+    if (!shift) {
+        return std::nullopt;
+    }
+    const IR::U32 dynamic{read->Arg(1)};
+    const u32 count{HandleTableCount(0, *shift)};
+    if (count <= 1) {
+        return std::nullopt;
+    }
+    return ConstBufferAddr{
+        .index = read->Arg(0).U32(),
+        .offset = 0,
+        .shift_left = 0,
+        .secondary_index = 0,
+        .secondary_offset = 0,
+        .secondary_shift_left = 0,
+        .dynamic_offset = dynamic,
+        .count = count,
+        .has_secondary = false,
+        .handle_table = true,
+    };
+}
+
 std::optional<ConstBufferAddr> Track(const IR::Value& value, Environment& env, const HostTranslateInfo& host_info, const IR::Block* block) {
     // A value loaded from memory is not a constant buffer word, whatever its address is built
     // from: the search does not look into a load's operands (a handle read from a storage
@@ -401,6 +769,11 @@ std::optional<ConstBufferAddr> Track(const IR::Value& value, Environment& env, c
     const IR::Value start{ResolveConditionalPhi(value, block)};
     if (start.IsImmediate()) {
         return std::nullopt;
+    }
+    if (HandleTablesOn()) {
+        if (std::optional table{LoneHandleTable(start.InstRecursive())}) {
+            return table;
+        }
     }
     std::unordered_set<const IR::Inst*> visited;
     std::queue<const IR::Inst*> queue;
@@ -793,6 +1166,78 @@ std::optional<u32> TryGetConstant(IR::Value& value, Environment& env) {
     return ReadCbufCached(env, index_number, offset_number);
 }
 
+// A handle table: `inst` ORs a constant buffer word at a dynamic offset (the table, read
+// at index * stride) with one at a fixed offset (lhs or rhs, as tracked). The OR becomes an array
+// over the table whose elements all take the fixed word as their other half. Kirby Air Riders'
+// cascaded shadow taps: cN[lightRecord[R + 4 * cascade] * 16] | c2[0x570].
+std::optional<ConstBufferAddr> TrackHandleTable(const IR::Inst* inst,
+                                                const std::optional<ConstBufferAddr>& lhs,
+                                                const std::optional<ConstBufferAddr>& rhs,
+                                                const IR::Block* block) {
+    const auto fixed_word = [](const std::optional<ConstBufferAddr>& addr) {
+        return addr && !addr->has_secondary && addr->count == 1 && addr->handle_program == ~0U &&
+               !addr->handle_table;
+    };
+    const auto table_read = [&](size_t arg) -> std::optional<ConstBufferAddr> {
+        const IR::Value value{ResolveConditionalPhi(inst->Arg(arg), block)};
+        if (value.IsImmediate()) {
+            return std::nullopt;
+        }
+        const IR::Inst* const read{value.InstRecursive()};
+        if (read->GetOpcode() != IR::Opcode::GetCbufU32 || !read->Arg(0).IsImmediate() ||
+            read->Arg(1).IsImmediate()) {
+            return std::nullopt;
+        }
+        u32 base_offset{};
+        IR::U32 dynamic_offset{read->Arg(1)};
+        if (const IR::Inst* const add{read->Arg(1).InstRecursive()};
+            add->GetOpcode() == IR::Opcode::IAdd32) {
+            if (add->Arg(0).IsImmediate()) {
+                base_offset = add->Arg(0).U32();
+                dynamic_offset = IR::U32{add->Arg(1)};
+            } else if (add->Arg(1).IsImmediate()) {
+                base_offset = add->Arg(1).U32();
+                dynamic_offset = IR::U32{add->Arg(0)};
+            }
+        }
+        // A whole number of 8-byte handle words per element, or no table (a 4-byte stride would
+        // map index i to element i >> 1).
+        const std::optional<u32> size_shift{HandleTableShift(dynamic_offset)};
+        if (!size_shift) {
+            return std::nullopt;
+        }
+        return ConstBufferAddr{
+            .index = read->Arg(0).U32(),
+            .offset = base_offset,
+            .shift_left = 0,
+            .secondary_index = 0,
+            .secondary_offset = 0,
+            .secondary_shift_left = 0,
+            .dynamic_offset = dynamic_offset,
+            .count = HandleTableCount(base_offset, *size_shift),
+            .has_secondary = false,
+        };
+    };
+    for (size_t table_arg = 0; table_arg < 2; ++table_arg) {
+        const std::optional<ConstBufferAddr>& fixed{table_arg == 0 ? rhs : lhs};
+        if (!fixed_word(fixed)) {
+            continue;
+        }
+        std::optional<ConstBufferAddr> table{table_read(table_arg)};
+        if (!table || table->count <= 1) {
+            continue;
+        }
+        table->secondary_index = fixed->index;
+        table->secondary_offset = fixed->offset;
+        table->secondary_shift_left = fixed->shift_left;
+        table->has_secondary = true;
+        table->secondary_fixed = true;
+        table->handle_table = true;
+        return table;
+    }
+    return std::nullopt;
+}
+
 std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environment& env, const HostTranslateInfo& host_info, const IR::Block* block) {
     switch (inst->GetOpcode()) {
     default:
@@ -800,7 +1245,17 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
     case IR::Opcode::BitwiseOr32: {
         std::optional lhs{TrackCached(inst->Arg(0), env, host_info, block)};
         std::optional rhs{TrackCached(inst->Arg(1), env, host_info, block)};
+        if (HandleTablesOn()) {
+            if (std::optional table{TrackHandleTable(inst, lhs, rhs, block)}) {
+                return table;
+            }
+        }
         if (!lhs || !rhs) {
+            return std::nullopt;
+        }
+        // A handle table side is not a constant buffer word to pair: the OR stays untracked, as
+        // before tables.
+        if (lhs->handle_table || rhs->handle_table) {
             return std::nullopt;
         }
         if (lhs->has_secondary || rhs->has_secondary) {
@@ -830,6 +1285,11 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
             return std::nullopt;
         }
         std::optional lhs{TrackCached(inst->Arg(0), env, host_info, block)};
+        // A handle table is only taken as the whole handle or an OR with a fixed word: shifted,
+        // it stays untracked as before tables.
+        if (lhs && lhs->handle_table) {
+            return std::nullopt;
+        }
         if (lhs) {
             lhs->shift_left = shift.U32();
         }
@@ -858,6 +1318,10 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
             } while (false);
         }
         std::optional lhs{TrackCached(op1, env, host_info, block)};
+        // As for a shift: a masked handle table stays untracked.
+        if (lhs && lhs->handle_table) {
+            return std::nullopt;
+        }
         if (lhs) {
             lhs->shift_left = static_cast<u32>(std::countr_zero(op2.U32()));
         }
@@ -890,6 +1354,8 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
     }
     IR::Inst* const offset_inst{offset.InstRecursive()};
     if (offset_inst->GetOpcode() != IR::Opcode::IAdd32) {
+        // A memory-indexed read as the whole handle is a handle table (LoneHandleTable, at the
+        // search's root); anywhere else it stays untracked, as before tables.
         return std::nullopt;
     }
     u32 base_offset{};
@@ -920,10 +1386,69 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
     };
 }
 
+bool IsImageOperation(IR::Opcode opcode) {
+    switch (opcode) {
+    case IR::Opcode::ImageRead:
+    case IR::Opcode::ImageWrite:
+    case IR::Opcode::ImageAtomicIAdd32:
+    case IR::Opcode::ImageAtomicSMin32:
+    case IR::Opcode::ImageAtomicUMin32:
+    case IR::Opcode::ImageAtomicSMax32:
+    case IR::Opcode::ImageAtomicUMax32:
+    case IR::Opcode::ImageAtomicInc32:
+    case IR::Opcode::ImageAtomicDec32:
+    case IR::Opcode::ImageAtomicAnd32:
+    case IR::Opcode::ImageAtomicOr32:
+    case IR::Opcode::ImageAtomicXor32:
+    case IR::Opcode::ImageAtomicExchange32:
+        return true;
+    default:
+        return false;
+    }
+}
+
 TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const HostTranslateInfo& host_info) {
     ConstBufferAddr addr;
     if (IsBindless(inst)) {
-        const std::optional<ConstBufferAddr> track_addr{TrackCached(inst.Arg(0), env, host_info, block)};
+        std::optional<ConstBufferAddr> track_addr{TrackCached(inst.Arg(0), env, host_info, block)};
+        // MakeInst runs before the opcode is replaced: the indexed opcode tells what it does. A
+        // fetch typed 1D may turn out to be a texture buffer once the descriptor is read.
+        const IR::Opcode indexed{IndexedInstruction(inst)};
+        const TextureType type{inst.Flags<IR::TextureInstInfo>().type.Value()};
+        const bool image_or_buffer{IsImageOperation(indexed) || type == TextureType::Buffer ||
+                                   (indexed == IR::Opcode::ImageFetch &&
+                                    type == TextureType::Color1D)};
+        if (track_addr && track_addr->handle_table && image_or_buffer) {
+            // Tables are made for sampled textures only: storage images and texture buffers
+            // take the plain search's answer.
+            g_handle_tables_off = true;
+            g_tables_off_cache.clear();
+            try {
+                track_addr = Track(inst.Arg(0), env, host_info, block);
+            } catch (...) {
+                g_handle_tables_off = false;
+                throw;
+            }
+            g_handle_tables_off = false;
+        }
+        if (track_addr && track_addr->handle_table && !track_addr->has_secondary &&
+            g_handle_programs) {
+            // A lone table gets one more element past it: the handle program the plain search
+            // gives, evaluated for each draw. The clamp sends an index past the table there, so a
+            // draw-uniform index the table can't hold binds exactly what it did before tables.
+            std::vector<u32> code;
+            int budget = 4096;
+            if (BuildHandleProgram(inst.Arg(0), code, budget, block)) {
+                auto& programs{*g_handle_programs};
+                auto it{std::ranges::find(programs, code)};
+                if (it == programs.end()) {
+                    programs.push_back(std::move(code));
+                    it = programs.end() - 1;
+                }
+                track_addr->overflow_program = static_cast<u32>(it - programs.begin());
+                ++track_addr->count;
+            }
+        }
 
         if (track_addr) {
             addr = *track_addr;
@@ -1053,7 +1578,9 @@ public:
                    desc.secondary_cbuf_offset == existing.secondary_cbuf_offset &&
                    desc.secondary_shift_left == existing.secondary_shift_left &&
                    desc.count == existing.count && desc.size_shift == existing.size_shift &&
-                   desc.handle_program == existing.handle_program;
+                   desc.handle_program == existing.handle_program &&
+                   desc.secondary_fixed == existing.secondary_fixed &&
+                   desc.overflow_program == existing.overflow_program;
         })};
         // TODO: Read this from TIC
         texture_descriptors[index].is_multisample |= desc.is_multisample;
@@ -1186,12 +1713,14 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
         program.info.image_descriptors,
     };
     const u32 sampled_dynamic_cap = DynamicSampledTextureCap(program.info, host_info, DynamicSampledTextureArrayCount(to_replace));
+    const u32 handle_table_cap =
+        HandleTableCap(env, program, program.info, host_info, to_replace, sampled_dynamic_cap);
     bool has_last_is_integer{false};
     u32 last_cbuf_index{};
     u32 last_cbuf_offset{};
     bool last_is_integer{false};
     const auto is_texture_pixel_format_integer{[&](const ConstBufferAddr& cbuf_addr) {
-        if (cbuf_addr.handle_program != ~0U) {
+        if (cbuf_addr.handle_program != ~0U || cbuf_addr.handle_table) {
             // Every handle program is at cbuf 0 offset 0: the cache below can't tell them apart.
             return IsTexturePixelFormatIntegerCached(env, cbuf_addr);
         }
@@ -1266,6 +1795,10 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
         }
         u32 index;
         u32 size_shift = cbuf.count > 1 ? DynamicDescriptorSizeShift(cbuf.dynamic_offset) : DESCRIPTOR_SIZE_SHIFT;
+        if (cbuf.handle_table) {
+            // The stride its count was made with (an IMul by a power of two counts too).
+            size_shift = HandleTableShift(cbuf.dynamic_offset).value_or(DESCRIPTOR_SIZE_SHIFT);
+        }
         u32 count = cbuf.count;
         switch (inst->GetOpcode()) {
         case IR::Opcode::ImageRead:
@@ -1330,7 +1863,22 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                     .handle_program = cbuf.handle_program,
                 });
             } else {
-                count = std::min(count, sampled_dynamic_cap);
+                // A handle table by its own cap (HandleTableCap); other arrays as before.
+                count = std::min(count, cbuf.handle_table ? handle_table_cap : sampled_dynamic_cap);
+                if (cbuf.handle_table && count < cbuf.count) {
+                    // The host's limits (Vulkan descriptor limits, GL's texture units) cut a
+                    // handle table: indices past the cut take its last element.
+                    static std::atomic<bool> logged{false};
+                    if (!logged.exchange(true, std::memory_order_relaxed)) {
+                        LOG_INFO(Shader,
+                                 "Handle table of {} elements cut to {} by the host's sampler "
+                                 "limit (logged once)",
+                                 cbuf.count, count);
+                    }
+                }
+                // A lone table's overflow element is its last: a cap that cuts the array leaves
+                // the table without one (the clamp then picks the last table element).
+                const u32 overflow_program{count == cbuf.count ? cbuf.overflow_program : ~0U};
                 // Depth-compare sampling returns a float in Vulkan, so its image must be float
                 // even when a garbage or unknown descriptor reads as an integer format.
                 static const bool depth_float_fix{Common::EnvGate("EGLANTINE_DEPTH_FLOAT_FIX")};
@@ -1351,6 +1899,8 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                     .count = count,
                     .size_shift = size_shift,
                     .handle_program = cbuf.handle_program,
+                    .secondary_fixed = cbuf.secondary_fixed,
+                    .overflow_program = overflow_program,
                 });
                 flags.is_integer.Assign(is_integer ? 1 : 0);
             }

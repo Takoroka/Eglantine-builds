@@ -269,6 +269,8 @@ ShaderCache::ShaderCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .support_viewport_index_layer = device.HasVertexViewportLayer(),
         .support_geometry_shader_passthrough = device.HasGeometryShaderPassthrough(),
         .support_conditional_barrier = device.SupportsConditionalBarriers(),
+        // Handle tables only (other arrays keep the 1024 default and their windows).
+        .handle_table_sampler_limit = device.GetMaxTextureImageUnits(),
       } {
     host_info.ApplyDescriptorLimitPolicy();
     if (use_asynchronous_shaders) {

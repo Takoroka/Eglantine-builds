@@ -204,6 +204,7 @@ Device::Device(Core::Frontend::EmuWindow& emu_window) {
     max_compute_shared_memory_size = GetInteger<u32>(GL_MAX_COMPUTE_SHARED_MEMORY_SIZE);
     max_glasm_storage_buffer_blocks = GetInteger<u32>(GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS);
     max_user_clip_distances = GetInteger<u32>(GL_MAX_CLIP_DISTANCES);
+    max_texture_image_units = GetInteger<u32>(GL_MAX_TEXTURE_IMAGE_UNITS);
     has_warp_intrinsics = GLAD_GL_NV_gpu_shader5 && GLAD_GL_NV_shader_thread_group &&
                           GLAD_GL_NV_shader_thread_shuffle;
     has_shader_ballot = GLAD_GL_ARB_shader_ballot;

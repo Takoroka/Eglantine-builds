@@ -437,7 +437,12 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                           std::is_same_v<decltype(desc), const Shader::TextureBufferDescriptor&>) {
                 if (desc.has_secondary) {
                     ASSERT(cbufs[desc.secondary_cbuf_index].enabled);
-                    const u32 second_offset{desc.secondary_cbuf_offset + index_offset};
+                    u32 second_index_offset{index_offset};
+                    if constexpr (requires { desc.secondary_fixed; }) {
+                        // A handle table's elements share one secondary word.
+                        second_index_offset = desc.secondary_fixed ? 0 : index_offset;
+                    }
+                    const u32 second_offset{desc.secondary_cbuf_offset + second_index_offset};
                     const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].address +
                                                  second_offset};
                     const u32 lhs_raw{gpu_memory->Read<u32>(addr) << desc.shift_left};
@@ -470,8 +475,24 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
         }
         for (const auto& desc : info.texture_descriptors) {
+            // A lone handle table's last element is this draw's own handle (the plain search's
+            // handle program), which an index past the table selects.
+            const u32 overflow_index{desc.overflow_program != ~0U ? desc.count - 1 : desc.count};
             for (u32 index = 0; index < desc.count; ++index) {
-                const auto handle{read_handle(desc, index)};
+                const auto handle{[&] {
+                    if (index == overflow_index) {
+                        return TexturePair(
+                            VideoCommon::EvaluateTextureHandle(
+                                info, desc.overflow_program, *gpu_memory,
+                                [&](u32 cbuf) -> GPUVAddr {
+                                    return cbuf < cbufs.size() && cbufs[cbuf].enabled
+                                               ? cbufs[cbuf].address
+                                               : GPUVAddr{};
+                                }),
+                            via_header_index);
+                    }
+                    return read_handle(desc, index);
+                }()};
                 views.push_back({handle.first});
 
                 VideoCommon::SamplerId sampler{texture_cache.GetSamplerId(handle.second, false)};
