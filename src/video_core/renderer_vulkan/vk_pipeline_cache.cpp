@@ -1312,16 +1312,27 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
     if (!use_asynchronous_shaders) {
         return pipeline;
     }
-    // If something is using depth, we can assume that games are not rendering anything which
-    // will be used one time.
+    // Draws whose result is read for many frames must not be skipped while their pipeline builds:
+    // what they leave unwritten stays wrong. Splatoon Raiders, after a cold pipeline cache, bakes
+    // maps with fullscreen quads (1600x1600 and 6400x6400) and captures probes (512x512), with
+    // a depth buffer bound; skipped, the screen stayed washed out or red. So wait for a small
+    // colour target (lookup tables, probes) and for a direct draw of at most 6 elements
+    // (fullscreen quads, usually building a texture) even with depth.
+    const auto& rt0 = maxwell3d->regs.rt[0];
+    if (rt0.Address() != 0 && u64{rt0.width} * rt0.height <= 512 * 512) {
+        return pipeline;
+    }
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    if (draw_state.draw_element_count != 0 && draw_state.draw_element_count <= 6) {
+        return pipeline;
+    }
+    // Other draws using depth render the scene, redrawn every frame: they can be skipped.
     if (maxwell3d->regs.zeta_enable) {
         graphics_miss = "async-build";
         return nullptr;
     }
-    // If games are using a small index count, we can assume these are full screen quads.
-    // Usually these shaders are only used once for building textures so we can assume they
-    // can't be built async
-    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    // Zero elements is an indirect draw whose count isn't known yet; without depth, these are
+    // usually full screen too.
     if (draw_state.draw_element_count <= 6) {
         return pipeline;
     }
