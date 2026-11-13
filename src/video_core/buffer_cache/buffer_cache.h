@@ -232,7 +232,11 @@ void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
     DAddr aligned_start = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
     DAddr aligned_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
     if (!IsRegionGpuModified(aligned_start, aligned_end - aligned_start)) {
-        WriteMemory(device_addr, size);
+        // No GPU-written range on the write's pages, so none in the write either: WriteMemory's
+        // own lookups (the range, then its pages before downloading them) would find nothing.
+        Nx2NoteListHostWrite(device_addr, size);
+        memory_tracker.MarkRegionAsCpuModified(device_addr, size);
+        MarkVertexBuffersStale(device_addr, size);
         return;
     }
 
