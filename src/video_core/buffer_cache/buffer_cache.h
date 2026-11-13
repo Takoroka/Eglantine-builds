@@ -851,6 +851,7 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
         normalized_copies.push_back(second_copy);
     }
     runtime.PostCopyBarrier();
+    runtime.HostReadBarrier();
     pending_downloads.emplace_back(std::move(normalized_copies));
     pending_download_ranges.emplace_back(std::move(download_ranges));
     async_buffers.emplace_back(download_staging);
@@ -1991,6 +1992,10 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
             entry.copy_begin = static_cast<u32>(begin - page);
             entry.copy_end = static_cast<u32>(end - page);
         }
+        if (recorded) {
+            // The CPU reads these copies once their tick is free (Nx2ReadListCopy).
+            runtime.HostReadBarrier();
+        }
         nx2_list_copy_requests.clear();
         std::erase_if(nx2_retired_list_copies, [this](auto& retired) {
             if (!runtime.IsFree(retired.first)) {
@@ -2517,6 +2522,7 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
         buffer.MarkUsage(download.copy.src_offset, download.copy.size);
         runtime.CopyBuffer(download_staging.buffer, buffer, std::span{&download.copy, 1}, true);
     }
+    runtime.HostReadBarrier();
     runtime.Finish();
     const u8* const mapped_memory = download_staging.mapped_span.data();
     const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
@@ -2581,6 +2587,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
             buffer.MarkUsage(copy.src_offset, copy.size);
         }
         runtime.CopyBuffer(download_staging.buffer, buffer, copies_span, true);
+        runtime.HostReadBarrier();
         runtime.Finish();
         for (const BufferCopy& copy : copies) {
             const DAddr copy_device_addr = buffer.CpuAddr() + copy.src_offset;
