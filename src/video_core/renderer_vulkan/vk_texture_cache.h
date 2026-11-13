@@ -631,10 +631,15 @@ private:
     VkImageAspectFlags aspect_mask = 0;
     bool initialized = false;
 
-    std::optional<Framebuffer> scale_framebuffer;
-    std::optional<Framebuffer> normal_framebuffer;
-    std::unique_ptr<ImageView> scale_view;
-    std::unique_ptr<ImageView> normal_view;
+    /// BlitScaleHelper's views of one level and layer on each copy, and the framebuffers that
+    /// draw into them. Sized levels * layers at the first helper copy and never again.
+    struct ScaleHelperSub {
+        std::unique_ptr<ImageView> original_view;
+        std::unique_ptr<ImageView> scaled_view;
+        std::optional<Framebuffer> original_framebuffer;
+        std::optional<Framebuffer> scaled_framebuffer;
+    };
+    std::vector<ScaleHelperSub> scale_helper_subs;
 };
 
 class ImageView : public VideoCommon::ImageViewBase {

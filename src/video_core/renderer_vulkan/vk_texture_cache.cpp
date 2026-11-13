@@ -3837,6 +3837,13 @@ bool Image::BlitScaleHelper(bool scale_up) {
     using namespace VideoCommon;
     static constexpr auto BLIT_OPERATION = Tegra::Engines::Fermi2D::Operation::SrcCopy;
     const bool is_color{aspect_mask == VK_IMAGE_ASPECT_COLOR_BIT};
+    const bool is_depth{!is_color && (aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT) != 0};
+    if (!is_color && !is_depth) {
+        // TODO: Use helper blits where applicable
+        flags &= ~ImageFlagBits::Rescaled;
+        LOG_ERROR(Render_Vulkan, "Device does not support scaling format {}", info.format);
+        return false;
+    }
     const bool is_bilinear{is_color && !IsPixelFormatInteger(info.format)};
     const auto operation = is_bilinear ? Tegra::Engines::Fermi2D::Filter::Bilinear
                                        : Tegra::Engines::Fermi2D::Filter::Point;
@@ -3845,63 +3852,86 @@ bool Image::BlitScaleHelper(bool scale_up) {
     const auto& resolution = runtime->resolution;
     const u32 scaled_width = resolution.ScaleUp(info.size.width);
     const u32 scaled_height = is_2d ? resolution.ScaleUp(info.size.height) : info.size.height;
-    std::unique_ptr<ImageView>& blit_view = scale_up ? scale_view : normal_view;
-    std::optional<Framebuffer>& blit_framebuffer = scale_up ? scale_framebuffer : normal_framebuffer;
-    if (!blit_view) {
-        const auto view_info = ImageViewInfo(ImageViewType::e2D, info.format);
-        blit_view = std::make_unique<ImageView>(*runtime, view_info, NULL_IMAGE_ID, *this);
+
+    // ScaleUp and ScaleDown point current_image at the destination copy before they get here, so a
+    // view made from Handle() would read the image the helper writes. Draw original_image into
+    // scaled_image (up) or the reverse (down) instead, every level and layer, through views made
+    // explicitly on each copy.
+    const s32 levels = (std::max)(info.resources.levels, 1);
+    const s32 layers = (std::max)(info.resources.layers, 1);
+    if (scale_helper_subs.empty()) {
+        scale_helper_subs.resize(static_cast<size_t>(levels) * static_cast<size_t>(layers));
     }
-
+    const auto make_view = [this](vk::Image Image::*copy, s32 level, s32 layer) {
+        const SubresourceRange range{
+            .base = {.level = level, .layer = layer},
+            .extent = {.levels = 1, .layers = 1},
+        };
+        const auto view_info = ImageViewInfo(ImageViewType::e2D, info.format, range);
+        // ImageView takes Handle(), the copy current_image names: point it at `copy`.
+        vk::Image Image::*const current = current_image;
+        current_image = copy;
+        auto view = std::make_unique<ImageView>(*runtime, view_info, NULL_IMAGE_ID, *this);
+        current_image = current;
+        return view;
+    };
     const auto [samples_x, samples_y] = VideoCommon::SamplesLog2(info.num_samples);
-    const u32 src_width = (scale_up ? info.size.width : scaled_width) >> samples_x;
-    const u32 src_height = (scale_up ? info.size.height : scaled_height) >> samples_y;
-    const u32 dst_width = (scale_up ? scaled_width : info.size.width) >> samples_x;
-    const u32 dst_height = (scale_up ? scaled_height : info.size.height) >> samples_y;
-    const Region2D src_region{
-        .start = {0, 0},
-        .end = {s32(src_width), s32(src_height)},
-    };
-    const Region2D dst_region{
-        .start = {0, 0},
-        .end = {s32(dst_width), s32(dst_height)},
-    };
-    const VkExtent2D extent{
-        .width = (std::max)(scaled_width, info.size.width) >> samples_x,
-        .height = (std::max)(scaled_height, info.size.height) >> samples_y,
-    };
-
-    auto* view_ptr = blit_view.get();
-    if (aspect_mask == VK_IMAGE_ASPECT_COLOR_BIT) {
-        if (!blit_framebuffer)
-            blit_framebuffer.emplace(*runtime, view_ptr, nullptr, extent, scale_up);
-        if (info.num_samples > 1) {
-            runtime->blit_image_helper.BlitColorMSAA(&*blit_framebuffer, *blit_view,
-                dst_region, src_region);
-        } else {
-            runtime->blit_image_helper.BlitColor(&*blit_framebuffer, *blit_view,
-                dst_region, src_region, operation, BLIT_OPERATION);
+    const bool has_stencil = (aspect_mask & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
+    const bool can_blit_stencil = has_stencil && runtime->device.IsExtShaderStencilExportSupported();
+    for (s32 level = 0; level < levels; ++level) {
+        const u32 native_w = (std::max)(info.size.width >> level, 1u);
+        const u32 native_h = (std::max)(info.size.height >> level, 1u);
+        const u32 scaled_w = (std::max)(scaled_width >> level, 1u);
+        const u32 scaled_h = (std::max)(scaled_height >> level, 1u);
+        const Region2D src_region{
+            .start = {0, 0},
+            .end = {s32((scale_up ? native_w : scaled_w) >> samples_x),
+                    s32((scale_up ? native_h : scaled_h) >> samples_y)},
+        };
+        const Region2D dst_region{
+            .start = {0, 0},
+            .end = {s32((scale_up ? scaled_w : native_w) >> samples_x),
+                    s32((scale_up ? scaled_h : native_h) >> samples_y)},
+        };
+        const VkExtent2D extent{
+            .width = (std::max)((std::max)(scaled_w, native_w) >> samples_x, 1u),
+            .height = (std::max)((std::max)(scaled_h, native_h) >> samples_y, 1u),
+        };
+        for (s32 layer = 0; layer < layers; ++layer) {
+            ScaleHelperSub& sub = scale_helper_subs[static_cast<size_t>(level * layers + layer)];
+            if (!sub.original_view) {
+                sub.original_view = make_view(&Image::original_image, level, layer);
+            }
+            if (!sub.scaled_view) {
+                sub.scaled_view = make_view(&Image::scaled_image, level, layer);
+            }
+            ImageView& source = scale_up ? *sub.original_view : *sub.scaled_view;
+            ImageView* const destination = scale_up ? sub.scaled_view.get() : sub.original_view.get();
+            std::optional<Framebuffer>& framebuffer =
+                scale_up ? sub.scaled_framebuffer : sub.original_framebuffer;
+            if (!framebuffer) {
+                framebuffer.emplace(*runtime, is_color ? destination : nullptr,
+                                    is_color ? nullptr : destination, extent, scale_up);
+            }
+            if (is_color) {
+                if (info.num_samples > 1) {
+                    runtime->blit_image_helper.BlitColorMSAA(&*framebuffer, source, dst_region,
+                                                             src_region);
+                } else {
+                    runtime->blit_image_helper.BlitColor(&*framebuffer, source, dst_region,
+                                                         src_region, operation, BLIT_OPERATION);
+                }
+            } else if (info.num_samples > 1) {
+                runtime->blit_image_helper.BlitDepthStencilMSAA(&*framebuffer, source, dst_region,
+                                                                src_region);
+            } else if (can_blit_stencil) {
+                runtime->blit_image_helper.BlitDepthStencil(&*framebuffer, source, dst_region,
+                                                            src_region, operation, BLIT_OPERATION);
+            } else {
+                runtime->blit_image_helper.BlitDepth(&*framebuffer, source, dst_region,
+                                                     src_region);
+            }
         }
-    } else if ((aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT) != 0) {
-        if (!blit_framebuffer)
-            blit_framebuffer.emplace(*runtime, nullptr, view_ptr, extent, scale_up);
-        const bool has_stencil = (aspect_mask & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
-        const bool can_blit_stencil =
-            has_stencil && runtime->device.IsExtShaderStencilExportSupported();
-        if (info.num_samples > 1) {
-            runtime->blit_image_helper.BlitDepthStencilMSAA(&*blit_framebuffer, *blit_view,
-                dst_region, src_region);
-        } else if (can_blit_stencil) {
-            runtime->blit_image_helper.BlitDepthStencil(&*blit_framebuffer, *blit_view,
-                dst_region, src_region, operation, BLIT_OPERATION);
-        } else {
-            runtime->blit_image_helper.BlitDepth(&*blit_framebuffer, *blit_view, dst_region,
-                                                 src_region);
-        }
-    } else {
-        // TODO: Use helper blits where applicable
-        flags &= ~ImageFlagBits::Rescaled;
-        LOG_ERROR(Render_Vulkan, "Device does not support scaling format {}", info.format);
-        return false;
     }
     return true;
 }
