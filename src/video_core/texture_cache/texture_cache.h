@@ -1772,7 +1772,10 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
             ForEachSparseSegment(image, [&](GPUVAddr, DAddr address, size_t size) {
                 uploaded_ranges.emplace_back(address, size);
             });
-        } else {
+        } else if (image.cpu_addr < ~(1ULL << 40ULL)) {
+            // Not for a stand-in address (ImageCpuAddress, InsertImage), an image with no CPU
+            // backing: no guest memory to page out, and HintCold walked its pages (about 513 for
+            // 2 MiB) at indices near 2^52, past the device page table.
             uploaded_ranges.emplace_back(image.cpu_addr, image.guest_size_bytes);
         }
     }

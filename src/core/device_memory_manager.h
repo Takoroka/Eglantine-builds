@@ -167,6 +167,18 @@ private:
 private:
     static constexpr size_t device_virtual_bits = Traits::device_virtual_bits;
     static constexpr size_t device_as_size = 1ULL << device_virtual_bits;
+
+    /// The size of the part of [addr, addr + size) inside the device address space (the pages
+    /// tracked_entries holds); 0 for none. The texture cache's stand-in address for an image
+    /// with no CPU backing (>= ~(1 << 40)) lies past it: walking its pages read tracked_entries
+    /// at indices near 2^52 ("Out of bounds access on large vector"; without that check, a read
+    /// far past the allocation).
+    static constexpr size_t DeviceSpaceSize(DAddr addr, size_t size) {
+        if (addr >= device_as_size) {
+            return 0;
+        }
+        return size < device_as_size - addr ? size : device_as_size - addr;
+    }
     static constexpr size_t physical_min_bits = 32;
     static constexpr size_t physical_max_bits = 35; // covers the 12 GiB layout plus nx2 graphics server memory
     static constexpr size_t page_bits = 12;
