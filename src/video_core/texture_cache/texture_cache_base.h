@@ -226,6 +226,9 @@ public:
     /// Notify the cache that a new frame has been queued
     void TickFrame();
 
+    /// The application layer's displayed size, from the swapchain composite (SceneShaped).
+    void NotePresentedFrame(u32 width, u32 height) noexcept;
+
     /// Return a constant reference to the given image view id
     [[nodiscard]] const ImageView& GetImageView(ImageViewId id) const noexcept;
 
@@ -393,6 +396,10 @@ private:
 
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);
+
+    /// True when an image of this size has the last presented frame's aspect (within 10%), its
+    /// full width or its full height, or nothing was presented yet.
+    [[nodiscard]] bool SceneShaped(u32 width, u32 height) const noexcept;
 
     /// Find or create a framebuffer with the given render target parameters
     FramebufferId GetFramebufferId(const RenderTargets& key);
@@ -636,6 +643,10 @@ private:
 
     u64 modification_tick = 0;
     u64 frame_tick = 0;
+
+    /// The application layer's displayed size (NotePresentedFrame), 0 before the first present.
+    u32 presented_width = 0;
+    u32 presented_height = 0;
 
     Common::ThreadWorker texture_decode_worker{1, "TextureDecoder", {},
                                                Common::ThreadPlacement::Efficiency};

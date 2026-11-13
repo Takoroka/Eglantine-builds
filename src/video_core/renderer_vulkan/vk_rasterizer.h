@@ -162,6 +162,13 @@ public:
                                                             VAddr framebuffer_addr,
                                                             u32 pixel_stride);
 
+    /// The application layer's displayed size, from the swapchain composite
+    /// (TextureCache::NotePresentedFrame).
+    void NotePresentedFrame(u32 width, u32 height) {
+        std::scoped_lock lock{texture_cache.mutex};
+        texture_cache.NotePresentedFrame(width, height);
+    }
+
 private:
     static constexpr const u64 NEEDS_D24[] = {
         0x01006A800016E000ULL, // SSBU

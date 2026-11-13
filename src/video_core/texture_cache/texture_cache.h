@@ -683,6 +683,41 @@ bool TextureCache<P>::RescaleRenderTargets() {
     bool rescaled = false;
     std::array<ImageId, NUM_RT> tmp_color_images{};
     ImageId tmp_depth_image{};
+    // A TIC-created image is rescaleable only with one level (image_info.cpp). A mipped colour
+    // target drawn at level 0 next to a same-size depth then made the draw scale its scene depth
+    // down (nearest), and the next draw scaled it back up: Kirby Air Riders above 1x has three such
+    // targets (RGBA16F and R16G16F, 4 and 11 levels) and drew a 2-pixel grid over the whole scene.
+    // Such a target becomes rescaleable here; the scale_up below scales it. Only when scaling up,
+    // for view base level 0, e2D, more than one level, one layer, no 3D block, one sample, a
+    // colour format, taller than 288, a depth bound with the image's size, and a scene shape.
+    const auto promote_mipped = [this](ImageViewId view_id) {
+        const auto& resolution = Settings::values.resolution_info;
+        if (!resolution.active || resolution.downscale) {
+            return;
+        }
+        if (view_id == NULL_IMAGE_VIEW_ID || view_id == ImageViewId{}) {
+            return;
+        }
+        const ImageViewBase& view = slot_image_views[view_id];
+        if (view.range.base.level != 0) {
+            return;
+        }
+        ImageInfo& info = slot_images[view.image_id].info;
+        if (info.rescaleable || info.type != ImageType::e2D || info.resources.levels <= 1 ||
+            info.resources.layers != 1 || info.block.depth != 0 || info.num_samples != 1 ||
+            GetFormatType(info.format) != SurfaceType::ColorTexture || info.size.height <= 288) {
+            return;
+        }
+        const auto& regs = maxwell3d->regs;
+        if (regs.zeta_enable == 0 || regs.zeta_size.width != info.size.width ||
+            regs.zeta_size.height != info.size.height) {
+            return;
+        }
+        if (!SceneShaped(info.size.width, info.size.height)) {
+            return;
+        }
+        info.rescaleable = true;
+    };
     do {
         flags[Dirty::RenderTargets] = false;
 
@@ -717,6 +752,7 @@ bool TextureCache<P>::RescaleRenderTargets() {
                 flags[Dirty::ColorBuffer0 + index] = false;
                 BindRenderTarget(&color_buffer_id, FindColorBuffer(index));
             }
+            promote_mipped(color_buffer_id);
             check_rescale(color_buffer_id, tmp_color_images[index]);
         }
         if (flags[Dirty::ZetaBuffer] || force) {
@@ -888,6 +924,24 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
     if (id != NULL_IMAGE_VIEW_ID)
         PrepareImageView(id, false, false);
     return id;
+}
+
+template <class P>
+void TextureCache<P>::NotePresentedFrame(u32 width, u32 height) noexcept {
+    presented_width = width;
+    presented_height = height;
+}
+
+template <class P>
+bool TextureCache<P>::SceneShaped(u32 width, u32 height) const noexcept {
+    if (presented_width == 0 || presented_height == 0 || width == 0 || height == 0 ||
+        width == presented_width || height == presented_height) {
+        return true;
+    }
+    const u64 cross_a = u64{width} * presented_height;
+    const u64 cross_b = u64{height} * presented_width;
+    const u64 diff = cross_a > cross_b ? cross_a - cross_b : cross_b - cross_a;
+    return diff * 10 <= cross_b;
 }
 
 template <class P>
