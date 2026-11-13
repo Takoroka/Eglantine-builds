@@ -224,6 +224,23 @@ struct WordManager {
         return result;
     }
 
+    /// @brief Returns true when no page of a region is CPU modified or untracked: an upload of it
+    ///        (ForEachModifiedRange of CPU pages, clearing) would find and change nothing
+    /// @param offset Offset in bytes from the start of the buffer
+    /// @param size   Size in bytes of the region to query
+    [[nodiscard]] bool IsRegionCpuClean(u64 offset, u64 size) const noexcept {
+        const std::span<const u64> cpu_words = Span(Type::CPU);
+        const std::span<const u64> untracked_words = Span(Type::Untracked);
+        bool clean = true;
+        IterateWords(offset, size, [&](size_t index, u64 mask) {
+            if (((cpu_words[index] | untracked_words[index]) & mask) != 0) {
+                clean = false;
+            }
+            return !clean;
+        });
+        return clean;
+    }
+
     /// @brief Returns a begin end pair with the inclusive modified region
     /// @param offset Offset in bytes from the start of the buffer
     /// @param size   Size in bytes of the region to query for modifications
