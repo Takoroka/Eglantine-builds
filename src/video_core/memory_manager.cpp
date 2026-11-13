@@ -333,6 +333,15 @@ u8* MemoryManager::GetPointer(GPUVAddr gpu_addr) {
     return memory.GetPointer<u8>(*address);
 }
 
+const u8* MemoryManager::GetWordPage(GPUVAddr page) const {
+    constexpr GPUVAddr PageSize = 0x1000;
+    const auto shim = native_syncpoint_shim.load(std::memory_order_acquire);
+    if (shim && page < shim + NumShimSyncpoints * sizeof(u32) && shim < page + PageSize) {
+        return nullptr;
+    }
+    return GetPointer(page);
+}
+
 const u8* MemoryManager::GetPointer(GPUVAddr gpu_addr) const {
     const auto address{GpuToCpuAddress(gpu_addr)};
     if (!address) {

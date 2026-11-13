@@ -78,6 +78,10 @@ public:
     [[nodiscard]] u8* GetPointer(GPUVAddr addr);
     [[nodiscard]] const u8* GetPointer(GPUVAddr addr) const;
 
+    /// Host pointer of the 4 KiB page at `page` for reading words as Read<u32> does: nullptr when
+    /// it has none or the Switch 2 syncpoint shim overlaps it (Read<u32> answers those).
+    [[nodiscard]] const u8* GetWordPage(GPUVAddr page) const;
+
     template <typename T>
     [[nodiscard]] inline T* GetPointer(GPUVAddr addr) noexcept {
         const auto address = GpuToCpuAddress(addr);
