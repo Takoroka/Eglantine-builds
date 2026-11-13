@@ -192,6 +192,11 @@ void TextureCache<P>::RunGarbageCollector() {
     // emptiest blocks go first, so blocks drain and go back to the driver; placement already
     // prefers the fullest blocks (best fit). Images with memory of their own sit in the middle.
     const auto Collect = [&] {
+        // Nothing is old enough yet. frame_tick - ticks_to_destroy would wrap around and only the
+        // LRU's signed tick compare kept that from selecting every image.
+        if (frame_tick < ticks_to_destroy) {
+            return;
+        }
         if constexpr (requires(const Image& image) { image.MemoryBlock(); }) {
             std::vector<ImageId> candidates;
             const size_t limit = num_iterations * 8;
