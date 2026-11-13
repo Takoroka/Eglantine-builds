@@ -147,8 +147,39 @@ void TextureCache<P>::RunGarbageCollector() {
         ticks_to_destroy = (std::max)(ticks_to_destroy, min_age);
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
     };
+    // Download-deletes record their copies and wait for the GPU once per batch, then swizzle in
+    // the order they were recorded, the way DownloadMemory batches (the copies only read). One
+    // Finish each made a race restart's 200+ download-deletes 85-105 ms frames (Mario Kart World).
+    // A deleted image waits in the delayed destruction ring until its copy has run. The staging
+    // maps are deferred until swizzled: OpenGL hands an undeferred download map out again at once,
+    // so a later copy of the batch would overwrite an earlier one.
+    static constexpr size_t MaxDownloadBatchBytes = 64_MiB;
+    using Map = decltype(runtime.DownloadStagingBuffer(size_t{}));
+    using Copies = decltype(FullDownloadCopies(std::declval<const ImageInfo&>()));
+    struct GcDownload {
+        GPUVAddr gpu_addr;
+        ImageInfo info;
+        Map map;
+        Copies copies;
+    };
+    boost::container::small_vector<GcDownload, 16> gc_downloads;
+    size_t gc_download_bytes = 0;
+    const auto flush_downloads = [&] {
+        if (gc_downloads.empty()) {
+            return;
+        }
+        runtime.Finish();
+        for (GcDownload& entry : gc_downloads) {
+            SwizzleImage(*gpu_memory, entry.gpu_addr, entry.info, entry.copies,
+                         entry.map.mapped_span, swizzle_data_buffer);
+            runtime.FreeDeferredStagingBuffer(entry.map);
+        }
+        gc_downloads.clear();
+        gc_download_bytes = 0;
+    };
     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,
-                          &evict_old_costly](ImageId image_id) {
+                          &evict_old_costly, &gc_downloads, &gc_download_bytes,
+                          &flush_downloads](ImageId image_id) {
         if (num_iterations == 0) {
             return true;
         }
@@ -162,12 +193,18 @@ void TextureCache<P>::RunGarbageCollector() {
             (!high_priority_mode && must_download)) {
             return false;
         }
+        bool immediate_delete = image.scale_tick > frame_tick + 5;
         if (must_download) {
-            auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
-            const auto copies = FullDownloadCopies(image.info);
+            if (!gc_downloads.empty() &&
+                gc_download_bytes + image.unswizzled_size_bytes > MaxDownloadBatchBytes) {
+                flush_downloads();
+            }
+            auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes, true);
+            auto copies = FullDownloadCopies(image.info);
             image.DownloadMemory(map, copies);
-            runtime.Finish();
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
+            gc_download_bytes += image.unswizzled_size_bytes;
+            gc_downloads.push_back(GcDownload{image.gpu_addr, image.info, map, std::move(copies)});
+            immediate_delete = false;
             ++gc_download_deletes;
         }
         if (True(image.flags & ImageFlagBits::Tracked)) {
@@ -175,7 +212,7 @@ void TextureCache<P>::RunGarbageCollector() {
         }
         ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
         UnregisterImage(image_id);
-        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+        DeleteImage(image_id, immediate_delete);
         if (aggressive_mode && total_used_memory < critical_memory) {
             num_iterations >>= 2;
             aggressive_mode = false;
@@ -251,6 +288,7 @@ void TextureCache<P>::RunGarbageCollector() {
         Configure(true);
         Collect();
     }
+    flush_downloads();
 }
 
 template <class P>
