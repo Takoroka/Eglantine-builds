@@ -3629,11 +3629,14 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
         if (False(image.flags & ImageFlagBits::Tracked)) {
             TrackImage(image, image_id);
         }
-    } else {
+    } else if (True(image.flags & ImageFlagBits::CpuModified)) {
+        // Every texture of every draw comes here: test the flag before the call.
         RefreshContents(image, image_id);
         if (!image.aliased_images.empty()) {
             SynchronizeAliases(image_id);
         }
+    } else if (!image.aliased_images.empty()) {
+        SynchronizeAliases(image_id);
     }
     if (is_modification) {
         if constexpr (requires { &Image::BackTilesWhole; }) {
@@ -3671,7 +3674,11 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
         }
         MarkModification(image);
     }
-    lru_cache.Touch(image.lru_index, frame_tick);
+    // Once a frame is enough (the item's tick is the frame); the pool item is a cache miss away.
+    if (image.lru_touch_tick != frame_tick) {
+        image.lru_touch_tick = frame_tick;
+        lru_cache.Touch(image.lru_index, frame_tick);
+    }
 }
 
 template <class P>
