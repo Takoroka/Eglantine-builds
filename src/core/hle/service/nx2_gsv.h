@@ -1847,6 +1847,9 @@ private:
     // present faster than that. Every slot is reported free here: hold each present until the
     // next vblank instead (title 4 ran at up to 160 fps, its timing and audio with it).
     std::chrono::steady_clock::time_point m_next_vblank{};
+    std::chrono::steady_clock::time_point m_previous_release{};
+    std::chrono::nanoseconds m_previous_gap{}; // between the last two presents' returns
+    std::chrono::nanoseconds m_frame_debt{};   // how far frame times ran past their intervals
     u32 m_swap_word{};
 
     // timing: present word 12, (swap interval << 16) | refresh rate. Fire Emblem: Fortune's Weave
@@ -1892,7 +1895,21 @@ private:
         const auto interval = std::chrono::nanoseconds{
             100'000'000'000LL * swap_interval / refresh_rate / Settings::SpeedLimit()};
         const auto now = std::chrono::steady_clock::now();
-        if (now > m_next_vblank + interval) {
+        // An interval above one is a frame rate only while the game keeps up. Mario Kart World
+        // picks its interval each frame from how far its frame times ran past the vblanks it asked
+        // for (debt += last frame time - interval vblanks, at most 4 vblanks; interval = 1 + debt
+        // / vblank, at most 2) and advances its clock by the interval: interval 2 there means
+        // "behind, catch up". Holding those presents for two vblanks made the next frame time
+        // match the interval, so the debt never shrank and the game kept asking for two. Keep the
+        // same debt and hold one vblank while it says the game is behind; a game that runs at
+        // 30 fps on time (Fire Emblem: Fortune's Weave) still gets two.
+        const auto vblank = interval / swap_interval;
+        if (m_previous_release != std::chrono::steady_clock::time_point{}) {
+            m_frame_debt = std::clamp(m_frame_debt + m_previous_gap - interval, -4 * vblank, 4 * vblank);
+        }
+        const bool catching_up = swap_interval > 1 && forced_interval == 0 && m_frame_debt >= -vblank;
+        const auto hold = catching_up ? vblank : interval;
+        if (now > m_next_vblank + hold) {
             // Running slower than the swap interval: show at once and don't bank the lost time.
             m_next_vblank = now;
         } else if (now < m_next_vblank) {
@@ -1903,7 +1920,12 @@ private:
             static_cast<void>(Kernel::GetCurrentThread(kernel).Sleep(
                 kernel, kernel.HardwareTimer().GetTick() + wait.count() + 2));
         }
-        m_next_vblank += interval;
+        m_next_vblank += hold;
+        const auto released = std::chrono::steady_clock::now();
+        if (m_previous_release != std::chrono::steady_clock::time_point{}) {
+            m_previous_gap = std::chrono::duration_cast<std::chrono::nanoseconds>(released - m_previous_release);
+        }
+        m_previous_release = released;
     }
 
     /// Waits until the fence is reached. With `unless_gpu_waits`, gives up after a few ms once a
