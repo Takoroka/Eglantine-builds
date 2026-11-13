@@ -7,8 +7,11 @@
 #pragma once
 
 #include <array>
+#include <bit>
+#include <unordered_map>
 
 #include <sirit/sirit.h>
+#include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
 
 #include "shader_recompiler/backend/bindings.h"
@@ -173,8 +176,11 @@ public:
     [[nodiscard]] Id BitOffset8(const IR::Value& offset);
     [[nodiscard]] Id BitOffset16(const IR::Value& offset);
 
+    // Sirit deduplicates constants by building and hashing their instruction words, on every
+    // immediate operand. The scalar ones remember the id Sirit returned instead: the same id, so
+    // the module is the same.
     Id Const(u32 value) {
-        return Constant(U32[1], value);
+        return CachedConstant(u32_constants, U32[1], value, value);
     }
 
     Id Const(u32 element_1, u32 element_2) {
@@ -191,7 +197,7 @@ public:
     }
 
     Id SConst(s32 value) {
-        return Constant(S32[1], value);
+        return CachedConstant(s32_constants, S32[1], static_cast<u32>(value), value);
     }
 
     Id SConst(s32 element_1, s32 element_2) {
@@ -208,7 +214,8 @@ public:
     }
 
     Id Const(f32 value) {
-        return Constant(F32[1], value);
+        // Keyed by bit pattern, as Sirit compares them: 0.0 and -0.0 stay apart.
+        return CachedConstant(f32_constants, F32[1], std::bit_cast<u32>(value), value);
     }
 
     const Profile& profile;
@@ -412,6 +419,21 @@ public:
     bool uses_nonuniform_storage_texel_buffer{};
 
 private:
+    template <typename T>
+    Id CachedConstant(::Common::unordered_map<u32, Id>& ids, Id type, u32 bits, T value) {
+        if (const auto it{ids.find(bits)}; it != ids.end()) {
+            return it->second;
+        }
+        const Id id{Constant(type, value)};
+        ids.emplace(bits, id);
+        return id;
+    }
+
+    /// Scalar constant ids by bit pattern, one map per type.
+    ::Common::unordered_map<u32, Id> u32_constants;
+    ::Common::unordered_map<u32, Id> s32_constants;
+    ::Common::unordered_map<u32, Id> f32_constants;
+
     void DefineCommonTypes(const Info& info);
     void DefineCommonConstants();
     void DefineInterfaces(const IR::Program& program);
