@@ -1759,8 +1759,25 @@ private:
                                    app_program_id == OcarinaOfTimeProgramId)) {
             frames_ahead = 0;
         }
+        // Mario Kart World cycles three present images, as the console lets it: its compositor
+        // frees a buffer once the frame two presents back has passed its fence, so the game
+        // builds frame N+1 while the GPU still runs frame N. Waiting here for this frame made the
+        // game and the GPU thread take turns (the present waited ~3.8 ms on the fence, then the
+        // GPU thread sat idle waiting for the next frame's command lists): wait for the previous
+        // frame only. Hyrule Warriors: Age of Imprisonment waits for its present images on the GPU
+        // (nvnQueueWaitSync after nvnWindowAcquireTexture), never on the CPU, so only this wait
+        // kept its CPU and GPU taking turns. The GPU-side wait isn't visible here (the replies
+        // hand out no fence for it), so this goes by title. Not for every title: Splatoon Raiders
+        // reuses its command memory as if the GPU were at most a frame behind (below).
+        constexpr u64 HyruleWarriorsAgeOfImprisonmentProgramId = 0x04003F40232DE000ULL;
+        const bool previous_frame_only =
+            frames_ahead == -1 && (app_program_id == Settings::MarioKartWorldProgramId ||
+                                   app_program_id == HyruleWarriorsAgeOfImprisonmentProgramId);
         const auto entered = std::chrono::steady_clock::now();
-        if (frames_ahead == 1 || (frames_ahead == -1 && !WaitForFrame(~w[22], w[24], true))) {
+        if (previous_frame_only) {
+            WaitForFrame(m_previous_fence_id, m_previous_fence_value);
+        } else if (frames_ahead == 1 ||
+                   (frames_ahead == -1 && !WaitForFrame(~w[22], w[24], true))) {
             LOG_DEBUG(Service, "nx2:vi2 present #{} fence ({}, {:#x}), waiting for ({}, {:#x}); now {:#x}",
                       m_presents, ~w[22], w[24], m_previous_fence_id, m_previous_fence_value,
                       ~w[22] < 192 ? system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(~w[22]) : 0U);
