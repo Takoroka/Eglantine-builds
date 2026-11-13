@@ -487,6 +487,21 @@ void SsaRewritePass(IR::Program& program) {
             }
         }
     }
+    // The replaced reads (and trivial phis a cycle read) stay as identities; every pass until
+    // dead code elimination walks those without uses. Remove them now, in the order dead code
+    // elimination visits instructions (post order, each block from its end), so it finds the
+    // same instructions dead as it would have.
+    for (IR::Block* const block : program.post_order_blocks) {
+        IR::Block::InstructionList& list{block->Instructions()};
+        auto it{list.end()};
+        while (it != list.begin()) {
+            --it;
+            if (it->GetOpcode() == IR::Opcode::Identity && !it->HasUses()) {
+                it->Invalidate();
+                it = list.erase(it);
+            }
+        }
+    }
 }
 
 } // namespace Shader::Optimization
