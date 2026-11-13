@@ -864,6 +864,24 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                      regs.blend.enable[0], seen.size());
         }
     }
+    // A draw with no vertices (after the quad conversion) or no instances draws nothing: it
+    // returns before the pipeline, buffer and descriptor setup and records nothing. What that
+    // setup would have applied stays pending for the next draw or clear: dirty flags, constant
+    // buffer changes, a deferred clear (realized at the next render pass request or end) and the
+    // sample counter's state. Task/mesh draws draw their group count whatever the instance
+    // count, and transform feedback draws still go through.
+    {
+        const auto& regs = maxwell3d->regs;
+        const bool no_vertices =
+            MakeDrawParams(maxwell3d->draw_manager.draw_state, instance_count, is_indexed)
+                .num_vertices == 0;
+        const bool no_instances = instance_count == 0;
+        if ((no_vertices || (no_instances && !regs.IsMeshEnabled())) &&
+            regs.transform_feedback_enabled == 0) {
+            gpu.TickWork();
+            return;
+        }
+    }
     PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
         const auto& draw_state = maxwell3d->draw_manager.draw_state;
         const u32 num_instances{instance_count};
