@@ -775,20 +775,13 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     }
 
     bool dispatched = true;
-    try {
-        rasterizer->DispatchCompute();
-        diag_note("ok");
-    } catch (const Shader::Exception& error) {
-        diag_note("failed", error.what());
-        static std::unordered_set<std::string> logged;
-        if (logged.insert(error.what()).second) {
-            LOG_ERROR(HW_GPU, "Native compute shader rejected: {}", error.what());
-        }
+    // A dispatch of a rejected program, by the error it was rejected with. A value is what the
+    // launch returns at once.
+    const auto rejected = [&](std::string_view error) -> std::optional<bool> {
         dispatched = false;
         if (dlss_chain.active) {
             ++dlss_chain.rejected;
-        } else if (std::string_view{error.what()}.find("matrix multiply") !=
-                   std::string_view::npos) {
+        } else if (error.find("matrix multiply") != std::string_view::npos) {
             DescribeNativeResources(qmd);
             // The console runs this on tensor cores; stand in with a plain upscale of its input.
             if (UpscaleInsteadOfNativeProgram()) {
@@ -796,6 +789,31 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
             }
             FollowPhotoUpscale();
             return UpscaleFromConstBuffers();
+        }
+        return std::nullopt;
+    };
+    const std::string* skipped_rejection{};
+    try {
+        skipped_rejection = rasterizer->DispatchCompute();
+        if (!skipped_rejection) {
+            diag_note("ok");
+        }
+    } catch (const Shader::Exception& error) {
+        diag_note("failed", error.what());
+        static std::unordered_set<std::string> logged;
+        if (logged.insert(error.what()).second) {
+            LOG_ERROR(HW_GPU, "Native compute shader rejected: {}", error.what());
+        }
+        if (const std::optional<bool> result = rejected(error.what())) {
+            return *result;
+        }
+    }
+    if (skipped_rejection) {
+        // The program was rejected at an earlier dispatch (and logged then): the rasterizer
+        // skipped it without throwing the error again.
+        diag_note("failed", *skipped_rejection);
+        if (const std::optional<bool> result = rejected(*skipped_rejection)) {
+            return *result;
         }
     }
     if (dispatched && !dlss_chain.active && photo_upscale.window_left != 0) {

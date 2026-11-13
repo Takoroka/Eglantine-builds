@@ -1250,7 +1250,7 @@ bool SyncFixEnabled() {
 }
 } // namespace
 
-void RasterizerVulkan::DispatchCompute() {
+const std::string* RasterizerVulkan::DispatchCompute() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
     FlushWork();
     gpu_memory->FlushCaching();
@@ -1262,13 +1262,16 @@ void RasterizerVulkan::DispatchCompute() {
     u64 native_key{};
     ComputePipeline* const pipeline{pipeline_cache.CurrentComputePipeline(native_key)};
     if (!pipeline) {
+        if (const std::string* const rejection = pipeline_cache.ComputeRejection()) {
+            return rejection;
+        }
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute pipeline unavailable");
-        return;
+        return nullptr;
     }
     if (pipeline->SkipsDispatches()) {
         // A software matrix pipeline AMD's compiler is still building where nothing waits for it
         // (PipelineCache matrix_workers): its dispatches are skipped until it exists.
-        return;
+        return nullptr;
     }
     std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};
     // Command list pages the dispatch writes are copied for the split's front right after it.
@@ -1279,7 +1282,7 @@ void RasterizerVulkan::DispatchCompute() {
     if (!pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
                              texture_cache)) {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
-        return;
+        return nullptr;
     }
     const auto& qmd{kepler_compute->launch_description};
     const auto publish_collision_map = [&] {
@@ -1372,12 +1375,12 @@ void RasterizerVulkan::DispatchCompute() {
         });
         SubmitNx2ListCopies();
         publish_collision_map();
-        return;
+        return nullptr;
     }
     const std::array<u32, 3> dim{qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z};
     const std::array<u32, 3> max_dim{device.GetMaxComputeWorkGroupCount()};
     if (dim[0] > max_dim[0] || dim[1] > max_dim[1] || dim[2] > max_dim[2]) {
-        return;
+        return nullptr;
     }
     scheduler.RequestOutsideRenderPassOperationContext();
     record_read_barrier();
@@ -1398,6 +1401,7 @@ void RasterizerVulkan::DispatchCompute() {
         GPU::Logging::GPULogger::GetInstance().LogVulkanCall(
             "vkCmdDispatch", params, VK_SUCCESS);
     }
+    return nullptr;
 }
 
 void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {

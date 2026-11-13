@@ -10,6 +10,7 @@
 #include <functional>
 #include <optional>
 #include <span>
+#include <string>
 #include <utility>
 #include "common/common_types.h"
 #include "common/polyfill_thread.h"
@@ -59,8 +60,10 @@ public:
     /// Clear the current framebuffer
     virtual void Clear(u32 layer_count) = 0;
 
-    /// Dispatches a compute shader invocation
-    virtual void DispatchCompute() = 0;
+    /// Dispatches a compute shader invocation. A native program rejected at an earlier dispatch
+    /// is skipped without its error being thrown again: the return is that error's text, which
+    /// lives as long as the rasterizer (nullptr otherwise).
+    virtual const std::string* DispatchCompute() = 0;
 
     /// Resets the counter of a query
     virtual void ResetCounter(VideoCommon::QueryType type) = 0;
