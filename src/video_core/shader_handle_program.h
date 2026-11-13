@@ -39,4 +39,12 @@ u32 EvaluateTextureHandle(const Shader::Info& info, u32 program, Tegra::MemoryMa
         .value_or(0U);
 }
 
+/// Whether the handle word at `offset` of a texture array (`count` > 1) lies past the end of its
+/// bound constant buffer (`size` bytes, 0 = unknown). The GPU reads 0 there, not the guest memory
+/// behind the buffer; a 256-element handle table can reach past the real table and past a short
+/// buffer.
+[[nodiscard]] inline bool PastBoundBuffer(u32 count, u32 offset, u32 size) {
+    return count > 1 && size != 0 && offset + sizeof(u32) > size;
+}
+
 } // namespace VideoCommon

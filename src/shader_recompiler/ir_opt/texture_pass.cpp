@@ -611,10 +611,13 @@ bool IsMemoryLoad(IR::Opcode opcode) {
 }
 
 // Most elements a handle table descriptor gets: its index comes from memory per pixel, so the
-// translation can't bound it. 33: Kirby Air Riders' race keeps its current shadow cascade at
-// element 32 (c5@0x200); with 32 elements that index fell on the last element or the per-draw
-// overflow element (black Kirby, dark shaded ground).
-constexpr u32 HANDLE_TABLE_MAX_COUNT = 33;
+// translation can't bound it. Kirby Air Riders' c4 table lists per-region textures (two BC6H maps
+// and a 32x32 probe array per region, about 197 handles in a race) in an order that changes from
+// race to race; its probe computes (6a61383eab76058c, dfd4c8e0055065fd) index it per object, and
+// its lit materials index the c5-c7 tables (shadow maps and more) past element 32 too. With 33
+// elements every index past 32 read element 32, another texture: dark or over-bright ground and
+// Kirby, about 1 race in 9 right. With 256, every race is lit.
+constexpr u32 HANDLE_TABLE_MAX_COUNT = 256;
 
 // The log2 of one table offset's element stride: a power-of-two number of 8-byte handle words,
 // `index << k` (k >= 3) or `index * m` (m = 8 << j). Anything else (a 4-byte stride, a 24-byte
