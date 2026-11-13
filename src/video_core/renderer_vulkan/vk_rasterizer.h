@@ -262,6 +262,11 @@ private:
 
     u32 draw_counter = 0;
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
+
+    /// Dirty flags the dynamic state updates consume on this device (UpdateDynamicStates)
+    Tegra::Engines::Maxwell3D::DirtyState::Flags dynamic_state_flags;
+    /// The dynamic state updates run every draw (AMD's logic op workaround)
+    bool always_update_dynamic_state;
 };
 
 } // namespace Vulkan

@@ -253,6 +253,53 @@ bool IsPrimitiveRestartSupported(const Device& device, VkPrimitiveTopology topol
 namespace {
 // EDEN_NX2_DIAG_SAMPLES: the occlusion query pool of the draw probe (created on first use).
 vk::QueryPool* g_diag_pool{};
+
+// The dirty flags the updates in RasterizerVulkan::UpdateDynamicStates consume on this device
+// (see there). Per rasterizer: the device and its dynamic state settings can differ per boot.
+Tegra::Engines::Maxwell3D::DirtyState::Flags MakeDynamicStateFlags(const Device& device) {
+    Tegra::Engines::Maxwell3D::DirtyState::Flags mask;
+    const auto add = [&mask](std::initializer_list<size_t> indices) {
+        for (const size_t index : indices) {
+            mask[index] = true;
+        }
+    };
+    add({Dirty::Viewports, VideoCommon::Dirty::RescaleViewports, Dirty::Scissors,
+         VideoCommon::Dirty::RescaleScissors, Dirty::DepthBias,
+         VideoCommon::Dirty::DepthBiasGlobal, Dirty::BlendConstants, Dirty::DepthBounds,
+         Dirty::StencilProperties, Dirty::LineWidth});
+    if (device.IsExtExtendedDynamicStateSupported()) {
+        add({Dirty::CullMode, Dirty::DepthCompareOp, Dirty::FrontFace, Dirty::StencilOp,
+             Dirty::StateEnable});
+    }
+    if (device.IsExtExtendedDynamicState2Supported()) {
+        add({Dirty::PrimitiveRestartEnable, Dirty::RasterizerDiscardEnable,
+             Dirty::DepthBiasEnable});
+    }
+    if (device.IsExtExtendedDynamicState2ExtrasSupported()) {
+        add({Dirty::LogicOp});
+    }
+    if (device.IsExtExtendedDynamicState3EnablesSupported()) {
+        add({Dirty::LogicOpEnable, Dirty::DepthClampEnable, Dirty::LineRasterizationMode,
+             Dirty::LineStippleEnable, Dirty::ConservativeRasterizationMode,
+             Dirty::AlphaToCoverageEnable, Dirty::AlphaToOneEnable});
+    }
+    if (device.IsExtExtendedDynamicState3BlendingSupported()) {
+        add({Dirty::Blending});
+    } else if (device.IsExtColorWriteEnableSupported()) {
+        add({Dirty::ColorMask});
+    }
+    if (device.IsExtVertexInputDynamicStateSupported()) {
+        add({Dirty::VertexInput, VideoCommon::Dirty::VertexBuffers});
+    }
+    return mask;
+}
+
+// AMD's logic op workaround in UpdateDynamicStates rewrites a register every draw.
+bool AlwaysUpdateDynamicStates(const Device& device) {
+    const VkDriverIdKHR driver = device.GetDriverID();
+    return device.IsExtExtendedDynamicState3EnablesSupported() &&
+           (driver == VK_DRIVER_ID_AMD_OPEN_SOURCE || driver == VK_DRIVER_ID_AMD_PROPRIETARY);
+}
 } // Anonymous namespace
 
 RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra::GPU& gpu_,
@@ -283,7 +330,9 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       accelerate_dma(buffer_cache, texture_cache, scheduler),
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
       frame_dump(device, memory_allocator, scheduler),
-      wfi_event(device.GetLogical().CreateEvent()) {
+      wfi_event(device.GetLogical().CreateEvent()),
+      dynamic_state_flags{MakeDynamicStateFlags(device)},
+      always_update_dynamic_state{AlwaysUpdateDynamicStates(device)} {
     scheduler.SetQueryCache(query_cache);
     buffer_cache.SetPendingCpuWrites(
         [this](const std::function<void(DAddr, size_t)>& callback) {
@@ -2096,6 +2145,15 @@ void RasterizerVulkan::UpdateDynamicStates() {
     if (topology_changed) {
         flags[Dirty::DepthBiasEnable] = true;
         flags[Dirty::PrimitiveRestartEnable] = true;
+    }
+
+    // Each update below does nothing while its dirty flags are clear, so a draw that left all of
+    // them clear (most draws) skips the ~25 checks. The mask holds only flags an update this
+    // device runs consumes: one nothing consumes would stay set and the skip would never happen.
+    // Registers that set a flag under StencilProperties, StateEnable or Blending set that flag too.
+    // AMD's logic op workaround below rewrites a register every draw, so it always runs there.
+    if (!topology_changed && !always_update_dynamic_state && (flags & dynamic_state_flags).none()) {
+        return;
     }
 
     UpdateViewportsState(regs);
