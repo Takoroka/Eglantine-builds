@@ -106,6 +106,22 @@ void ComputePipeline::Configure() {
     const auto& cbufs{qmd.const_buffer_config};
     const bool via_header_index{qmd.linked_tsc != 0};
     const auto read_handle{[&](const auto& desc, u32 index) {
+        if constexpr (requires { desc.overflow_program; }) {
+            // A lone handle table's last element is this dispatch's own handle (the plain
+            // search's handle program).
+            if (desc.overflow_program != ~0U && index + 1 == desc.count) {
+                return TexturePair(VideoCommon::EvaluateTextureHandle(
+                                       info, desc.overflow_program, *gpu_memory,
+                                       [&](u32 cbuf) -> GPUVAddr {
+                                           return cbuf < cbufs.size() &&
+                                                          ((qmd.const_buffer_enable_mask >> cbuf) &
+                                                           1) != 0
+                                                      ? cbufs[cbuf].Address()
+                                                      : GPUVAddr{};
+                                       }),
+                                   via_header_index);
+            }
+        }
         if (desc.handle_program != ~0U) {
             // Read by the shader from a storage buffer: computed for this dispatch.
             return TexturePair(VideoCommon::EvaluateTextureHandle(
@@ -127,7 +143,11 @@ void ComputePipeline::Configure() {
                       std::is_same_v<decltype(desc), const Shader::TextureBufferDescriptor&>) {
             if (desc.has_secondary) {
                 ASSERT(((qmd.const_buffer_enable_mask >> desc.secondary_cbuf_index) & 1) != 0);
-                const u32 secondary_offset{desc.secondary_cbuf_offset + index_offset};
+                u32 secondary_index_offset{index_offset};
+                if constexpr (requires { desc.secondary_fixed; }) {
+                    secondary_index_offset = desc.secondary_fixed ? 0 : index_offset;
+                }
+                const u32 secondary_offset{desc.secondary_cbuf_offset + secondary_index_offset};
                 const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].Address() +
                                              secondary_offset};
                 const u32 lhs_raw{gpu_memory->Read<u32>(addr) << desc.shift_left};

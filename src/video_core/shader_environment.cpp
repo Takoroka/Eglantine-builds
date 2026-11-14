@@ -1043,9 +1043,30 @@ u32 FileEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
     return it->second;
 }
 
+namespace {
+// A texture's type and pixel format come from its TIC entry, the handle's low 20 bits
+// (independent sampler binding); the sampler bits above don't change them. The texture pass
+// queries one handle per constant buffer slot, the first in an unstable sort, so which of a slot's
+// handles (texture word alone, or ORed with a sampler word) a cache recorded depends on the other
+// texture instructions, which handle tables change. A handle that is missing is answered from a
+// recorded one with the same TIC index, from the same recording.
+template <typename Map>
+const typename Map::mapped_type* FindSameTic(const Map& map, u32 handle) {
+    for (const auto& [key, value] : map) {
+        if ((key & 0xfffff) == (handle & 0xfffff)) {
+            return &value;
+        }
+    }
+    return nullptr;
+}
+} // Anonymous namespace
+
 Shader::TextureType FileEnvironment::ReadTextureType(u32 handle) {
     const auto it{texture_types.find(handle)};
     if (it == texture_types.end()) {
+        if (const auto* const same_tic{FindSameTic(texture_types, handle)}) {
+            return *same_tic;
+        }
         throw Shader::LogicError("Uncached read texture type");
     }
     return it->second;
@@ -1054,6 +1075,9 @@ Shader::TextureType FileEnvironment::ReadTextureType(u32 handle) {
 Shader::TexturePixelFormat FileEnvironment::ReadTexturePixelFormat(u32 handle) {
     const auto it{texture_pixel_formats.find(handle)};
     if (it == texture_pixel_formats.end()) {
+        if (const auto* const same_tic{FindSameTic(texture_pixel_formats, handle)}) {
+            return *same_tic;
+        }
         throw Shader::LogicError("Uncached read texture pixel format");
     }
     return it->second;
