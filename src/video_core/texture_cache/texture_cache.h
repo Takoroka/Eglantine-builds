@@ -2823,6 +2823,11 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         join_alias_indices.emplace(aliased_id, alias_index);
         new_image.flags |= ImageFlagBits::Alias;
     }
+    if (!new_image_base.aliased_images.empty()) {
+        // The alias copies below can make an aliased image's newest data this image's: a view
+        // memoized before it was made must be looked up again (FillImageViews' memo starts over).
+        ++alias_copy_epoch;
+    }
     for (const ImageId aliased_id : join_bad_overlap_ids) {
         ImageBase& aliased = slot_images[aliased_id];
         aliased.overlapping_images.push_back(new_image_id);
