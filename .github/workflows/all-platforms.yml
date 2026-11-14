@@ -1,0 +1,76 @@
+name: all-platforms
+run-name: all platforms ${{ inputs.refspec }} ${{ inputs.sha }}
+
+# Manual test builds of a given commit for every platform, artifacts only (no release job).
+# It calls Eglantine's own reusable platform workflows, copied unchanged from the source tree:
+# Linux x86_64 + aarch64 (GCC, plus the clang PGO variants with pgo=both), Windows (MSVC, plus the
+# MinGW clang PGO build with pgo=both) and macOS (arm64, clang). Each uploads its binaries as artifacts.
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Full commit SHA to build
+        type: string
+        required: true
+      version:
+        description: Version label embedded in the build
+        type: string
+        required: true
+      refspec:
+        type: string
+        required: true
+      tag:
+        type: string
+        required: true
+      pgo:
+        description: none or both (both adds the clang PGO builds on Linux and Windows)
+        type: choice
+        options: [both, none]
+        default: both
+      platforms:
+        type: choice
+        options: [all, linux, windows, macos]
+        default: all
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux
+    if: inputs.platforms == 'all' || inputs.platforms == 'linux'
+    uses: ./.github/workflows/build-linux.yml
+    with:
+      sha: ${{ inputs.sha }}
+      version: ${{ inputs.version }}
+      refspec: ${{ inputs.refspec }}
+      tag: ${{ inputs.tag }}
+      release: false
+      nightly: false
+      pgo: ${{ inputs.pgo }}
+
+  windows:
+    name: Windows
+    if: inputs.platforms == 'all' || inputs.platforms == 'windows'
+    uses: ./.github/workflows/build-windows.yml
+    with:
+      sha: ${{ inputs.sha }}
+      version: ${{ inputs.version }}
+      refspec: ${{ inputs.refspec }}
+      tag: ${{ inputs.tag }}
+      release: false
+      nightly: false
+      pgo: ${{ inputs.pgo }}
+
+  macos:
+    name: macOS
+    if: inputs.platforms == 'all' || inputs.platforms == 'macos'
+    uses: ./.github/workflows/build-macos.yml
+    with:
+      sha: ${{ inputs.sha }}
+      version: ${{ inputs.version }}
+      refspec: ${{ inputs.refspec }}
+      tag: ${{ inputs.tag }}
+      release: false
+      nightly: false
+      runner: macos-15
