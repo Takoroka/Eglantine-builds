@@ -12,6 +12,9 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <string>
+#include <string_view>
+#include <unordered_set>
 #include "common/container/unordered_map.h"
 #include <utility>
 #include <vector>
@@ -89,6 +92,12 @@ public:
     /// Native program key of the bound compute program, 0 when unknown, for the frame dump.
     [[nodiscard]] u64 ComputeNativeKey();
 
+    /// The error text of the rejected native program the last ComputeShader() call skipped,
+    /// nullptr when it skipped none. The text lives as long as the cache.
+    [[nodiscard]] const std::string* ComputeRejection() const noexcept {
+        return compute_rejection;
+    }
+
 protected:
     struct GraphicsEnvironments {
         std::array<GraphicsEnvironment, NUM_PROGRAMS> envs;
@@ -107,7 +116,8 @@ protected:
     bool RefreshStages(std::array<u64, NUM_PROGRAMS>& unique_hashes);
 
     /// @brief Returns information about the current compute shader
-    /// @return Pointer to a valid shader, nullptr on error
+    /// @return Pointer to a valid shader, nullptr on error. A native program rejected before
+    ///         returns nullptr without its error being thrown again (see ComputeRejection).
     const ShaderInfo* ComputeShader();
 
     /// @brief Collect the current graphics environments
@@ -167,8 +177,10 @@ private:
     void RethrowIfRejected(VAddr addr);
     /// Whether a native program at this address was rejected.
     bool IsRejected(VAddr addr);
-    /// Remembers the exception being handled as this address's rejection.
-    void RememberRejection(VAddr addr);
+    /// The text of the error a native program at this address was rejected with, if any.
+    const std::string* RejectionText(VAddr addr);
+    /// Remembers the exception being handled, with its text, as this address's rejection.
+    void RememberRejection(VAddr addr, std::string_view text);
     /// Hash of the state task and mesh programs are translated with.
     u64 MeshStateHash() const;
 
@@ -182,13 +194,22 @@ private:
     std::vector<std::unique_ptr<ShaderInfo>> storage;
     std::vector<Entry*> marked_for_removal;
 
-    /// Native programs the lowering rejected, by address, so each draw or dispatch rethrows the
+    struct Rejection {
+        std::exception_ptr error;
+        const std::string* text; ///< In rejection_texts
+    };
+
+    /// Native programs the lowering rejected, by address, so each draw or dispatch fails with the
     /// first error instead of lowering again; dropped when guest memory there is written.
     std::mutex rejected_mutex;
-    ::Common::unordered_map<u64, std::exception_ptr> rejected_native;
+    ::Common::unordered_map<u64, Rejection> rejected_native;
+    /// Every rejection's error text, kept for the cache's life (a few: one per distinct error).
+    std::unordered_set<std::string> rejection_texts;
     /// Bounds of every address ever rejected (never shrinks): a quick test for invalidations.
     std::atomic<VAddr> rejected_lowest{~VAddr{}};
     std::atomic<VAddr> rejected_highest{};
+    /// What ComputeRejection returns.
+    const std::string* compute_rejection{};
 };
 
 } // namespace VideoCommon

@@ -394,11 +394,11 @@ void RasterizerOpenGL::DrawTexture() {
     ++num_queued_commands;
 }
 
-void RasterizerOpenGL::DispatchCompute() {
+const std::string* RasterizerOpenGL::DispatchCompute() {
     gpu_memory->FlushCaching();
     ComputePipeline* const pipeline{shader_cache.CurrentComputePipeline()};
     if (!pipeline) {
-        return;
+        return shader_cache.ComputeRejection();
     }
     if (pipeline->UsesLocalMemory()) {
         program_manager.LocalMemoryWarmup();
@@ -415,11 +415,12 @@ void RasterizerOpenGL::DispatchCompute() {
             buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
         glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, buffer->Handle());
         glDispatchComputeIndirect(static_cast<GLintptr>(offset));
-        return;
+        return nullptr;
     }
     glDispatchCompute(qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z);
     ++num_queued_commands;
     has_written_global_memory |= pipeline->WritesGlobalMemory();
+    return nullptr;
 }
 
 void RasterizerOpenGL::ResetCounter(VideoCommon::QueryType type) {

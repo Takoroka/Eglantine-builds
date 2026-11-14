@@ -34,8 +34,9 @@ struct ShaderCacheTestAccess {
         cache.Register(std::move(data), address, 0x100);
     }
     static void Reject(ShaderCache& cache, VAddr address) {
-        cache.rejected_native.emplace(address,
-                                      std::make_exception_ptr(std::runtime_error{"rejected"}));
+        cache.rejected_native.emplace(
+            address, ShaderCache::Rejection{std::make_exception_ptr(std::runtime_error{"rejected"}),
+                                            nullptr});
     }
     static bool IsRejected(ShaderCache& cache, VAddr address) {
         return cache.IsRejected(address);

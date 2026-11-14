@@ -24,7 +24,9 @@ RasterizerNull::~RasterizerNull() = default;
 void RasterizerNull::Draw(bool is_indexed, u32 instance_count) {}
 void RasterizerNull::DrawTexture() {}
 void RasterizerNull::Clear(u32 layer_count) {}
-void RasterizerNull::DispatchCompute() {}
+const std::string* RasterizerNull::DispatchCompute() {
+    return nullptr;
+}
 void RasterizerNull::ResetCounter(VideoCommon::QueryType type) {}
 void RasterizerNull::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                            VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) {
