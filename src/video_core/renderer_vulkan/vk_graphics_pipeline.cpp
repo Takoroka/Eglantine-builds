@@ -414,6 +414,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
     const auto& regs{maxwell3d->regs};
     const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
+    // Texture handles of a draw sit together in its constant buffers: one translation a page.
+    VideoCommon::GuestPageCache handle_pages;
     const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         const Shader::Info& info{stage_infos[stage]};
         buffer_cache.UnbindGraphicsStorageBuffers(stage);
@@ -459,15 +461,20 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                     const u32 second_offset{desc.secondary_cbuf_offset + second_index_offset};
                     const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].address +
                                                  second_offset};
-                    const u32 lhs_raw{(past_end ? 0U : gpu_memory->Read<u32>(addr))
-                                      << desc.shift_left};
-                    const u32 rhs_raw{gpu_memory->Read<u32>(separate_addr)
-                                      << desc.secondary_shift_left};
+                    const u32 lhs_raw{
+                        (past_end ? 0U
+                                  : VideoCommon::ReadHandleWord(handle_pages, *gpu_memory, addr))
+                        << desc.shift_left};
+                    const u32 rhs_raw{
+                        VideoCommon::ReadHandleWord(handle_pages, *gpu_memory, separate_addr)
+                        << desc.secondary_shift_left};
                     const u32 raw{lhs_raw | rhs_raw};
                     return TexturePair(raw, via_header_index);
                 }
             }
-            return TexturePair(past_end ? 0U : gpu_memory->Read<u32>(addr), via_header_index);
+            return TexturePair(
+                past_end ? 0U : VideoCommon::ReadHandleWord(handle_pages, *gpu_memory, addr),
+                via_header_index);
         }};
         const auto add_image{[&](const auto& desc, bool blacklist) LAMBDA_FORCEINLINE {
             for (u32 index = 0; index < desc.count; ++index) {
