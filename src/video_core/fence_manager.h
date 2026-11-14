@@ -114,7 +114,10 @@ public:
             func();
         }
         fences.push(std::move(new_fence));
-        if (should_flush) {
+        // Where queueing a fence submits (Vulkan), flushing again sends an empty command buffer
+        // when the flush isn't deferred (split off, or over 500 us since the last flush), and
+        // otherwise only marks a flush pending that the fence's own submit already covers.
+        if (should_flush && !Traits::QUEUE_SUBMITS) {
             rasterizer.FlushCommands();
         }
         if constexpr (can_async_check) {
