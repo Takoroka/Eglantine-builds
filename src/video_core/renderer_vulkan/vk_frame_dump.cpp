@@ -343,10 +343,10 @@ std::optional<FrameDump::Target> FrameDump::MakeTarget(ImageView& view, u32 slot
         .image = image->Handle(),
         .format =
             BytesPerBlock(view.format) == BytesPerBlock(info.format) ? view.format : info.format,
-        .width = std::max(1U, width >> level),
-        .height = std::max(1U, height >> level),
+        .width = (std::max)(1U, width >> level),
+        .height = (std::max)(1U, height >> level),
         .depth =
-            info.type == VideoCommon::ImageType::e3D ? std::max(1U, info.size.depth >> level) : 1U,
+            info.type == VideoCommon::ImageType::e3D ? (std::max)(1U, info.size.depth >> level) : 1U,
         .level = view.range.base.level,
         .layer = info.type == VideoCommon::ImageType::e3D ? 0 : view.range.base.layer,
         .gpu_addr = image->gpu_addr,
@@ -821,8 +821,8 @@ void FrameDump::Write(const Job& job) {
                     ++infs[c];
                     finite = false;
                 } else {
-                    lo[c] = std::min(lo[c], value);
-                    hi[c] = std::max(hi[c], value);
+                    lo[c] = (std::min)(lo[c], value);
+                    hi[c] = (std::max)(hi[c], value);
                     sum[c] += value;
                 }
             }

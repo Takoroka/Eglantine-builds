@@ -92,7 +92,7 @@ using SelectClock = std::chrono::steady_clock;
 /// When a wait bounded by a socket timeout in milliseconds ends; never for 0, no timeout.
 SelectClock::time_point TimeoutDeadline(u32 timeout_ms) {
     if (timeout_ms == 0) {
-        return SelectClock::time_point::max();
+        return (SelectClock::time_point::max)();
     }
     return SelectClock::now() + std::chrono::milliseconds{timeout_ms};
 }
@@ -313,7 +313,7 @@ struct BSD_USA::SelectRequest {
     /// For a Poll: its pollfds as the guest sent them.
     std::vector<PollFD> pollfds;
     /// SelectClock::time_point::max() for no timeout.
-    SelectClock::time_point deadline = SelectClock::time_point::max();
+    SelectClock::time_point deadline = (SelectClock::time_point::max)();
     /// For an eventfd Read or Write: the generation of the descriptor's slot. The retry goes on
     /// only if the descriptor has not closed since.
     u64 file_descriptor_generation = 0;
@@ -346,7 +346,7 @@ struct BSD_USA::SelectWait {
     std::vector<Entry> entries;
     /// When to retry regardless, to look again at the sockets left out of the wait;
     /// SelectClock::time_point::max() for never.
-    SelectClock::time_point recheck = SelectClock::time_point::max();
+    SelectClock::time_point recheck = (SelectClock::time_point::max)();
 };
 
 /// Its thread host-polls the sockets that deferred requests wait on, and signals the deferral
@@ -527,7 +527,7 @@ private:
                 stopped = true;
             }
             const auto now = SelectClock::now();
-            auto wake_at = SelectClock::time_point::max();
+            auto wake_at = (SelectClock::time_point::max)();
             bool retry = false;
             pollfds.clear();
             polled_for.clear();
@@ -577,7 +577,7 @@ private:
                 .revents = Network::PollEvents{},
             });
             s32 timeout = -1;
-            if (wake_at != SelectClock::time_point::max()) {
+            if (wake_at != (SelectClock::time_point::max)()) {
                 const auto remaining =
                     std::chrono::ceil<std::chrono::milliseconds>(wake_at - now).count();
                 timeout = static_cast<s32>(std::clamp<std::chrono::milliseconds::rep>(
@@ -1667,7 +1667,7 @@ std::optional<std::pair<s32, Errno>> BSD_USA::SelectImpl(const SelectRequest& re
     }
 
     const auto now = SelectClock::now();
-    wait.recheck = SelectClock::time_point::max();
+    wait.recheck = (SelectClock::time_point::max)();
     for (size_t i = 0; i < host_pollfds.size(); ++i) {
         const size_t index = host_entries[i];
         const Network::PollEvents revents = host_pollfds[i].revents;
@@ -2258,11 +2258,11 @@ std::optional<std::pair<s32, Errno>> BSD_USA::RecvMMsgImpl(HLERequestContext& ct
         const auto now = SelectClock::now();
         // A timeout longer than the clock counts never passes.
         const auto max_seconds = std::chrono::duration_cast<std::chrono::seconds>(
-                                     SelectClock::time_point::max() - now)
+                                     (SelectClock::time_point::max)() - now)
                                      .count() -
                                  1;
         deadline = timeout_seconds >= max_seconds
-                       ? SelectClock::time_point::max()
+                       ? (SelectClock::time_point::max)()
                        : now + std::chrono::duration_cast<SelectClock::duration>(
                                    std::chrono::seconds{timeout_seconds} +
                                    std::chrono::nanoseconds{timeout_nanoseconds});
