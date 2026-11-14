@@ -232,6 +232,9 @@ public:
     /// Notify the cache that a new frame has been queued
     void TickFrame();
 
+    /// The application layer's displayed size, from the swapchain composite (SceneShaped).
+    void NotePresentedFrame(u32 width, u32 height) noexcept;
+
     /// Return a constant reference to the given image view id
     [[nodiscard]] const ImageView& GetImageView(ImageViewId id) const noexcept;
 
@@ -406,6 +409,10 @@ private:
 
     /// Starts an empty view memo (a new stamp; on wrap, all slots cleared).
     void StartViewMemo() noexcept;
+
+    /// True when an image of this size has the last presented frame's aspect (within 10%), its
+    /// full width or its full height, or nothing was presented yet.
+    [[nodiscard]] bool SceneShaped(u32 width, u32 height) const noexcept;
 
     /// Find or create a framebuffer with the given render target parameters
     FramebufferId GetFramebufferId(const RenderTargets& key);
@@ -670,6 +677,10 @@ private:
     u32 view_memo_used = 0;
     u64 view_memo_epoch = 0;     ///< alias_copy_epoch when the memo started
     bool view_memo_busy = false; ///< a FillImageViews with the memo is running (no nesting)
+
+    /// The application layer's displayed size (NotePresentedFrame), 0 before the first present.
+    u32 presented_width = 0;
+    u32 presented_height = 0;
 
     Common::ThreadWorker texture_decode_worker{1, "TextureDecoder", {},
                                                Common::ThreadPlacement::Efficiency};

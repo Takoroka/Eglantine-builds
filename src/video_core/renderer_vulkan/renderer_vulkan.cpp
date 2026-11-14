@@ -212,6 +212,36 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         render_window.OnFrameDisplayed();
     };
 
+    // The scene's shape for the texture cache is the application's own layer, not whatever the
+    // capture, screenshot or overlay passes look up last: the first layer on the
+    // ApplicationForDebug stack, else the first on the Recording stack (NX2's vi2 has no
+    // ApplicationForDebug), with its displayed crop rather than its buffer size. Without such a
+    // layer the previous shape stays.
+    using Service::Nvnflinger::LayerStackBit;
+    using Service::Nvnflinger::LayerStackId;
+    const auto find_layer = [&](LayerStackId id) -> const Tegra::FramebufferConfig* {
+        for (const Tegra::FramebufferConfig& config : framebuffers) {
+            if ((config.layer_stack_mask & LayerStackBit(id)) != 0) {
+                return &config;
+            }
+        }
+        return nullptr;
+    };
+    const Tegra::FramebufferConfig* app_layer = find_layer(LayerStackId::ApplicationForDebug);
+    if (app_layer == nullptr) {
+        app_layer = find_layer(LayerStackId::Recording);
+    }
+    if (app_layer != nullptr) {
+        const auto& crop = app_layer->crop_rect;
+        const bool crop_valid = crop.left >= 0 && crop.top >= 0 && crop.GetWidth() > 0 &&
+                                crop.GetHeight() > 0 &&
+                                static_cast<u32>(crop.right) <= app_layer->width &&
+                                static_cast<u32>(crop.bottom) <= app_layer->height;
+        rasterizer.NotePresentedFrame(
+            crop_valid ? static_cast<u32>(crop.GetWidth()) : app_layer->width,
+            crop_valid ? static_cast<u32>(crop.GetHeight()) : app_layer->height);
+    }
+
     RenderAppletCaptureLayer(framebuffers);
 
     if (!render_window.IsShown()) {
