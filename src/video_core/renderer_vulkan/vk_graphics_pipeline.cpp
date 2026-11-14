@@ -388,8 +388,19 @@ void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
 
 template <typename Spec>
 bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
-    boost::container::small_vector<VideoCommon::ImageViewInOut, 160> views;
-    boost::container::small_vector<VideoCommon::SamplerId, 96> samplers;
+    // Setups past the stack vectors' room (large handle tables) fill the pipeline's kept vectors
+    // instead of heap vectors per draw.
+    boost::container::small_vector<VideoCommon::ImageViewInOut, 160> stack_views;
+    boost::container::small_vector<VideoCommon::SamplerId, 96> stack_samplers;
+    const bool kept_vectors{num_image_elements > 160 || num_textures > 96};
+    using ViewVector = boost::container::small_vector_base<VideoCommon::ImageViewInOut>;
+    using SamplerVector = boost::container::small_vector_base<VideoCommon::SamplerId>;
+    ViewVector& views{kept_vectors ? static_cast<ViewVector&>(scratch_views)
+                                   : static_cast<ViewVector&>(stack_views)};
+    SamplerVector& samplers{kept_vectors ? static_cast<SamplerVector&>(scratch_samplers)
+                                         : static_cast<SamplerVector&>(stack_samplers)};
+    views.clear();
+    samplers.clear();
     views.reserve(num_image_elements);
     samplers.reserve(num_textures);
 
@@ -482,6 +493,11 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             // A lone handle table's last element is this draw's own handle (the plain search's
             // handle program), which an index past the table selects.
             const u32 overflow_index{desc.overflow_program != ~0U ? desc.count - 1 : desc.count};
+            // The last TSC index of this descriptor and its sampler: an element with the same
+            // index takes it (a table's elements share one sampler word).
+            bool memo_valid{};
+            u32 memo_tsc{};
+            VideoCommon::SamplerId memo_sampler{};
             for (u32 index = 0; index < desc.count; ++index) {
                 const auto handle{[&] {
                     if (index == overflow_index) {
@@ -499,8 +515,16 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 }()};
                 views.push_back({handle.first});
 
+                if (memo_valid && handle.second == memo_tsc) {
+                    // GetSamplerId would read the same entry again: the same id.
+                    samplers.push_back(memo_sampler);
+                    continue;
+                }
                 VideoCommon::SamplerId sampler{texture_cache.GetSamplerId(handle.second, false)};
                 samplers.push_back(sampler);
+                memo_valid = true;
+                memo_tsc = handle.second;
+                memo_sampler = sampler;
             }
         }
         if constexpr (Spec::has_images) {
