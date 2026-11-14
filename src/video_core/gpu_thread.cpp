@@ -209,6 +209,9 @@ void ThreadManager::NotifyShutdown() {
         thread.join();
     }
     VideoCommon::GpuSplit::Get().Stop();
+    if (rasterizer) {
+        rasterizer->OnGpuShutdown();
+    }
 }
 
 } // namespace VideoCommon::GPUThread
