@@ -115,8 +115,8 @@ NvResult nvhost_as_gpu::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> i
                                 continue;
                             }
                             system.GPU().RunInOrder(
-                                [&smmu, tile_device = tile_device, tile_size = tile.size] {
-                                    smmu.Unmap(tile_device, tile_size);
+                                [&smmu, unmap_device = tile_device, tile_size = tile.size] {
+                                    smmu.Unmap(unmap_device, tile_size);
                                 });
                             it = nx2_tiles.erase(it);
                         }
