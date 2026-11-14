@@ -89,6 +89,25 @@ public:
         return ssa_reg_values[RegIndex(reg)];
     }
 
+    /// The SSA rewrite's other fixed-count variables (predicates, condition flags, the indirect
+    /// branch variable), by the index the pass gives them.
+    static constexpr size_t NUM_SSA_VARIABLES = 12;
+    void SetSsaVariableValue(size_t index, const Value& value) noexcept {
+        ssa_variable_values[index] = value;
+    }
+    const Value& SsaVariableValue(size_t index) const noexcept {
+        return ssa_variable_values[index];
+    }
+
+    /// The SSA rewrite's read that is collecting the operands of a phi for this block, as an
+    /// index into its walk (0: none).
+    void SetSsaPendingPhi(u32 read_index) noexcept {
+        ssa_pending_phi = read_index;
+    }
+    [[nodiscard]] u32 SsaPendingPhi() const noexcept {
+        return ssa_pending_phi;
+    }
+
     void SsaSeal() noexcept {
         is_ssa_sealed = true;
     }
@@ -182,8 +201,10 @@ private:
 
     /// Intrusively store the value of a register in the block.
     std::array<Value, NUM_REGS> ssa_reg_values;
+    std::array<Value, NUM_SSA_VARIABLES> ssa_variable_values;
     /// Intrusively store if the block is sealed in the SSA pass.
     bool is_ssa_sealed{false};
+    u32 ssa_pending_phi{};
 
     /// Intrusively stored host definition of this block.
     u32 definition{};
