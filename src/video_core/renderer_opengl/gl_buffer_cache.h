@@ -92,6 +92,7 @@ public:
 
     void PreCopyBarrier();
     void PostCopyBarrier();
+    void HostReadBarrier() {}
     void Finish();
 
     void TickFrame(Common::SlotVector<Buffer>&) noexcept {}

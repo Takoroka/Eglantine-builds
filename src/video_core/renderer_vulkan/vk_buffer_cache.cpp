@@ -560,6 +560,23 @@ void BufferCacheRuntime::PostCopyBarrier() {
     });
 }
 
+void BufferCacheRuntime::HostReadBarrier() {
+    // Waiting for the fence doesn't make device writes visible to the host by itself: the copies'
+    // writes need a dependency on the host stage first. The post-copy barriers only reach the
+    // graphics and compute stages. Download memory is host coherent, so no invalidation follows.
+    static constexpr VkMemoryBarrier HOST_READ_BARRIER{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+    };
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([](vk::CommandBuffer cmdbuf) {
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                               HOST_READ_BARRIER);
+    });
+}
+
 void BufferCacheRuntime::ClearBuffer(VkBuffer dest_buffer, u32 offset, size_t size, u32 value) {
     if (dest_buffer == VK_NULL_HANDLE) {
         return;
