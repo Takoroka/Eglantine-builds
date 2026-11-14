@@ -152,12 +152,23 @@ void Swapchain::Create(
     // Submitted work may still wait on the old acquire/present semaphores; destroying them under
     // it loses the device on MoltenVK (window moved to a display with a different scale).
     if (swapchain) {
-        std::scoped_lock lock{scheduler.submit_mutex};
-        const VkResult result = device.GetLogical().WaitIdle();
-        if (result == VK_ERROR_DEVICE_LOST) {
-            device.ReportLoss();
+        const auto wait_idle = [this] {
+            const VkResult result = device.GetLogical().WaitIdle();
+            if (result == VK_ERROR_DEVICE_LOST) {
+                device.ReportLoss();
+            }
+            vk::Check(result);
+        };
+        // vkDeviceWaitIdle needs every queue of the device externally synchronized, so with
+        // presents on a queue of their own it takes that queue's lock too. Nothing takes
+        // submit_mutex while holding the present queue's lock, so the pair can't deadlock.
+        if (device.HasOwnPresentQueue()) {
+            std::scoped_lock lock{scheduler.submit_mutex, device.GetOwnPresentQueueMutex()};
+            wait_idle();
+        } else {
+            std::scoped_lock lock{scheduler.submit_mutex};
+            wait_idle();
         }
-        vk::Check(result);
     }
     Destroy();
 
@@ -227,7 +238,11 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
 }
 
 void Swapchain::Present(VkSemaphore render_semaphore) {
-    const auto present_queue{device.GetPresentQueue()};
+    // On a queue no submit uses, under a lock of its own, so a present that waits for a vblank
+    // doesn't hold up the scheduler's submits (Device::HasOwnPresentQueue). Otherwise on the
+    // graphics queue under the submit lock, as before.
+    const bool own_queue = device.HasOwnPresentQueue();
+    const auto present_queue{own_queue ? device.GetOwnPresentQueue() : device.GetPresentQueue()};
     const VkPresentInfoKHR present_info{
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
         .pNext = nullptr,
@@ -238,7 +253,7 @@ void Swapchain::Present(VkSemaphore render_semaphore) {
         .pImageIndices = &image_index,
         .pResults = nullptr,
     };
-    std::scoped_lock lock{scheduler.submit_mutex};
+    std::scoped_lock lock{own_queue ? device.GetOwnPresentQueueMutex() : scheduler.submit_mutex};
     switch (const VkResult result = present_queue.Present(present_info)) {
     case VK_SUCCESS:
         break;

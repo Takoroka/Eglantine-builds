@@ -59,6 +59,7 @@ add_executable(tests
     video_core/shader_attributes.cpp
     video_core/indirect_reset.cpp
     video_core/strongly_connected.cpp
+    video_core/present_queue.cpp
     input_common/calibration_configuration_job.cpp
 )
 

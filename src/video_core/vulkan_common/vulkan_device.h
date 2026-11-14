@@ -20,6 +20,7 @@
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "common/settings.h"
+#include "video_core/vulkan_common/vulkan_present_queue.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 VK_DEFINE_HANDLE(VmaAllocator)
@@ -303,9 +304,27 @@ public:
         return graphics_queue;
     }
 
-    /// Returns the main present queue.
+    /// Returns the main present queue. When the present family isn't the graphics family, this is
+    /// the same VkQueue as GetOwnPresentQueue and needs GetOwnPresentQueueMutex.
     vk::Queue GetPresentQueue() const {
         return present_queue;
+    }
+
+    /// Whether presents may go to a queue no submit uses (GetOwnPresentQueue, under
+    /// GetOwnPresentQueueMutex) instead of the main present queue under the submit lock. Not with
+    /// NVIDIA Streamline, which hooks vkQueuePresentKHR and may do its own work there.
+    bool HasOwnPresentQueue() const {
+        return present_choice.own_queue && !streamline_attached;
+    }
+
+    /// Returns the queue presents go to apart from the graphics queue (HasOwnPresentQueue).
+    vk::Queue GetOwnPresentQueue() const {
+        return own_present_queue;
+    }
+
+    /// Returns the lock presents on GetOwnPresentQueue take.
+    std::mutex& GetOwnPresentQueueMutex() const {
+        return own_present_queue_mutex;
     }
 
     /// Returns main graphics queue family index.
@@ -1256,6 +1275,9 @@ private:
     vk::Device logical;          ///< Logical device.
     vk::Queue graphics_queue;    ///< Main graphics queue.
     vk::Queue present_queue;     ///< Main present queue.
+    vk::Queue own_present_queue; ///< Present queue apart from the graphics queue, if any.
+    mutable std::mutex own_present_queue_mutex;
+    PresentQueueChoice present_choice{1, 0, false}; ///< SetupFamilies
     vk::PipelineCache static_pipeline_cache;
     bool owns_static_pipeline_cache{};
     u32 instance_version{};      ///< Vulkan instance version.
