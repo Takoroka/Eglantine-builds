@@ -50,7 +50,8 @@ public:
     struct Slot {
         Ref ref{};
         u64 tick{};
-        u32 size{}; // 0: nothing streamed yet
+        u64 device_addr{~u64{0}}; ///< Where the slot's last bind read from
+        u32 size{}; // 0: no bytes kept (nothing streamed yet, or bound from a new address)
         std::array<u8, MaxBytes> bytes{};
     };
 
@@ -59,6 +60,7 @@ public:
             for (Slot& slot : stage) {
                 slot.size = 0;
                 slot.tick = 0;
+                slot.device_addr = ~u64{0};
             }
         }
     }
@@ -97,24 +99,47 @@ template <class Runtime, class DeviceMemory>
     }
     Reuse& reuse = UniformStreamReuseState<typename Runtime::StreamUniformRef>();
     typename Reuse::Slot& slot = reuse.slots[stage][index];
-    u8* const scratch = reuse.scratch.data();
-    device_memory.ReadBlockUnsafe(device_addr, scratch, size);
+    // Compare against guest memory in place when the range is contiguous on the host and copy it
+    // only when it changed: most binds are the same bytes again, and reading every buffer into a
+    // scratch copy first was most of this path's cost.
+    const u8* source = nullptr;
+    if constexpr (requires { device_memory.GetSpan(device_addr, size_t{size}); }) {
+        source = device_memory.GetSpan(device_addr, size);
+    }
+    if (source == nullptr) {
+        device_memory.ReadBlockUnsafe(device_addr, reuse.scratch.data(), size);
+        source = reuse.scratch.data();
+    }
 
+    if (slot.device_addr != device_addr) {
+        // Bound from a new address: games stream each draw's uniforms to a new place in a ring,
+        // so the bytes are rarely the last bind's. Copy them to the stream once, without comparing
+        // or keeping them; the slot keeps bytes again once binds repeat an address.
+        slot.device_addr = device_addr;
+        slot.size = 0;
+        const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
+        std::memcpy(span.data(), source, size);
+        slot.ref = runtime.LastStreamUniformRef();
+        slot.tick = runtime.CurrentTick();
+        return true;
+    }
     const bool same_bytes =
-        slot.size == size && std::memcmp(slot.bytes.data(), scratch, size) == 0;
+        slot.size == size && std::memcmp(slot.bytes.data(), source, size) == 0;
     if (same_bytes && slot.tick == runtime.CurrentTick()) {
         runtime.RebindStreamUniform(slot.ref, size);
         return true;
     }
+    if (!same_bytes) {
+        // Through the slot: the stream gets exactly the bytes later binds compare against, even
+        // when the guest writes the buffer meanwhile.
+        slot.size = size;
+        std::memcpy(slot.bytes.data(), source, size);
+    }
     const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
-    std::memcpy(span.data(), scratch, size);
+    std::memcpy(span.data(), slot.bytes.data(), size);
     slot.ref = runtime.LastStreamUniformRef();
     // After the allocation: the tick the stream region is tagged with is the one current now.
     slot.tick = runtime.CurrentTick();
-    if (!same_bytes) {
-        slot.size = size;
-        std::memcpy(slot.bytes.data(), scratch, size);
-    }
     return true;
 }
 
