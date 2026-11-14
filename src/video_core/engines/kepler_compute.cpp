@@ -1293,7 +1293,11 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
     // Title 4's program ends by decoding its result from sRGB to linear (the 0.04045 threshold
     // and the 2.4 exponent as half-precision immediates of HSETP2 and HMUL2). The copy of its
     // sRGB input left the frame gamma-encoded twice, washed out: decode in the copy when the
-    // program does.
+    // program does. Kirby Air Riders' upscaler decodes the same way in single precision: the
+    // threshold as an FSETP immediate and the exponent as an FMUL immediate, once per channel of
+    // each stored pixel. Its network's 1920x1080 output equals the sRGB decode of a bilinear copy
+    // of its input to 42.7 dB (the plain copy: 13.4 dB), and the plain copy made every frame far
+    // brighter (sky luma ~165 against ~107 with the network).
     static std::unordered_map<GPUVAddr, bool> decodes_srgb;
     const GPUVAddr program = regs.code_loc.Address();
     const auto [known, inserted] = decodes_srgb.try_emplace(program, false);
@@ -1305,8 +1309,10 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
             memory_manager.ReadBlock(program + offset, block.data(), sizeof(block));
             for (size_t word = 0; word < block.size(); word += 4) {
                 const u32 opcode = block[word] & 0xfff;
-                threshold |= opcode == 0x434 && block[word + 1] == 0x292d292d;
-                exponent |= opcode == 0x832 && block[word + 1] == 0x40cc40cc;
+                threshold |= (opcode == 0x434 && block[word + 1] == 0x292d292d) ||
+                             (opcode == 0x80b && block[word + 1] == 0x3d25aee6); // 0.04045f
+                exponent |= (opcode == 0x832 && block[word + 1] == 0x40cc40cc) ||
+                            (opcode == 0x820 && block[word + 1] == 0x4019999a); // 2.4f
             }
         }
         known->second = threshold && exponent;
