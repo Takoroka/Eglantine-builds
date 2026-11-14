@@ -79,10 +79,14 @@ void PositionPass(Environment& env, IR::Program& program) {
 // render target it holds: texel size (0x0/0x4, again at 0x10/0x14), size (0x8/0xc), a UV scale of
 // 1 (0x18/0x1c), the UV clamp rectangle 0,0..1,1 (0x30-0x3c, read by the fragment shader), a zero
 // dither bias (0x40-0x48) and the integer source rectangle 0,0..W-1,H-1 (0x50-0x5c).
+// Fragment shaders: 0x10-0x1c are a zero dither bias there.
+// Kirby Air Riders' base-game SMAA blend reads its texel size at 0x0/0x4 and adds 0x10/0x14/0x18
+// as integers to its sRGB-encoded output (IADD3); the vertex layout's values made it all white.
 void BlitConstantsPass(Environment& env, IR::Program& program) {
     if (env.ShaderStage() != Stage::VertexB && env.ShaderStage() != Stage::Fragment) {
         return;
     }
+    const bool fragment_dither{env.ShaderStage() == Stage::Fragment};
     // Bank 24 is root table 0, which games may load themselves (3D methods 0x504/0x508; the buffer
     // cache binds it as bank 17): Fire Emblem: Fortune's Weave keeps its material push constants
     // there. A shader reading bank 17 outside the blit block reads such a table and keeps its reads,
@@ -129,6 +133,9 @@ void BlitConstantsPass(Environment& env, IR::Program& program) {
             const IR::F32 width{ir.RenderAreaWidth()};
             const IR::F32 height{ir.RenderAreaHeight()};
             const auto word = [&](u32 offset) -> IR::U32 {
+                if (fragment_dither && offset >= 0x10 && offset < 0x20) {
+                    return ir.Imm32(0U);
+                }
                 switch (offset) {
                 case 0x0:
                 case 0x10:
