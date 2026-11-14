@@ -452,8 +452,8 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
         break;
     }
     case BufferMethods::Yield: {
-        // TODO(Kmather73): Research and implement this method.
-        LOG_ERROR(HW_GPU, "Special puller engine method Yield not implemented");
+        // Only a hint that the channel may give the GPU to another one; the emulated GPU runs its
+        // channels in submission order, so there is nothing to do (it logged an error per call).
         break;
     }
     default:
