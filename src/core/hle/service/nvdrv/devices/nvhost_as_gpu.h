@@ -240,9 +240,39 @@ private:
         bool heap; ///< Mapped through the session's heap mapper (else an SMMU allocation)
         bool shared{}; ///< A reference to the process's range in Nx2GpuMemoryRegistry
         size_t asid{};
+        u64 id{}; ///< This range, one of its own (memory made again under the same key gets another)
     };
+    /// SMMU ranges of live memory, by CPU range.
     std::map<std::pair<u64, u64>, Nx2DeviceRange> nx2_device_ranges;
-    void Nx2Release(u64 cpu_address, u64 size);
+    u64 nx2_next_range_id{};
+    /// The memory of a CPU range is gone (ReleaseBacking): its SMMU range stops translating now (in
+    /// GPU-thread order, behind the GMMU unmaps) and its record goes; its address range is freed
+    /// once no GMMU mapping reaches it (Nx2CutGpuMaps). Needs `mutex`.
+    void Nx2ReleaseLocked(u64 cpu_address, u64 size);
+    /// Frees the address range of an SMMU range that no longer translates. Needs `mutex`.
+    void Nx2FreeRange(u64 cpu_address, u64 size, const Nx2DeviceRange& range);
+    // The GMMU mappings Nx2Map made, as exact intervals (GPU start -> size, range id): an unmap of
+    // part of one trims or splits it, a map over part of one trims it to what is left. How many
+    // pieces reach each range, and the unmapped ranges whose address range waits for their last
+    // piece to go (a 211/216 map of part of a memory at another GPU address may outlive it; a GPU
+    // access through such a piece meanwhile hits unmapped device pages, not other memory). For a
+    // heap-area range the wait is a hold in the registry instead: memory made again over it maps
+    // outside the heap area until its last piece goes.
+    struct Nx2GpuMap {
+        u64 size;
+        u64 id;
+    };
+    std::map<u64, Nx2GpuMap> nx2_gpu_maps;
+    std::map<u64, u32> nx2_range_pieces;
+    struct Nx2PendingFree {
+        u64 cpu_address;
+        u64 size;
+        Nx2DeviceRange range;
+    };
+    std::map<u64, Nx2PendingFree> nx2_pending_frees; ///< By range id
+    /// Takes [gpu_address, +size) out of nx2_gpu_maps and frees the pending ranges this leaves
+    /// unreached. Needs `mutex`; called after the GMMU change over that range is queued.
+    void Nx2CutGpuMaps(u64 gpu_address, u64 size);
 
     // Switch 2 sparse regions: a device range per region, mapped for the GPU when it's created;
     // blocks get memory behind their device pages as the GPU writes them.
@@ -251,6 +281,15 @@ private:
     // A tile of a sparse region (nx2:gpu 216): its device pages show process memory, or nothing.
     void Nx2SparseTile(u64 gpu_address, u64 cpu_address, u64 size);
     std::map<u64, std::pair<u64, DAddr>> nx2_sparse_ranges; ///< GPU address -> (size, device)
+    // Tiles that show process memory, as exact intervals (device start -> size, CPU address): a
+    // tile of memory that is freed stops translating to its pages with it (ReleaseBacking).
+    struct Nx2Tile {
+        u64 size;
+        u64 cpu_address;
+    };
+    std::map<DAddr, Nx2Tile> nx2_tiles;
+    /// Takes [device_address, +size) out of nx2_tiles, trimming tiles partly inside. Needs `mutex`.
+    void Nx2CutTiles(DAddr device_address, u64 size);
 };
 
 } // namespace Service::Nvidia::Devices

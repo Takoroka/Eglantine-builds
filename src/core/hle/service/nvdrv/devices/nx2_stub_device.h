@@ -76,14 +76,15 @@ public:
         }
     }
 
-    // Backing memory [cpu_address, +size) is about to be freed (its GPU mappings are gone): each
-    // address space drops its SMMU mapping of it, in GPU-thread order.
+    // Backing memory [cpu_address, +size) is about to be freed: each address space stops its SMMU
+    // ranges inside it translating (in GPU-thread order) and forgets their records now, and frees
+    // their address ranges once no GPU mapping reaches them. The shared ranges inside it are
+    // retired first, so memory made again at the same address and size gets a range of its own
+    // (under `mutex`, as maps are: no AcquireDeviceRange can come between the retire and the
+    // listeners).
     void ReleaseBacking(u64 cpu_address, u64 size) {
-        {
-            std::scoped_lock lk{device_mutex};
-            device_ranges.erase(cpu_address);
-        }
         std::scoped_lock lk{mutex};
+        RetireDeviceRanges(cpu_address, size);
         for (auto& [owner, listener] : listeners) {
             if (listener.release) {
                 listener.release(cpu_address, size);
@@ -168,6 +169,8 @@ public:
             std::scoped_lock lk{device_mutex};
             device_ranges.clear();
             shared_ranges.clear();
+            retired_ranges.clear();
+            heap_holds.clear();
         }
         std::scoped_lock lk{mutex};
         mappings.clear();
@@ -205,16 +208,85 @@ public:
         return true;
     }
 
+    // The memory of [cpu_address, +size) is gone: its shared ranges leave the table (a new
+    // AcquireDeviceRange of the same key allocates afresh) and keep their references by device
+    // address until each holder frees its part (ReleaseRetiredRange).
+    void RetireDeviceRanges(u64 cpu_address, u64 size) {
+        std::scoped_lock lk{device_mutex};
+        const u64 end = cpu_address + size;
+        for (auto it = shared_ranges.begin(); it != shared_ranges.end();) {
+            const SharedRangeKey& key = it->first;
+            if (key.cpu_address >= cpu_address && key.cpu_address + key.size <= end) {
+                auto& retired = retired_ranges[it->second.device_address];
+                retired.asid = key.asid;
+                retired.references += it->second.references;
+                it = shared_ranges.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // Heap-area ranges (device addresses fixed by the VA) whose memory is gone while a GPU mapping
+    // still reaches them: memory made again over them maps outside the heap area meanwhile, so
+    // that mapping never reaches it.
+    void HoldHeapRange(size_t asid, u64 cpu_address, u64 size) {
+        std::scoped_lock lk{device_mutex};
+        ++heap_holds[SharedRangeKey{asid, cpu_address, size}];
+    }
+
+    void DropHeapHold(size_t asid, u64 cpu_address, u64 size) {
+        std::scoped_lock lk{device_mutex};
+        const auto it = heap_holds.find(SharedRangeKey{asid, cpu_address, size});
+        if (it != heap_holds.end() && --it->second == 0) {
+            heap_holds.erase(it);
+        }
+    }
+
+    bool IsHeapHeld(size_t asid, u64 cpu_address, u64 size) {
+        std::scoped_lock lk{device_mutex};
+        for (const auto& [key, holders] : heap_holds) {
+            if (key.asid == asid && key.cpu_address < cpu_address + size &&
+                cpu_address < key.cpu_address + key.size) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Drops a reference to a retired range. True for the last one: the caller frees the range.
+    bool ReleaseRetiredRange(u64 device_address) {
+        std::scoped_lock lk{device_mutex};
+        const auto it = retired_ranges.find(device_address);
+        if (it == retired_ranges.end() || --it->second.references != 0) {
+            return false;
+        }
+        retired_ranges.erase(it);
+        return true;
+    }
+
     // The process's session closed and its ASID can be reused: stop sharing its ranges.
     void ForgetDeviceRanges(size_t asid) {
         std::scoped_lock lk{device_mutex};
         std::erase_if(shared_ranges, [asid](const auto& entry) { return entry.first.asid == asid; });
+        std::erase_if(retired_ranges, [asid](const auto& entry) { return entry.second.asid == asid; });
+        std::erase_if(heap_holds, [asid](const auto& entry) { return entry.first.asid == asid; });
     }
 
     // Device (SMMU) address of a CPU range an address space mapped; used to present images.
     void RecordDeviceRange(u64 cpu_address, u64 size, u64 device_address) {
         std::scoped_lock lk{device_mutex};
         device_ranges[cpu_address] = {size, device_address};
+    }
+
+    // The SMMU range of a CPU range is being freed: drop its record, if it is still the one there.
+    void ForgetDeviceRange(u64 cpu_address, u64 size, u64 device_address) {
+        std::scoped_lock lk{device_mutex};
+        const auto it = device_ranges.find(cpu_address);
+        if (it != device_ranges.end() && it->second.first == size &&
+            it->second.second == device_address) {
+            device_ranges.erase(it);
+        }
     }
 
     std::optional<u64> DeviceAddressOf(u64 cpu_address) {
@@ -247,6 +319,13 @@ private:
         u32 references;
     };
     std::map<SharedRangeKey, SharedRange> shared_ranges;
+    struct RetiredRange {
+        size_t asid{};
+        u32 references{};
+    };
+    std::map<u64, RetiredRange> retired_ranges; ///< Device address -> references left
+    std::map<SharedRangeKey, u32> heap_holds; ///< Held heap-area ranges -> address spaces holding
+
 
     struct Mapping {
         u64 gpu_address;
