@@ -167,6 +167,9 @@ void GpuSplit::Stop() {
     consumed_cache = 0;
     publish_every = PublishEvery;
     front_engine = nullptr;
+    run_count = 0;
+    run_data = false;
+    run_flags = {};
     back_engine = nullptr;
     front_macros = false;
     published.store(0, std::memory_order_relaxed);
@@ -208,6 +211,9 @@ void GpuSplit::WaitForSpace(size_t words) {
 }
 
 void GpuSplit::Publish() {
+    if (run_count != 0) {
+        FlushRun();
+    }
     if (published_local == write_position) {
         return;
     }
@@ -221,6 +227,9 @@ void GpuSplit::Publish() {
 }
 
 void GpuSplit::Drain() {
+    if (run_count != 0) {
+        FlushRun();
+    }
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache == write_position && BackQuiet()) {
         return;
@@ -270,6 +279,26 @@ bool GpuSplit::WaitForWriters() {
             std::this_thread::yield();
         }
     }
+}
+
+void GpuSplit::FlushRun() {
+    const u32 count = run_count;
+    const bool data = run_data;
+    run_count = 0; // Reserve flushes while it is set
+    run_data = false;
+    if (count == 0) {
+        return;
+    }
+    const size_t head = data ? 1 : 1 + RunFlagWords;
+    const size_t size = head + count;
+    u64* const entry = Reserve(size);
+    entry[0] = static_cast<u64>(data ? Kind::Data : Kind::State) | (u64{count} << 32);
+    if (!data) {
+        std::memcpy(entry + 1, run_flags.data(), sizeof(run_flags));
+        run_flags = {};
+    }
+    std::memcpy(entry + head, run_writes.data(), size_t{count} * sizeof(u64));
+    Commit(size);
 }
 
 void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
@@ -359,6 +388,18 @@ size_t GpuSplit::Execute(const u64* entry) {
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
         reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
         return 2 + payload;
+    }
+    case Kind::State: {
+        const u32 count = static_cast<u32>(head >> 32);
+        Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+        back_engine->ApplyStateRun(*system, entry + 1, entry + 1 + RunFlagWords, count);
+        return 1 + RunFlagWords + count;
+    }
+    case Kind::Data: {
+        const u32 count = static_cast<u32>(head >> 32);
+        Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+        back_engine->ApplyDataRun(*system, entry + 1, count);
+        return 1 + count;
     }
     }
     return 1;
