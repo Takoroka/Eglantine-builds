@@ -31,8 +31,17 @@ private:
     std::atomic<u32> m_state{0};
 };
 
+// A spin lock alone on its cache line: the global scheduler lock is one (every SVC of a job system
+// takes it), and the other cores spin on its word while the holder writes the lock count, the
+// owner and the priority queue's per-core bitsets, which shared the word's line before.
+// Idea: MythosOfs/Orchid 452d0ace50.
+class alignas(64) KAlignedSpinLock : public KSpinLock {
+public:
+    explicit KAlignedSpinLock() = default;
+};
+static_assert(sizeof(KAlignedSpinLock) == 64);
+
 // TODO(bunnei): Alias for now, in case we want to implement these accurately in the future.
-using KAlignedSpinLock = KSpinLock;
 using KNotAlignedSpinLock = KSpinLock;
 
 using KScopedSpinLock = KScopedLock<KSpinLock>;
