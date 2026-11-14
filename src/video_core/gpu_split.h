@@ -168,6 +168,7 @@ public:
 
     /// Makes what was sent visible to the back.
     void Publish();
+
     /// Waits until the back executed everything sent so far.
     void Drain();
 
@@ -235,6 +236,17 @@ private:
     }
     void SwitchEngine(Tegra::Engines::EngineInterface* engine);
 
+    /// Front, past the spin of its waits for the back (Drain, WaitForWriters, WaitForSpace):
+    /// sleeps until the back stores `consumed` (last seen as `seen`) instead of yielding.
+    void SleepForBack(u64 seen);
+    /// Back: hands `consumed` to the front and wakes it if it sleeps on it.
+    void StoreConsumed(u64 position) {
+        consumed.store(position, std::memory_order_seq_cst);
+        if (front_sleeping.load(std::memory_order_seq_cst)) {
+            consumed.notify_all();
+        }
+    }
+
     void BackLoop(std::stop_token stop_token);
     size_t Execute(const u64* entry);
 
@@ -285,6 +297,8 @@ private:
     alignas(128) std::atomic<u64> wait_target{~u64{0}};
     alignas(128) std::atomic<bool> back_waiting{};
     std::atomic<u32> wake{};
+    /// The front sleeps on `consumed` (SleepForBack): the back wakes it when it stores one.
+    alignas(128) std::atomic<bool> front_sleeping{};
     std::jthread back_thread;
 };
 
