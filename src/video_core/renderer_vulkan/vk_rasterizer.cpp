@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <limits>
 #include <cstdio>
@@ -1647,6 +1648,33 @@ void RasterizerVulkan::SignalReference() {
 
 void RasterizerVulkan::ReleaseFences(bool force) {
     fence_manager.WaitPendingFences(force);
+}
+
+void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
+    if (addr == 0 || size == 0 || !query_cache.SemiFlushRegion(addr, size)) {
+        return;
+    }
+    // Some reports still wait for host results, written by operations the next fence runs. Below
+    // High GPU accuracy a fence runs its own callback at once: wait for an operation queued
+    // behind theirs instead. On the split's back the fence's submission may be deferred, and
+    // nothing else submits it while this thread waits. The state outlives a wait that gives up.
+    struct Wait {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool written{};
+    };
+    const auto wait = std::make_shared<Wait>();
+    SyncOperation([wait] {
+        std::scoped_lock lock{wait->mutex};
+        wait->written = true;
+        wait->cv.notify_all();
+    });
+    SignalFence([] {});
+    scheduler.FlushDeferred();
+    // At most 100 ms: past that the read takes the older words, as before.
+    std::unique_lock lock{wait->mutex};
+    static_cast<void>(
+        wait->cv.wait_for(lock, std::chrono::milliseconds{100}, [&wait] { return wait->written; }));
 }
 
 void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,

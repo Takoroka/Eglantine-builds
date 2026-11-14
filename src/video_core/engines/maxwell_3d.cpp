@@ -23,6 +23,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/query_reads.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/texture.h"
 #ifdef ARCHITECTURE_x86_64
@@ -1195,6 +1196,11 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
         });
     }
+    // Counter reports land only once a later fence pops: wait for them on the back, whose query
+    // cache it is (QueryReads).
+    split.Run([this, source, read_bytes] {
+        VideoCommon::QueryReads::Flush(memory_manager, *rasterizer, source, read_bytes);
+    });
     for (u32 i = 0; i < words; ++i) {
         const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
         if (method == 0x158) {
