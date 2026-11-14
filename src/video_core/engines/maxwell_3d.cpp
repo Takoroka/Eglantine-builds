@@ -774,7 +774,7 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
     const size_t room = regs.const_buffer.offset < regs.const_buffer.size
                             ? regs.const_buffer.size - regs.const_buffer.offset
                             : 0;
-    const size_t write_size = std::min(copy_size, room / sizeof(u32) * sizeof(u32));
+    const size_t write_size = (std::min)(copy_size, room / sizeof(u32) * sizeof(u32));
     if (write_size != 0) {
         const GPUVAddr address{buffer_address + regs.const_buffer.offset};
         memory_manager.WriteBlockCached(address, start_base, write_size);
