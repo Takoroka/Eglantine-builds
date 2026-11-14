@@ -141,6 +141,8 @@ public:
     struct Event;
 
     void Reset();
+    /// Wakes the timing thread after an event was scheduled; earliest: it became the next one.
+    void WakeTimerThread(bool earliest);
 
     using heap_t = boost::heap::fibonacci_heap<CoreTiming::Event, boost::heap::compare<std::greater<>>>;
     heap_t event_queue;
