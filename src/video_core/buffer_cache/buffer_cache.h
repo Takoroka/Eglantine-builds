@@ -295,7 +295,15 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
 template <class P>
 void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
     ForEachBufferInRange(device_addr, size, [&](BufferId, Buffer& buffer) {
-        DownloadBufferMemory(buffer, device_addr, size);
+        // Each buffer downloads its own part only: given the whole range, the first buffer took
+        // the GPU-written ranges of the buffers after it as its own, copying from offsets past
+        // its end (VK_ERROR_DEVICE_LOST) and clearing them for their own buffers. A flush area
+        // can span several buffers.
+        const DAddr start = (std::max)(device_addr, buffer.CpuAddr());
+        const DAddr end = (std::min)(device_addr + size, buffer.CpuAddr() + buffer.SizeBytes());
+        if (start < end) {
+            DownloadBufferMemory(buffer, start, end - start);
+        }
     });
 }
 
