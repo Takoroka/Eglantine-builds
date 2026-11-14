@@ -748,7 +748,9 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
 HostMemory::~HostMemory() {
 #ifdef _WIN32
     if (fallback_buffer) {
-        VirtualFree(backing_base, backing_size, MEM_RELEASE);
+        // MEM_RELEASE takes size 0 and frees the whole allocation; any other size fails, which
+        // leaked the committed fallback backing at the end of every session.
+        VirtualFree(backing_base, 0, MEM_RELEASE);
     }
 #else
     if (fallback_buffer) {
@@ -756,10 +758,6 @@ HostMemory::~HostMemory() {
     }
 #endif
 }
-
-HostMemory::HostMemory(HostMemory&&) noexcept = default;
-
-HostMemory& HostMemory::operator=(HostMemory&&) noexcept = default;
 
 void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms, bool separate_heap) {
 #if !(defined(__OPENORBIS__) || defined(__managarm__))
