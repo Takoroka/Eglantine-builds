@@ -247,7 +247,9 @@ jobs:
 
       # A dynamic MinGW build is not portable on its own: windeployqt6 brings the Qt libraries and
       # plugins, then every non-system DLL the binaries and those plugins pull in gets copied next to
-      # them (docs/Caveats.md#msys2).
+      # them (docs/Caveats.md#msys2). The GLib network information plugin is left out: it would bring
+      # GIO, which reads the registry's app and mail client registrations on load and gets the
+      # package flagged by malware sandboxes.
       - name: Package MinGW binary
         shell: msys2 {0}
         run: |
@@ -257,7 +259,7 @@ jobs:
           test -f eglantine.exe
           test -f eden-cli.exe
           windeployqt6 --no-translations --no-compiler-runtime --no-opengl-sw \
-            --no-system-dxc-compiler --no-system-d3d-compiler eglantine.exe
+            --no-system-dxc-compiler --no-system-d3d-compiler --exclude-plugins qglib eglantine.exe
           deps() {
             objdump -p "$1" | awk '/DLL Name:/ {print $3}' | while read -r dll; do
               [ -z "$dll" ] && continue

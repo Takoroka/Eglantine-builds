@@ -459,7 +459,14 @@ if (WIN32 AND NOT YUZU_USE_BUNDLED_QT)
     endif()
     if (WINDEPLOYQT_EXECUTABLE)
         set(YUZU_EXE_DIR "$<TARGET_FILE_DIR:yuzu>")
-        add_custom_command(TARGET yuzu POST_BUILD COMMAND ${WINDEPLOYQT_EXECUTABLE} "$<TARGET_FILE:yuzu>" --dir "${YUZU_EXE_DIR}" --libdir "${YUZU_EXE_DIR}" --plugindir "${YUZU_EXE_DIR}/plugins" --no-compiler-runtime --no-opengl-sw --no-system-d3d-compiler --no-translations --verbose 0)
+        # MSYS2's Qt also has the GLib network information plugin. It pulls in GIO, which reads every
+        # app and mail client registration in the registry as soon as it loads, so malware sandboxes
+        # flag the package. Windows uses the Network List Manager plugin instead.
+        set(YUZU_WINDEPLOYQT_EXTRA_ARGS "")
+        if (MINGW)
+            set(YUZU_WINDEPLOYQT_EXTRA_ARGS --exclude-plugins qglib)
+        endif()
+        add_custom_command(TARGET yuzu POST_BUILD COMMAND ${WINDEPLOYQT_EXECUTABLE} "$<TARGET_FILE:yuzu>" --dir "${YUZU_EXE_DIR}" --libdir "${YUZU_EXE_DIR}" --plugindir "${YUZU_EXE_DIR}/plugins" --no-compiler-runtime --no-opengl-sw --no-system-d3d-compiler --no-translations --verbose 0 ${YUZU_WINDEPLOYQT_EXTRA_ARGS})
     else()
         message(WARNING "windeployqt not found: copy the Qt DLLs next to the executable yourself")
     endif()
